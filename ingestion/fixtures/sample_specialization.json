@@ -1,0 +1,35 @@
+{
+  "slug": "online-mba-marketing",
+  "university_slug": "nmims",
+  "course_slug": "online-mba",
+  "spec_name": "Online MBA in Marketing",
+  "duration": "2 years",
+  "mode": "Online",
+  "naac_grade": "A+",
+  "ugc_status": "UGC Entitled",
+  "total_fee": "₹2,20,000",
+  "about_content": "Marketing specialization focuses on consumer behavior, brand management, and digital marketing.",
+  "eligibility_content": "Graduation from a recognized university.",
+  "eligibility_summary": "Graduation from a recognized university is required.",
+  "syllabus_content": "Marketing management, digital marketing, sales strategy, analytics, and capstone project.",
+  "exam_content": "Online exams as per university schedule.",
+  "admission_steps": "Apply online and choose Marketing as the specialization.",
+  "admission_fee_note": "Fees are payable as per university installment rules.",
+  "placement_content": "Suitable for roles in brand management, digital marketing, and sales strategy.",
+  "certificate_description": "Online MBA degree with Marketing specialization.",
+  "emi_amount": "EMI starts around ₹9,500 per month",
+  "seo_title": "NMIMS Online MBA Marketing",
+  "meta_description": "Explore NMIMS Online MBA in Marketing fees, eligibility, and syllabus.",
+  "faqs": [
+    {
+      "question": "Is Marketing available in NMIMS Online MBA?",
+      "answer": "Yes, Marketing is included in this sample specialization data."
+    }
+  ],
+  "other_specs": [
+    {
+      "other_spec_name": "Finance",
+      "other_spec_fee": "₹2,20,000"
+    }
+  ]
+}

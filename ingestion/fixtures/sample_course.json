@@ -1,0 +1,53 @@
+{
+  "slug": "online-mba",
+  "university_slug": "nmims",
+  "program_name": "Online MBA",
+  "duration": "2 years",
+  "mode": "Online",
+  "naac_grade": "A+",
+  "ugc_status": "UGC Entitled",
+  "total_fee": "₹2,20,000",
+  "starting_fee": "₹55,000",
+  "num_specializations": "5",
+  "about_content": "The Online MBA is designed for learners who want management skills with flexible study.",
+  "eligibility_content": "Graduation from a recognized university with minimum marks as per university norms.",
+  "eligibility_summary": "Graduation from a recognized university is required.",
+  "admission_steps": "Apply online, upload documents, complete verification, and pay the fee.",
+  "admission_fee_note": "Installment options may be available.",
+  "syllabus_content": "Core management subjects, electives, projects, and capstone learning.",
+  "placement_content": "Career support includes job portal access, resume building, and interview preparation.",
+  "certificate_description": "Degree awarded by NMIMS as per university rules.",
+  "validity": "UGC entitled online degree",
+  "emi_amount": "EMI starts around ₹9,500 per month",
+  "seo_title": "NMIMS Online MBA Fees and Eligibility",
+  "meta_description": "Check NMIMS Online MBA duration, fees, eligibility, and admission details.",
+  "faqs": [
+    {
+      "question": "What is the NMIMS Online MBA fee?",
+      "answer": "The total fee listed in this fixture is ₹2,20,000."
+    },
+    {
+      "question": "Who is eligible for NMIMS Online MBA?",
+      "answer": "Graduation from a recognized university is required."
+    }
+  ],
+  "fee_plans": [
+    {
+      "plan_name": "Semester",
+      "plan_amount": "₹55,000",
+      "plan_total": "₹2,20,000"
+    }
+  ],
+  "highlights": [
+    {
+      "highlight_title": "Flexible learning",
+      "highlight_description": "Study through online classes and digital materials."
+    }
+  ],
+  "job_profiles": [
+    {
+      "job_title": "Business Analyst",
+      "avg_salary": "₹6-10 LPA"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "slug": "nmims",
+  "name": "NMIMS",
+  "full_name": "Narsee Monjee Institute of Management Studies",
+  "established_year": "1981",
+  "naac_grade": "A+",
+  "ugc_approved": "Yes",
+  "mode_of_learning": "Online",
+  "starting_fee": "₹55,000",
+  "num_programs": "12",
+  "about_content": "NMIMS offers online degree programs for working professionals and fresh graduates.",
+  "why_choose_content": "Known for management education, flexible online learning, and strong student support.",
+  "admission_steps": "Register online, submit documents, pay the program fee, and wait for confirmation.",
+  "admission_fee_note": "Admission fee may vary by program.",
+  "emi_content": "EMI options are available on selected programs.",
+  "exam_content": "Exams are conducted online as per university guidelines.",
+  "faculty_intro": "Faculty includes experienced management and technology educators.",
+  "placement_content": "Career services include resume support, interview preparation, and job portal access.",
+  "seo_title": "NMIMS Online Degree Programs",
+  "meta_description": "Explore NMIMS online MBA, BBA, and other programs with fees and eligibility.",
+  "faqs": [
+    {
+      "question": "Is NMIMS UGC approved?",
+      "answer": "Yes, NMIMS online programs listed on DegreeBaba are marked as UGC approved where applicable."
+    },
+    {
+      "question": "Does NMIMS offer EMI?",
+      "answer": "Yes, EMI options are available on selected NMIMS programs."
+    }
+  ],
+  "faculty_members": [
+    {
+      "member_name": "Dr. R. Sharma",
+      "member_program": "Management",
+      "member_designation": "Professor",
+      "member_qualification": "PhD"
+    }
+  ],
+  "accreditations": [
+    {
+      "body_name": "NAAC",
+      "body_descriptor": "A+ Grade",
+      "body_detail": "Accredited by NAAC."
+    }
+  ],
+  "facts": [
+    {
+      "fact_title": "Learning mode",
+      "fact_description": "Online learning with digital resources."
+    }
+  ]
+}
