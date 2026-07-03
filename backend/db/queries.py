@@ -24,21 +24,27 @@ async def ensure_session(pool, session_id: str, site_id: str, page_university_sl
         site_id,
         page_university_slug,
     )
+    # Insert a blank session_context row — conversational slugs start as NULL.
+    # The page_university_slug is intentionally NOT written here; it is a
+    # passive page hint, not evidence of user intent.
     await pool.execute(
         """
-        INSERT INTO session_context(session_id, current_university_slug)
-        VALUES($1::uuid, $2)
+        INSERT INTO session_context(session_id)
+        VALUES($1::uuid)
         ON CONFLICT (session_id) DO NOTHING
         """,
         session_id,
-        page_university_slug,
     )
 
 
 async def get_session_context(pool, session_id: str) -> dict[str, Any]:
     row = await pool.fetchrow(
-        "SELECT current_university_slug, current_course_slug, current_specialization_slug FROM session_context WHERE session_id = $1::uuid",
-        session_id
+        """
+        SELECT current_university_slug, current_course_slug, current_specialization_slug
+        FROM session_context
+        WHERE session_id = $1::uuid
+        """,
+        session_id,
     )
     return dict_row(row) or {}
 

@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     groq_api_key: str | None = None
 
     allowed_site_keys: str = '{"degreebaba_dev":["localhost","127.0.0.1"],"degreebaba_prod":["degreebaba.com","www.degreebaba.com"]}'
-    allowed_origins_raw: str = Field(default="http://localhost:8000,http://localhost:8080", alias="ALLOWED_ORIGINS")
+    allowed_origins_raw: str = Field(default="http://localhost:2323,http://localhost:8080", alias="ALLOWED_ORIGINS")
     crm_webhook_url: str | None = None
     admin_auth_token: str = "change-me"
     rate_limit_per_minute: int = 10

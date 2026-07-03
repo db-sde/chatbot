@@ -98,20 +98,43 @@ def _make_state(
 async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
     """
     Entity resolution: LLM extraction → fuzzy slug snap → context fallback.
-    Persists resolved slugs back to session_context so the next turn inherits.
-    Also logs anonymous demand signals for fee / eligibility intent.
+
+    page_university_slug is passed to the resolver as a *passive hint* —
+    it is only used when the user's message requires factual catalog data
+    and no entity was found via extraction or conversational context.
+
+    Persists resolved slugs back to session_context so the next turn
+    inherits them — but only slugs that came from real extraction or prior
+    conversational context, never page-hint-only slugs.
     """
     message = state["raw_message"]
     context = state.get("context", {})
     session_id = state["session_id"]
+    page_university_slug = state.get("page_university_slug")
 
-    resolved = await _resolve_entities(message, context)
+    resolved = await _resolve_entities(message, context, page_university_slug)
+
+    # Only persist slugs that were established through user intent this turn
+    # (via LLM extraction or prior conversational context).  A slug that came
+    # solely from the page hint should NOT be written into session_context,
+    # because that would promote a passive page hint into conversational fact.
+    context_university = context.get("current_university_slug")
+    new_university = resolved.get("university_slug")
+    # If the resolved university equals the page hint AND was not already in
+    # conversational context, it came only from the page — don't persist it.
+    from agent.resolve import _message_needs_entity
+    page_hint_only = (
+        new_university == page_university_slug
+        and new_university != context_university
+        and not _message_needs_entity(message)
+    )
+    persist_university = None if page_hint_only else new_university
 
     pool = await get_pool()
     await queries.update_session_context(
         pool,
         session_id,
-        resolved.get("university_slug"),
+        persist_university,
         resolved.get("course_slug"),
         resolved.get("specialization_slug"),
     )
@@ -133,13 +156,46 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
             "eligibility",
         )
 
+    # Attach a flag so node_agent_decide knows whether this resolution is
+    # backed by real user intent or is merely a passive page hint.
+    resolved["_page_hint_only"] = page_hint_only
     return {"resolved": resolved}
+
+
+def _clean_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    cleaned = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            content = msg.content
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content)
+                except Exception:
+                    content = str(content)
+            # Recreate ToolMessage with sanitized string content
+            cleaned.append(
+                ToolMessage(
+                    content=content,
+                    name=getattr(msg, "name", None),
+                    tool_call_id=msg.tool_call_id,
+                    status=getattr(msg, "status", "success"),
+                    artifact=getattr(msg, "artifact", None),
+                )
+            )
+        else:
+            cleaned.append(msg)
+    return cleaned
 
 
 async def node_agent_decide(state: ChatState) -> dict[str, Any]:
     """
     The LLM (with tools bound) decides which tool(s) to call or returns a
     direct reply.  Supports parallel tool calling in a single response.
+
+    A context note is only injected when slugs were established through real
+    user intent (extraction or prior conversational context).  Page-hint-only
+    resolutions (e.g. greeting on an NMIMS page) produce no context note so
+    the LLM is free to reply naturally.
     """
     if llm_client.groq_chat and llm_client.gemini_chat:
         model_with_tools = llm_client.groq_chat.bind_tools(TOOLS).with_fallbacks(
@@ -162,18 +218,22 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
             ]
         }
 
-    # Inject resolved context so the LLM knows exactly which slugs to pass to tools.
-    # Without this, the LLM must guess arguments and often declines to call any tool.
-    resolved = state.get("resolved", {})
-    context_parts = []
-    if resolved.get("university_slug"):
-        context_parts.append(f"university_slug={resolved['university_slug']}")
-    if resolved.get("course_slug"):
-        context_parts.append(f"course_slug={resolved['course_slug']}")
-    if resolved.get("specialization_slug"):
-        context_parts.append(f"specialization_slug={resolved['specialization_slug']}")
-
     messages = list(state["messages"])
+    resolved = state.get("resolved", {})
+
+    # Only inject a context note when resolution is backed by real user intent.
+    # _page_hint_only=True means the slug came only from the page URL and the
+    # user did not ask a factual question — do NOT pollute the LLM context.
+    page_hint_only = resolved.get("_page_hint_only", False)
+    context_parts = []
+    if not page_hint_only:
+        if resolved.get("university_slug"):
+            context_parts.append(f"university_slug={resolved['university_slug']}")
+        if resolved.get("course_slug"):
+            context_parts.append(f"course_slug={resolved['course_slug']}")
+        if resolved.get("specialization_slug"):
+            context_parts.append(f"specialization_slug={resolved['specialization_slug']}")
+
     if context_parts:
         context_note = (
             f"[Resolved context for this turn: {', '.join(context_parts)}. "
@@ -183,7 +243,7 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
         messages = messages[:-1] + [SystemMessage(content=context_note)] + messages[-1:]
 
     try:
-        response: AIMessage = await model_with_tools.ainvoke(messages)
+        response: AIMessage = await model_with_tools.ainvoke(_clean_messages(messages))
     except groq.RateLimitError:
         logger.warning("Groq rate limit hit in node_agent_decide — returning rate-limit message.")
         return {
@@ -258,7 +318,7 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
             )
         ]
         try:
-            response: AIMessage = await llm_client.chat_model.ainvoke(synthesis_messages)
+            response: AIMessage = await llm_client.chat_model.ainvoke(_clean_messages(synthesis_messages))
             reply_text = str(response.content) if response.content else (
                 "I found the data but couldn't format it — please check with our team."
             )
@@ -310,18 +370,6 @@ def _build_graph() -> Any:
 
     graph.add_node("resolve_entities", node_resolve_entities)
     graph.add_node("agent_decide", node_agent_decide)
-    graph.add_node("execute_tools", ToolNode(TOOLS))
-    graph.add_node("synthesize_reply", node_synthesize_reply)
-    graph.add_node("update_lead_score", node_update_lead_score)
-
-    graph.add_edge(START, "resolve_entities")
-    graph.add_edge("resolve_entities", "agent_decide")
-
-def _build_graph() -> Any:
-    graph = StateGraph(ChatState)
-
-    graph.add_node("resolve_entities", node_resolve_entities)
-    graph.add_node("agent_decide", node_agent_decide)
     graph.add_node("execute_tools", node_execute_tools)
     graph.add_node("synthesize_reply", node_synthesize_reply)
     graph.add_node("update_lead_score", node_update_lead_score)
@@ -338,7 +386,6 @@ def _build_graph() -> Any:
         },
     )
     graph.add_edge("execute_tools", "agent_decide")  # ReAct loop
-
 
     graph.add_edge("synthesize_reply", "update_lead_score")
     graph.add_edge("update_lead_score", END)

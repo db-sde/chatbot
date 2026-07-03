@@ -15,4 +15,4 @@ RUN uv sync --frozen --no-dev
 COPY . .
 
 # Start uvicorn server
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "2323"]

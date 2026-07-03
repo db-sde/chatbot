@@ -181,3 +181,9 @@ async def admin_flagged(
 async def admin_analytics(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
     pool = await get_pool()
     return await queries.analytics(pool)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=2323, reload=True)
+

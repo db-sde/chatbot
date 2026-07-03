@@ -87,7 +87,7 @@ python -m http.server 8080
 Open `http://localhost:8080/test.html`. The test page loads:
 
 ```html
-<script src="./widget.js" data-site-key="degreebaba_dev" data-university-slug="nmims" data-api-base="http://localhost:8000" defer></script>
+<script src="./widget.js" data-site-key="degreebaba_dev" data-university-slug="nmims" data-api-base="http://localhost:2323" defer></script>
 ```
 
 ## Admin
