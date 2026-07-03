@@ -36,8 +36,12 @@ async def ensure_session(pool, session_id: str, site_id: str, page_university_sl
 
 
 async def get_session_context(pool, session_id: str) -> dict[str, Any]:
-    row = await pool.fetchrow("SELECT * FROM session_context WHERE session_id = $1::uuid", session_id)
+    row = await pool.fetchrow(
+        "SELECT current_university_slug, current_course_slug, current_specialization_slug FROM session_context WHERE session_id = $1::uuid",
+        session_id
+    )
     return dict_row(row) or {}
+
 
 
 async def update_session_context(pool, session_id: str, university_slug: str | None, course_slug: str | None, specialization_slug: str | None) -> None:
@@ -313,3 +317,29 @@ async def analytics(pool) -> dict[str, Any]:
         "unanswered_count": int(await pool.fetchval("SELECT count(*) FROM unanswered_questions") or 0),
         "top_universities": dict_rows(await pool.fetch("SELECT page_university_slug, count(*) FROM sessions GROUP BY page_university_slug ORDER BY count(*) DESC LIMIT 10")),
     }
+
+
+async def insert_flagged_message(pool, session_id: str, message: str, reason: str) -> None:
+    await pool.execute(
+        """
+        INSERT INTO flagged_messages(session_id, message, reason)
+        VALUES($1::uuid, $2, $3)
+        """,
+        session_id,
+        message,
+        reason,
+    )
+
+
+async def list_flagged_messages(pool, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+    rows = await pool.fetch(
+        """
+        SELECT id, session_id, message, reason, created_at
+        FROM flagged_messages
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2
+        """,
+        limit,
+        offset,
+    )
+    return dict_rows(rows)

@@ -149,12 +149,16 @@ def patch_llm(monkeypatch):
     fake_chat = MagicMock()
     fake_chat.bind_tools = MagicMock(return_value=fake_chat)
     fake_chat.ainvoke = AsyncMock(side_effect=[decide_ai, synth_ai])
+    monkeypatch.setattr(llm_mod.llm_client, "groq_model", fake_genai_model)
 
-    monkeypatch.setattr(llm_mod.llm_client, "model", fake_genai_model)
+    monkeypatch.setattr(llm_mod.llm_client, "gemini_model", None)
     monkeypatch.setattr(llm_mod.llm_client, "chat_model", fake_chat)
+    monkeypatch.setattr(llm_mod.llm_client, "groq_chat", fake_chat)
+    monkeypatch.setattr(llm_mod.llm_client, "gemini_chat", None)
     monkeypatch.setattr(llm_mod.llm_client, "enabled", True)
 
     return fake_chat
+
 
 
 # ── Graph-level tests ──────────────────────────────────────────────────────
@@ -266,3 +270,47 @@ async def test_graph_lead_ask_appended_when_threshold_met(patch_llm, monkeypatch
     )
     # Should contain the incentive text
     assert "counsellor" in reply_text.lower() or "shortlist" in reply_text.lower() or "PDF" in reply_text
+
+
+@pytest.mark.asyncio
+async def test_graph_loop_iteration_cap(monkeypatch):
+    """
+    Assert the graph terminates at the MAX_TOOL_ITERATIONS cap even if the
+    LLM keeps requesting tool calls.
+    """
+    from langchain_core.messages import AIMessage
+    import agent.graph as graph_mod
+    import agent.llm_client as llm_mod
+
+    # Mock LLM to always return a tool call
+    fake_tool_call = {
+        "name": "get_fee_tool",
+        "args": {"university_slug": "nmims", "course_slug": "mba"},
+        "id": "call_123",
+        "type": "tool_call"
+    }
+    # Mock LLM to keep returning this tool call
+    fake_chat = MagicMock()
+    fake_chat.bind_tools = MagicMock(return_value=fake_chat)
+    fake_chat.ainvoke = AsyncMock(
+        return_value=AIMessage(content="", tool_calls=[fake_tool_call])
+    )
+
+    monkeypatch.setattr(llm_mod.llm_client, "chat_model", fake_chat)
+    monkeypatch.setattr(llm_mod.llm_client, "groq_chat", fake_chat)
+    monkeypatch.setattr(llm_mod.llm_client, "gemini_chat", None)
+    monkeypatch.setattr(llm_mod.llm_client, "enabled", True)
+
+    events = []
+    async for event in graph_mod.run_chat_turn(
+        session_id="55555555-5555-5555-8555-555555555555",
+        site_id="test",
+        message="NMIMS MBA fees",
+        page_university_slug="nmims",
+    ):
+        events.append(event)
+
+    # Verify that the loop terminated and returned a final event
+    assert len(events) > 0
+    assert events[-1]["event"] == "final"
+

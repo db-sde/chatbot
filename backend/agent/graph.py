@@ -30,7 +30,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from agent.guardrail import OFF_TOPIC_REDIRECT, guardrail_check
+from agent.guardrail import OFF_TOPIC_REDIRECT, guardrail_check, get_guardrail_reason
 from agent.llm_client import SYSTEM_PROMPT, llm_client
 from agent.resolve import resolve_entities as _resolve_entities
 from agent.tools import TOOLS, log_anonymous_signal, log_unanswered
@@ -64,6 +64,7 @@ class ChatState(TypedDict, total=False):
     reply: str
     tool_calls_log: list[dict[str, Any]]
     lead_ask: bool
+    tool_call_count: int
 
 
 def _make_state(
@@ -86,6 +87,7 @@ def _make_state(
         "reply": "",
         "tool_calls_log": [],
         "lead_ask": False,
+        "tool_call_count": 0,
     }
 
 
@@ -139,7 +141,18 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
     The LLM (with tools bound) decides which tool(s) to call or returns a
     direct reply.  Supports parallel tool calling in a single response.
     """
-    if llm_client.chat_model is None:
+    if llm_client.groq_chat and llm_client.gemini_chat:
+        model_with_tools = llm_client.groq_chat.bind_tools(TOOLS).with_fallbacks(
+            [llm_client.gemini_chat.bind_tools(TOOLS)]
+        )
+    elif llm_client.groq_chat:
+        model_with_tools = llm_client.groq_chat.bind_tools(TOOLS)
+    elif llm_client.gemini_chat:
+        model_with_tools = llm_client.gemini_chat.bind_tools(TOOLS)
+    else:
+        model_with_tools = llm_client.chat_model.bind_tools(TOOLS) if llm_client.chat_model else None
+
+    if model_with_tools is None:
         # No LLM key — return a static offline fallback.
         return {
             "messages": [
@@ -148,8 +161,6 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
                 )
             ]
         }
-
-    model_with_tools = llm_client.chat_model.bind_tools(TOOLS)
 
     # Inject resolved context so the LLM knows exactly which slugs to pass to tools.
     # Without this, the LLM must guess arguments and often declines to call any tool.
@@ -258,6 +269,28 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
     return {"reply": reply_text, "tool_calls_log": tool_calls_log}
 
 
+async def node_execute_tools(state: ChatState) -> dict[str, Any]:
+    """Execute tools node wrapper that increments the loop counter."""
+    tool_node = ToolNode(TOOLS)
+    result = await tool_node.ainvoke(state)
+    count = state.get("tool_call_count", 0) + 1
+    return {**result, "tool_call_count": count}
+
+
+MAX_TOOL_ITERATIONS = 4
+
+
+def route_after_agent_decide(state: ChatState) -> str:
+    """Decides whether to execute tools or exit synthesis based on iteration cap."""
+    if state.get("tool_call_count", 0) >= MAX_TOOL_ITERATIONS:
+        logger.warning("Agent reached maximum tool call iterations (%d). Bypassing to synthesis.", MAX_TOOL_ITERATIONS)
+        return "synthesize_reply"
+    next_step = tools_condition(state)
+    if next_step == "tools":
+        return "execute_tools"
+    return "synthesize_reply"
+
+
 async def node_update_lead_score(state: ChatState) -> dict[str, Any]:
     """Silent node — scores the turn and sets lead_ask flag if threshold crossed."""
     session_id = state["session_id"]
@@ -284,17 +317,28 @@ def _build_graph() -> Any:
     graph.add_edge(START, "resolve_entities")
     graph.add_edge("resolve_entities", "agent_decide")
 
-    # If the LLM returned tool calls → run them and loop back.
-    # Otherwise → synthesise the final reply.
+def _build_graph() -> Any:
+    graph = StateGraph(ChatState)
+
+    graph.add_node("resolve_entities", node_resolve_entities)
+    graph.add_node("agent_decide", node_agent_decide)
+    graph.add_node("execute_tools", node_execute_tools)
+    graph.add_node("synthesize_reply", node_synthesize_reply)
+    graph.add_node("update_lead_score", node_update_lead_score)
+
+    graph.add_edge(START, "resolve_entities")
+    graph.add_edge("resolve_entities", "agent_decide")
+
     graph.add_conditional_edges(
         "agent_decide",
-        tools_condition,  # returns "tools" or "__end__"
+        route_after_agent_decide,
         {
-            "tools": "execute_tools",
-            END: "synthesize_reply",
+            "execute_tools": "execute_tools",
+            "synthesize_reply": "synthesize_reply",
         },
     )
     graph.add_edge("execute_tools", "agent_decide")  # ReAct loop
+
 
     graph.add_edge("synthesize_reply", "update_lead_score")
     graph.add_edge("update_lead_score", END)
@@ -354,11 +398,14 @@ async def run_chat_turn(
 
     # ── Guardrail: cheap pre-check before any LLM call ──
     if not guardrail_check(message):
+        reason = get_guardrail_reason(message)
+        await queries.insert_flagged_message(pool, session_id, message, reason)
         await queries.insert_message(pool, session_id, "assistant", OFF_TOPIC_REDIRECT, [])
         async for token in _stream_text(OFF_TOPIC_REDIRECT):
             yield {"event": "token", "data": {"text": token}}
         yield {"event": "final", "data": {"lead_ask": False, "quick_replies": []}}
         return
+
 
     # ── Load prior session context so slugs carry forward ──
     context = await queries.get_session_context(pool, session_id)

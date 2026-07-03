@@ -18,12 +18,26 @@ def guardrail_check(message: str) -> bool:
     normalized = " ".join(message.lower().split())
     if any(term in normalized for term in INJECTION_TERMS):
         return False
-    if normalized in SMALL_TALK:
+    
+    # Allow prefix-based small talk and natural greetings
+    small_talk_prefixes = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "good morning", "good afternoon", "good evening"}
+    if any(normalized.startswith(prefix) for prefix in small_talk_prefixes) or normalized in {"how are you", "who are you", "what is your name", "hey there"}:
         return True
+
     return any(term in normalized for term in IN_SCOPE_TERMS)
+
+
+
+def get_guardrail_reason(message: str) -> str:
+    """Classifies the matched block reason for database logging."""
+    normalized = " ".join(message.lower().split())
+    if any(term in normalized for term in INJECTION_TERMS):
+        return "injection_pattern"
+    return "off_topic_keyword"
 
 
 OFF_TOPIC_REDIRECT = (
     "I can help with DegreeBaba university, course, fee, eligibility, admission, and comparison questions. "
     "Ask me about a program like online MBA, BCA, or MCA and I will use DegreeBaba's data."
 )
+

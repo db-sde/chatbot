@@ -1,6 +1,7 @@
 
-
 import json
+import logging
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 import httpx
@@ -21,7 +22,17 @@ from rate_limit import limiter
 from settings import settings
 
 
-app = FastAPI(title="DegreeBaba AI Chatbot", version="0.1.0")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):  # noqa: ARG001
+    await init_pool()
+    yield
+    await close_pool()
+
+
+app = FastAPI(title="DegreeBaba AI Chatbot", version="0.1.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"}))
 app.add_middleware(SlowAPIMiddleware)
@@ -50,15 +61,6 @@ class LeadRequest(BaseModel):
     course_interest: str | None = None
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
-    await init_pool()
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    await close_pool()
-
 
 @app.get("/health")
 async def health() -> dict[str, str]:
@@ -83,10 +85,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
             ):
                 yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
         except Exception as exc:  # noqa: BLE001
-            # Catch any unhandled error (e.g. 429 quota) so the stream ends cleanly
-            # with a visible error token rather than an empty body.
-            import logging
-            logging.getLogger(__name__).error("event_stream error: %s", exc)
+            # Catch any unhandled error (e.g. rate limit) so the stream ends
+            # cleanly with a visible error token rather than an empty body.
+            logger.error("event_stream error: %s", exc)
             error_msg = "I'm temporarily unavailable. Please try again in a moment."
             yield f"event: token\ndata: {json.dumps({'text': error_msg})}\n\n"
             yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
@@ -163,6 +164,17 @@ async def admin_leads(_: Annotated[None, Depends(check_admin_auth)], limit: int 
 async def admin_unanswered(_: Annotated[None, Depends(check_admin_auth)]) -> list[dict]:
     pool = await get_pool()
     return await queries.group_unanswered(pool)
+
+
+@app.get("/admin/flagged")
+async def admin_flagged(
+    _: Annotated[None, Depends(check_admin_auth)],
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    pool = await get_pool()
+    return await queries.list_flagged_messages(pool, limit, offset)
+
 
 
 @app.get("/admin/analytics")

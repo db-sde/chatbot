@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:postgres@localhost:5432/degreebaba_ai"
     gemini_api_key: str | None = None
     groq_api_key: str | None = None
+
     allowed_site_keys: str = '{"degreebaba_dev":["localhost","127.0.0.1"],"degreebaba_prod":["degreebaba.com","www.degreebaba.com"]}'
     allowed_origins_raw: str = Field(default="http://localhost:8000,http://localhost:8080", alias="ALLOWED_ORIGINS")
     crm_webhook_url: str | None = None

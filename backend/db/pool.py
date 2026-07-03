@@ -17,8 +17,17 @@ async def init_pool() -> asyncpg.Pool:
             socket.gethostbyname(host)
         except (socket.gaierror, IndexError):
             db_url = db_url.replace("@db:", "@localhost:")
-        _pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=10)
+        for attempt in range(1, 6):
+            try:
+                _pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=10)
+                break
+            except Exception as exc:
+                if attempt == 5:
+                    raise exc
+                import asyncio
+                await asyncio.sleep(1)
     return _pool
+
 
 
 async def get_pool() -> asyncpg.Pool:

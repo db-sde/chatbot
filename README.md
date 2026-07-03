@@ -1,6 +1,6 @@
 # DegreeBaba AI Chatbot
 
-Production-oriented FastAPI scaffold for the DegreeBaba WordPress chatbot. It uses a single PostgreSQL database with `pgvector`, async `asyncpg` queries, a LangGraph-compatible agent layer, Gemini 2.5 Flash through a thin wrapper, SSE streaming, and a vanilla Shadow DOM widget.
+Production-oriented FastAPI scaffold for the DegreeBaba WordPress chatbot. It uses a single PostgreSQL database with `pgvector`, async `asyncpg` queries, a LangGraph agent powered by **Groq (llama-3.3-70b-versatile)**, SSE streaming, and a vanilla Shadow DOM widget.
 
 ## Setup
 
@@ -14,7 +14,7 @@ Required values:
 
 ```text
 DATABASE_URL=
-GEMINI_API_KEY=
+GROQ_API_KEY=          # get a free key at https://console.groq.com
 ALLOWED_SITE_KEYS=
 ALLOWED_ORIGINS=
 CRM_WEBHOOK_URL=
@@ -44,9 +44,8 @@ The compose file mounts `./ingestion` at `/ingestion` and sets `PYTHONPATH=/app:
 ## Run Locally (with uv Workspace)
 
 ```bash
-# Sync and set up the local workspace virtual environment
-uv sync
-uv pip install -r backend/requirements.txt
+# Sync and set up the local workspace virtual environment (installs all packages)
+uv sync --all-packages
 
 # Run the database migrations from the root folder
 uv run python -m db.migrate
@@ -111,4 +110,4 @@ GET /admin/analytics
 uv run pytest tests -v
 ```
 
-The unit tests monkeypatch the async pool with fixture-like in-memory rows, so they validate tool behavior without requiring Gemini or a live database.
+The unit tests monkeypatch the async pool with fixture-like in-memory rows, so they validate tool behavior without requiring a Groq API key or a live database.
