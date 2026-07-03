@@ -30,7 +30,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from agent.guardrail import OFF_TOPIC_REDIRECT, guardrail_check, get_guardrail_reason
+from agent.guardrail import OFF_TOPIC_REDIRECT
+from security.output_scan import scan_output
 from agent.llm_client import SYSTEM_PROMPT, llm_client
 from agent.resolve import resolve_entities as _resolve_entities
 from agent.tools import TOOLS, log_anonymous_signal, log_unanswered
@@ -443,17 +444,6 @@ async def run_chat_turn(
     await queries.ensure_session(pool, session_id, site_id, page_university_slug)
     await queries.insert_message(pool, session_id, "user", message)
 
-    # ── Guardrail: cheap pre-check before any LLM call ──
-    if not guardrail_check(message):
-        reason = get_guardrail_reason(message)
-        await queries.insert_flagged_message(pool, session_id, message, reason)
-        await queries.insert_message(pool, session_id, "assistant", OFF_TOPIC_REDIRECT, [])
-        async for token in _stream_text(OFF_TOPIC_REDIRECT):
-            yield {"event": "token", "data": {"text": token}}
-        yield {"event": "final", "data": {"lead_ask": False, "quick_replies": []}}
-        return
-
-
     # ── Load prior session context so slugs carry forward ──
     context = await queries.get_session_context(pool, session_id)
 
@@ -486,6 +476,18 @@ async def run_chat_turn(
             "arrange a callback from a counsellor. Just share your name and phone — "
             "or choose 'No thanks' if you prefer to keep browsing."
         )
+
+    # ── Output security scan ──
+    scan = scan_output(reply)
+    if not scan["clean"]:
+        logger.warning(
+            "Output scan blocked response (reason=%s) for session=%s",
+            scan["reason"], session_id,
+        )
+        await queries.insert_flagged_message(
+            pool, session_id, reply[:500], f"output_scan:{scan['reason']}"
+        )
+        reply = scan["safe_reply"]
 
     # ── Persist assistant reply + compact tool log ──
     tool_calls_log: list[dict[str, Any]] = final_state.get("tool_calls_log", [])

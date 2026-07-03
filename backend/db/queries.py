@@ -325,14 +325,23 @@ async def analytics(pool) -> dict[str, Any]:
     }
 
 
-async def insert_flagged_message(pool, session_id: str, message: str, reason: str) -> None:
+async def insert_flagged_message(
+    pool,
+    session_id: str,
+    message: str,
+    layer: str = "unknown",
+    risk_score: float = 0.0,
+    reason: str = "unknown",
+) -> None:
     await pool.execute(
         """
-        INSERT INTO flagged_messages(session_id, message, reason)
-        VALUES($1::uuid, $2, $3)
+        INSERT INTO flagged_messages(session_id, message, layer, risk_score, reason)
+        VALUES($1::uuid, $2, $3, $4, $5)
         """,
         session_id,
         message,
+        layer,
+        risk_score,
         reason,
     )
 
@@ -340,7 +349,7 @@ async def insert_flagged_message(pool, session_id: str, message: str, reason: st
 async def list_flagged_messages(pool, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
     rows = await pool.fetch(
         """
-        SELECT id, session_id, message, reason, created_at
+        SELECT id, session_id, message, layer, risk_score, reason, created_at
         FROM flagged_messages
         ORDER BY created_at DESC
         LIMIT $1 OFFSET $2

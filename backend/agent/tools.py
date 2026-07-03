@@ -6,7 +6,17 @@ from langchain_core.tools import tool
 
 from db import queries
 from db.pool import get_pool
+from security.tool_validator import (
+    validate_course_slug,
+    validate_entity_type,
+    validate_specialization_slug,
+    validate_university_slug,
+)
 
+
+# ---------------------------------------------------------------------------
+# Internal helpers (called by graph.py directly, not via LangChain tools)
+# ---------------------------------------------------------------------------
 
 async def get_fee(university_slug: str, course_slug: str | None = None, specialization_slug: str | None = None) -> dict:
     pool = await get_pool()
@@ -65,15 +75,41 @@ async def log_unanswered(session_id: str, question: str, university_slug: str | 
     await queries.log_unanswered(pool, session_id, question, university_slug, course_slug)
 
 
+# ---------------------------------------------------------------------------
+# LangChain @tool wrappers — with input validation before DB access
+# ---------------------------------------------------------------------------
+
 @tool
 async def get_fee_tool(university_slug: str, course_slug: str | None = None, specialization_slug: str | None = None) -> dict:
     """Return fee data for a university, course, or specialization."""
+    v = await validate_university_slug(university_slug)
+    if not v["is_valid"]:
+        return {"error": v["error"], "not_found": True}
+
+    if course_slug:
+        vc = await validate_course_slug(course_slug)
+        if not vc["is_valid"]:
+            return {"error": vc["error"], "not_found": True}
+
+    if specialization_slug:
+        vs = await validate_specialization_slug(specialization_slug)
+        if not vs["is_valid"]:
+            return {"error": vs["error"], "not_found": True}
+
     return await get_fee(university_slug, course_slug, specialization_slug)
 
 
 @tool
 async def get_eligibility_tool(university_slug: str, course_slug: str) -> dict:
     """Return eligibility data for a course at a university."""
+    v = await validate_university_slug(university_slug)
+    if not v["is_valid"]:
+        return {"error": v["error"], "not_found": True}
+
+    vc = await validate_course_slug(course_slug)
+    if not vc["is_valid"]:
+        return {"error": vc["error"], "not_found": True}
+
     return await get_eligibility(university_slug, course_slug)
 
 
@@ -92,14 +128,43 @@ async def list_courses_tool(
 
 
 @tool
-async def compare_entities_tool(entity_type: str, slugs: list[str], fields: list[str]) -> list[dict]:
+async def compare_entities_tool(entity_type: str, slugs: list[str], fields: list[str]) -> list[dict] | dict:
     """Compare approved fields for universities, courses, or specializations."""
+    vt = await validate_entity_type(entity_type)
+    if not vt["is_valid"]:
+        return {"error": vt["error"]}
+
+    # Validate each slug
+    validator = {
+        "university": validate_university_slug,
+        "course": validate_course_slug,
+        "specialization": validate_specialization_slug,
+    }[entity_type]
+
+    for slug in slugs:
+        v = await validator(slug)
+        if not v["is_valid"]:
+            return {"error": v["error"], "not_found": True}
+
     return await compare_entities(entity_type, slugs, fields)
 
 
 @tool
-async def get_faq_tool(entity_type: str, entity_slug: str, query_text: str | None = None) -> list[dict]:
+async def get_faq_tool(entity_type: str, entity_slug: str, query_text: str | None = None) -> list[dict] | dict:
     """Return FAQs for a university, course, or specialization."""
+    vt = await validate_entity_type(entity_type)
+    if not vt["is_valid"]:
+        return {"error": vt["error"]}
+
+    validator = {
+        "university": validate_university_slug,
+        "course": validate_course_slug,
+        "specialization": validate_specialization_slug,
+    }[entity_type]
+    v = await validator(entity_slug)
+    if not v["is_valid"]:
+        return {"error": v["error"], "not_found": True}
+
     return await get_faq(entity_type, entity_slug, query_text)
 
 

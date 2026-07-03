@@ -19,6 +19,8 @@ from auth import check_admin_auth, validate_site_request
 from db import queries
 from db.pool import close_pool, get_pool, init_pool
 from rate_limit import limiter
+from security.scanner import check_prompt_safety
+from security.policy import check_policy
 from settings import settings
 
 
@@ -75,8 +77,58 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
     if await queries.count_site_messages_today(pool, body.site_key) >= settings.daily_message_cap_per_site:
         raise HTTPException(status_code=429, detail="Daily site message cap exceeded")
 
+    _PROMPT_GUARD_BLOCKED = (
+        "I'm not able to process that message. "
+        "I'm here to help with universities, courses, fees, and admissions."
+    )
+
     async def event_stream():
         try:
+            pool = await get_pool()
+
+            # ── Layer 1: Prompt Guard 2 ──
+            safety = await check_prompt_safety(body.message)
+            if not safety["safe"]:
+                logger.warning(
+                    "Prompt Guard blocked message (score=%.2f reason=%s) session=%s",
+                    safety["risk_score"], safety["reason"], body.session_id,
+                )
+                await queries.insert_flagged_message(
+                    pool, body.session_id, body.message,
+                    layer="prompt_guard",
+                    risk_score=safety["risk_score"],
+                    reason=safety["reason"] or "injection",
+                )
+                await queries.insert_message(pool, body.session_id, "user", body.message)
+                await queries.insert_message(pool, body.session_id, "assistant", _PROMPT_GUARD_BLOCKED, [])
+                yield f"event: token\ndata: {json.dumps({'text': _PROMPT_GUARD_BLOCKED})}\n\n"
+                yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
+                return
+
+            # ── Layer 2: DegreeBaba Policy ──
+            policy = check_policy(body.message)
+            if not policy["passed"]:
+                logger.warning(
+                    "Policy blocked message (rule=%s) session=%s",
+                    policy["rule"], body.session_id,
+                )
+                _POLICY_BLOCKED = (
+                    "I'm DegreeBaba's AI assistant and I can only help with "
+                    "university, course, and admissions questions."
+                )
+                await queries.insert_flagged_message(
+                    pool, body.session_id, body.message,
+                    layer="policy",
+                    risk_score=0.9,
+                    reason=policy["rule"] or "policy_violation",
+                )
+                await queries.insert_message(pool, body.session_id, "user", body.message)
+                await queries.insert_message(pool, body.session_id, "assistant", _POLICY_BLOCKED, [])
+                yield f"event: token\ndata: {json.dumps({'text': _POLICY_BLOCKED})}\n\n"
+                yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
+                return
+
+            # ── Layer 3: LangGraph Agent ──
             async for event in run_chat_turn(
                 session_id=body.session_id,
                 site_id=body.site_key,
@@ -84,9 +136,8 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 page_university_slug=body.page_university_slug,
             ):
                 yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
+
         except Exception as exc:  # noqa: BLE001
-            # Catch any unhandled error (e.g. rate limit) so the stream ends
-            # cleanly with a visible error token rather than an empty body.
             logger.error("event_stream error: %s", exc)
             error_msg = "I'm temporarily unavailable. Please try again in a moment."
             yield f"event: token\ndata: {json.dumps({'text': error_msg})}\n\n"
