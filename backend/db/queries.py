@@ -358,3 +358,72 @@ async def list_flagged_messages(pool, limit: int = 100, offset: int = 0) -> list
         offset,
     )
     return dict_rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Security dashboard helpers (Phase 7)
+# ---------------------------------------------------------------------------
+
+async def get_security_summary(pool) -> dict[str, Any]:
+    """
+    Returns aggregate security metrics for the admin dashboard.
+
+    Fields:
+      total_blocks         — all-time flagged_messages count
+      blocks_by_layer      — breakdown by layer (prompt_guard, policy, output_scan)
+      blocks_by_reason     — breakdown by reason
+      last_24h_blocks      — blocks in the last 24 hours
+    """
+    total_blocks = int(
+        await pool.fetchval("SELECT count(*) FROM flagged_messages") or 0
+    )
+
+    layer_rows = await pool.fetch(
+        """
+        SELECT layer, count(*) AS count
+        FROM flagged_messages
+        GROUP BY layer
+        ORDER BY count DESC
+        """
+    )
+
+    reason_rows = await pool.fetch(
+        """
+        SELECT reason, count(*) AS count
+        FROM flagged_messages
+        GROUP BY reason
+        ORDER BY count DESC
+        """
+    )
+
+    last_24h = int(
+        await pool.fetchval(
+            "SELECT count(*) FROM flagged_messages WHERE created_at >= now() - interval '24 hours'"
+        ) or 0
+    )
+
+    return {
+        "total_blocks": total_blocks,
+        "blocks_by_layer": dict_rows(layer_rows),
+        "blocks_by_reason": dict_rows(reason_rows),
+        "last_24h_blocks": last_24h,
+    }
+
+
+async def get_top_attack_patterns(pool, limit: int = 20) -> list[dict[str, Any]]:
+    """
+    Returns the most commonly blocked message prefixes grouped by reason.
+    Useful for identifying repeat attackers and evolving attack patterns.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT reason, layer, message, count(*) AS occurrences, max(created_at) AS last_seen
+        FROM flagged_messages
+        GROUP BY reason, layer, message
+        ORDER BY occurrences DESC, last_seen DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    return dict_rows(rows)
+

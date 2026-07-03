@@ -89,13 +89,14 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
             # ── Layer 1: Prompt Guard 2 ──
             safety = await check_prompt_safety(body.message)
             if not safety["safe"]:
+                source = safety.get("source", "unknown")
                 logger.warning(
-                    "Prompt Guard blocked message (score=%.2f reason=%s) session=%s",
-                    safety["risk_score"], safety["reason"], body.session_id,
+                    "Prompt Guard blocked message (score=%.4f reason=%s source=%s) session=%s",
+                    safety["risk_score"], safety["reason"], source, body.session_id,
                 )
                 await queries.insert_flagged_message(
                     pool, body.session_id, body.message,
-                    layer="prompt_guard",
+                    layer=f"prompt_guard:{source}",
                     risk_score=safety["risk_score"],
                     reason=safety["reason"] or "injection",
                 )
@@ -104,6 +105,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 yield f"event: token\ndata: {json.dumps({'text': _PROMPT_GUARD_BLOCKED})}\n\n"
                 yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
                 return
+
 
             # ── Layer 2: DegreeBaba Policy ──
             policy = check_policy(body.message)
@@ -234,7 +236,25 @@ async def admin_analytics(_: Annotated[None, Depends(check_admin_auth)]) -> dict
     return await queries.analytics(pool)
 
 
+@app.get("/admin/security/summary")
+async def admin_security_summary(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Security block summary: total, by layer, by reason, last 24h."""
+    pool = await get_pool()
+    return await queries.get_security_summary(pool)
+
+
+@app.get("/admin/security/attacks")
+async def admin_security_attacks(
+    _: Annotated[None, Depends(check_admin_auth)],
+    limit: int = 20,
+) -> list[dict]:
+    """Top attack patterns — most frequent blocked messages grouped by reason."""
+    pool = await get_pool()
+    return await queries.get_top_attack_patterns(pool, limit)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=2323, reload=True)
+
 

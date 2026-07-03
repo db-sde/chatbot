@@ -40,7 +40,7 @@ _EXTRACTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(show|print|output|display|repeat|tell me|reveal|leak)\s+(your\s+)?(system\s+prompt|instructions?|config(uration)?|rules?)", re.I),
     re.compile(r"what\s+(do\s+your|are\s+your)\s+(hidden|internal|secret|initial|original)\s+(instructions?|rules?|prompts?)", re.I),
     re.compile(r"(developer|admin|debug)\s+(mode|instructions?|access|override)", re.I),
-    re.compile(r"(ignore|bypass|skip)\s+(your\s+)?(guidelines?|safety|rules?|policies?|restrictions?)", re.I),
+    re.compile(r"(ignore|bypass|skip|disregard|forget)\s+(previous|all|your)?\s*(instructions?|rules?|guidelines?|prompts?)", re.I),
     re.compile(r"(print|output)\s+everything\s+(above|before|prior)", re.I),
 ]
 
