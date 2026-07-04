@@ -71,7 +71,7 @@ JSON Schema:
 }}
 """
     try:
-        res = await llm_client.generate_json(prompt)
+        res = await llm_client.generate_json(prompt, task="lead_intent")
         
         # Parse output safely and validate keys
         lead_intent = bool(res.get("lead_intent", False))

@@ -1,31 +1,33 @@
+"""Public LLM client facade.
+
+This module is kept as the single import point for the rest of the application
+(agent nodes, tools, lead scoring).  Internally it delegates to the unified
+`llm` layer introduced in Phase B, so no caller needs to know which provider is
+actually serving a request.
+
+The legacy attributes (`groq_model`, `gemini_model`, `groq_chat`, `gemini_chat`,
+`chat_model`) are preserved as compatibility shims so existing tests and
+monkeypatches continue to work.
+"""
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-import random
-import time
-from typing import Any, Callable
+from typing import Any
 
-from groq import AsyncGroq
-from langchain_groq import ChatGroq
-from langchain_google_genai import ChatGoogleGenerativeAI
-from settings import settings
+from langchain_core.messages import HumanMessage
 
+from llm import LLMManager, ModelRegistry
+from llm.types import LLMResponse, ProviderCapability, ToolSpec
 from observability import (
     mark_first_token,
     mark_llm_start,
     record_llm_call_duration,
 )
+from settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Retry configuration for LLM calls
-_MAX_RETRIES = 3
-_BASE_DELAY = 1.0  # seconds
-_MAX_DELAY = 8.0   # seconds
-
-SYSTEM_PROMPT = (
+_SYSTEM_PROMPT = (
     "You are DegreeBaba's AI assistant. "
     "You help students with universities, courses, fees, eligibility, admissions, "
     "specialisations, placements, rankings, and comparisons available in DegreeBaba's catalog. "
@@ -37,114 +39,139 @@ SYSTEM_PROMPT = (
     "the user back to university and course related questions."
 )
 
+SYSTEM_PROMPT = _SYSTEM_PROMPT
+
 
 class LLMClient:
+    """Thin facade over the unified LLM layer."""
+
     def __init__(self) -> None:
-        self.groq_model = None
-        self.groq_chat = None
-        self.gemini_model = None
-        self.gemini_chat = None
-        
-        # 1. Initialize Groq if key exists
-        if settings.groq_api_key:
-            self.groq_model = AsyncGroq(api_key=settings.groq_api_key)
-            self.groq_chat = ChatGroq(
-                model=settings.groq_model_name,
-                api_key=settings.groq_api_key,
-                temperature=0,
-            )
+        self._manager = LLMManager(ModelRegistry(settings.llm_tasks))
+        self._enabled = self._manager.has_task("agent_decide") or self._manager.has_task("entity_resolution")
 
-        # 2. Initialize Gemini if key exists
-        if settings.gemini_api_key:
-            import google.generativeai as genai
-            genai.configure(api_key=settings.gemini_api_key)
-            self.gemini_model = genai.GenerativeModel(settings.gemini_model_name)
-            self.gemini_chat = ChatGoogleGenerativeAI(
-                model=settings.gemini_model_name,
-                google_api_key=settings.gemini_api_key,
-                temperature=0,
-            )
+        # Legacy attributes are stored as plain instance attributes so existing
+        # tests and monkeypatches continue to work.  They are derived from the
+        # unified registry, not hard-coded provider logic.
+        self.groq_model = self._legacy_adapter("groq")
+        self.gemini_model = self._legacy_adapter("gemini")
+        self.groq_chat = self._legacy_chat_model("groq")
+        self.gemini_chat = self._legacy_chat_model("gemini")
+        self.chat_model = self._primary_chat_model()
 
-        self.enabled = bool(self.groq_model or self.gemini_model)
+    def _legacy_adapter(self, provider_name: str) -> Any | None:
+        """Return the named provider adapter from the registry if available."""
+        for task in ("agent_decide", "synthesize", "entity_resolution", "embedding"):
+            try:
+                cfg, adapter = self._manager.registry.get_primary_provider(task)
+                if cfg.provider == provider_name:
+                    return adapter
+            except Exception:
+                continue
+        return None
 
-        # 3. Build the primary with fallbacks
-        if self.groq_chat and self.gemini_chat:
-            self.chat_model = self.groq_chat.with_fallbacks([self.gemini_chat])
-        elif self.groq_chat:
-            self.chat_model = self.groq_chat
-        elif self.gemini_chat:
-            self.chat_model = self.gemini_chat
-        else:
-            self.chat_model = None
-
-    async def _try_groq(self, prompt: str) -> str | None:
-        if not self.groq_model:
+    def _legacy_chat_model(self, provider_name: str) -> Any | None:
+        """Return the named provider's LangChain chat model if available."""
+        adapter = self._legacy_adapter(provider_name)
+        if adapter is None:
             return None
-        response = await self.groq_model.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model=settings.groq_model_name,
-        )
-        return response.choices[0].message.content or ""
-
-    async def _try_gemini(self, prompt: str) -> str | None:
-        if not self.gemini_model:
+        try:
+            return adapter.get_chat_model()
+        except Exception:
             return None
-        response = await self.gemini_model.generate_content_async(prompt)
-        return response.text or ""
 
+    def _primary_chat_model(self) -> Any | None:
+        """Return the primary chat model for the agent_decide task."""
+        try:
+            return self._manager.get_chat_model("agent_decide")
+        except RuntimeError:
+            return None
+
+    # ------------------------------------------------------------------
+    # Backward-compatible attributes
+    # ------------------------------------------------------------------
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    # ------------------------------------------------------------------
+    # Public methods used by application code
+    # ------------------------------------------------------------------
     async def generate_text(self, prompt: str) -> str:
-        if not self.enabled:
+        """Generate plain text from a prompt (used by entity resolution / lead intent)."""
+        try:
+            response = await self._manager.generate("entity_resolution", prompt)
+            if isinstance(response, LLMResponse):
+                return response.content
+            # Defensive: drain stream if misconfigured.
+            text = ""
+            async for chunk in response:
+                text += chunk
+            return text
+        except Exception as exc:
+            logger.warning("generate_text failed: %s", exc)
             return ""
 
-        mark_llm_start()
-        t_start = time.perf_counter()
-
-        providers: list[tuple[str, Callable[[str], Any]]] = [
-            ("groq", self._try_groq),
-            ("gemini", self._try_gemini),
-        ]
-
-        last_error: Exception | None = None
-        for provider_name, provider_fn in providers:
-            for attempt in range(1, _MAX_RETRIES + 1):
-                try:
-                    result = await provider_fn(prompt)
-                    if result is not None:
-                        mark_first_token()
-                        duration_ms = int((time.perf_counter() - t_start) * 1000)
-                        record_llm_call_duration(duration_ms)
-                        return result
-                except Exception as exc:  # noqa: BLE001
-                    last_error = exc
-                    logger.warning(
-                        "%s generate_text attempt %d/%d failed: %s",
-                        provider_name, attempt, _MAX_RETRIES, exc
-                    )
-                    if attempt < _MAX_RETRIES:
-                        delay = min(_BASE_DELAY * (2 ** (attempt - 1)) + random.random(), _MAX_DELAY)
-                        await asyncio.sleep(delay)
-
-        if last_error:
-            logger.error("All LLM providers failed for generate_text: %s", last_error)
-        duration_ms = int((time.perf_counter() - t_start) * 1000)
-        record_llm_call_duration(duration_ms)
-        return ""
-
-    async def generate_json(self, prompt: str) -> dict[str, Any]:
-        text = await self.generate_text(prompt)
-        if not text:
-            return {}
-        stripped = (
-            text.strip()
-            .removeprefix("```json")
-            .removeprefix("```")
-            .removesuffix("```")
-            .strip()
-        )
+    async def generate_json(self, prompt: str, *, task: str = "entity_resolution") -> dict[str, Any]:
+        """Generate a JSON object from a prompt."""
         try:
-            return json.loads(stripped)
-        except json.JSONDecodeError:
+            return await self._manager.generate_json(task, prompt)
+        except Exception as exc:
+            logger.warning("generate_json failed: %s", exc)
             return {}
+
+    async def embed(self, text: str) -> list[float] | None:
+        """Generate an embedding vector for the supplied text."""
+        try:
+            return await self._manager.embed("embedding", text)
+        except Exception as exc:
+            logger.warning("embed failed: %s", exc)
+            return None
+
+    async def generate(
+        self,
+        task: str,
+        prompt: str | list[Any],
+        *,
+        tools: list[ToolSpec] | None = None,
+        stream: bool = False,
+        json_mode: bool = False,
+    ):
+        """Unified generate interface for any registered task."""
+        return await self._manager.generate(
+            task,
+            prompt,
+            tools=tools,
+            stream=stream,
+            json_mode=json_mode,
+        )
+
+    async def stream(self, task: str, prompt: str | list[Any]):
+        """Stream text chunks for any registered task."""
+        return self._manager.generate(task, prompt, stream=True)
 
 
 llm_client = LLMClient()
+
+
+# ---------------------------------------------------------------------------
+# Convenience re-exports so existing imports keep working
+# ---------------------------------------------------------------------------
+def mark_llm_start() -> None:
+    """Re-export observability helper for callers that import it from here."""
+    from observability import mark_llm_start as _mark
+
+    _mark()
+
+
+def mark_first_token() -> None:
+    """Re-export observability helper for callers that import it from here."""
+    from observability import mark_first_token as _mark
+
+    _mark()
+
+
+def record_llm_call_duration(duration_ms: int) -> None:
+    """Re-export observability helper for callers that import it from here."""
+    from observability import record_llm_call_duration as _record
+
+    _record(duration_ms)

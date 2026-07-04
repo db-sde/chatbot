@@ -88,18 +88,7 @@ Return ONLY a JSON object with the following keys. Do not explain, do not add ma
 
 
 async def _get_embedding(text: str) -> list[float] | None:
-    if settings.gemini_api_key:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=settings.gemini_api_key)
-            result = genai.embed_content(
-                model=settings.gemini_embedding_model,
-                contents=text,
-            )
-            return result.get("embedding")
-        except Exception as e:
-            logger.warning("Failed to generate embedding: %s", e)
-    return None
+    return await llm_client.embed(text)
 
 
 async def _snap(entity_type: str, name: str | None) -> str | None:

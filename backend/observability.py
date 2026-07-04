@@ -75,28 +75,33 @@ def timed_tool_execution(func: F) -> F:
 def record_llm_call(response_metadata: dict[str, Any]) -> None:
     """Extract model name, token usage and update cumulative request stats."""
     metadata = request_metadata_var.get()
-    
+
+    # Defensive: ensure context is initialized (helps tests and ad-hoc callers).
+    if not metadata or "input_tokens" not in metadata:
+        init_observability_context()
+        metadata = request_metadata_var.get()
+
     # 1. Extract model name
     model = response_metadata.get("model_name")
     if model:
         metadata["model_name"] = model
-        
+
     # 2. Extract token usage
     usage = response_metadata.get("token_usage") or {}
-    
+
     # Standard format: input/output/total
     input_t = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
     output_t = usage.get("output_tokens") or usage.get("completion_tokens") or 0
     total_t = usage.get("total_tokens") or (input_t + output_t)
-    
+
     metadata["input_tokens"] += input_t
     metadata["output_tokens"] += output_t
     metadata["total_tokens"] += total_t
-    
+
     # 3. Calculate cost
     cost = calculate_message_cost(metadata["model_name"], input_t, output_t) or 0.0
     metadata["estimated_cost_usd"] += cost
-    
+
     request_metadata_var.set(metadata)
 
 def mark_llm_start() -> None:

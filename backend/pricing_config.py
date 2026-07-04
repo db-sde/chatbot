@@ -17,6 +17,31 @@ MODEL_PRICING = {
         "input_per_million": 0.59,
         "output_per_million": 0.79
     },
+    # OpenAI GPT-4o mini
+    "gpt-4o-mini": {
+        "input_per_million": 0.15,
+        "output_per_million": 0.60
+    },
+    # OpenAI GPT-4o
+    "gpt-4o": {
+        "input_per_million": 2.50,
+        "output_per_million": 10.00
+    },
+    # Anthropic Claude 3.5 Sonnet
+    "claude-3-5-sonnet-20241022": {
+        "input_per_million": 3.00,
+        "output_per_million": 15.00
+    },
+    # DeepSeek Chat
+    "deepseek-chat": {
+        "input_per_million": 0.14,
+        "output_per_million": 0.28
+    },
+    # Kimi / Moonshot
+    "moonshot-v1-8k": {
+        "input_per_million": 0.50,
+        "output_per_million": 1.50
+    },
     # Default fallback pricing
     "default": {
         "input_per_million": 0.15,

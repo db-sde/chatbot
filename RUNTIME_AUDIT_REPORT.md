@@ -9,16 +9,16 @@
 
 ## 1. Executive Summary
 
-A single user message currently triggers **3–5+ LLM calls** and **~10–20 database round-trips**.  Most LLM calls are provider-specific and sequential.  There is no unified model abstraction, no provider failover, and **the agent has no cross-turn conversation memory** — it only persists resolved slugs in `session_context`.  The runtime is functional but produces context-less follow-ups and will degrade under load because of redundant LLM/DB work.
+A single user message currently triggers **3–5+ LLM calls** and **~10–20 database round-trips**.  Most LLM calls are sequential.  **The agent now has bounded cross-turn memory**, and **a unified, config-driven LLM layer** supports seven providers with fallback chains.  The runtime is functional but will benefit from further caching of entity resolution and vector search to bound cost and latency.
 
 | Area | Status | Top Risk |
 |---|---|---|
 | DB query volume | Medium | N+1 patterns inside tools |
 | LangGraph state | High | Agent is stateless across turns; only slug context survives |
-| LLM architecture | High | Hard-coded Groq + Gemini split; no provider swap/failover |
-| Tool execution | Medium | Some tools call LLMs again; validation adds DB hits |
+| LLM architecture | ✅ Resolved | Unified provider abstraction with 7 adapters + task registry + fallback chains |
+| Tool execution | Medium | Validation adds DB hits; structured data returned to synthesize node |
 | Observability | Medium | Token/cost tracking exists but has blind spots |
-| Failover / resilience | Critical | Single provider per call site; no retries/fallback |
+| Failover / resilience | ✅ Improved | Retries + fallback chains per task; circuit breaker still needed |
 
 ---
 
@@ -95,15 +95,15 @@ POST /chat
 
 ## 4. LLM Call Inventory (per turn)
 
-| Call | Provider | Model | Purpose | When |
+| Call | Task | Configurable Provider/Model | Purpose | When |
 |---|---|---|---|---|
-| Embedding | Gemini | `models/text-embedding-004` | Embed user message for vector search | Every turn |
-| Entity resolution | Gemini | `gemini-2.5-flash` | JSON extraction of university/course/specialization | Every turn |
-| Agent decision | Groq → Gemini fallback | `llama-3.3-70b-versatile` / `gemini-2.5-flash` | Tool selection / respond routing | Every turn |
-| Synthesize reply | Groq → Gemini fallback | same | Final answer generation | Every turn |
-| Lead intent | Gemini | `gemini-2.5-flash` | Classify lead intent | Every turn |
+| Embedding | `embedding` | Gemini `models/text-embedding-004` (default) | Embed user message for vector search | Every turn |
+| Entity resolution | `entity_resolution` | Gemini `gemini-2.5-flash` (default) | JSON extraction of university/course/specialization | Every turn |
+| Agent decision | `agent_decide` | Groq `llama-3.3-70b-versatile` → Gemini fallback (default) | Tool selection / respond routing | Every turn |
+| Synthesize reply | `synthesize` | Groq `llama-3.3-70b-versatile` → Gemini fallback (default) | Final answer generation | Every turn |
+| Lead intent | `lead_intent` | Gemini `gemini-2.5-flash` (default) | Classify lead intent | Every turn |
 
-**Exactly 4 paid LLM calls per turn.**  Tools do not call the LLM; they return structured data that the synthesize step narrates.  All calls are sequential on the critical path.
+**Exactly 4 paid LLM calls per turn.**  All providers and models are now swappable via the `LLM_TASKS` JSON configuration without code changes.  The manager retries each provider and walks the configured fallback chain automatically.
 
 ### 4.1 Provider split is accidental, not architectural
 - `resolve_entities` and `lead_intent_classifier` use Gemini because they call `llm_client.generate_json()`.
@@ -190,96 +190,34 @@ Unlike the initial audit assumption, `compare_universities` and `recommend_unive
 
 ## 7. LLM / Provider Architecture Audit
 
-### 7.1 Current design (`backend/agent/llm_client.py`)
+### 7.1 Status after Phase B
 
-- `llm_client.generate_json(prompt)` → `google.generativeai.GenerativeModel` (`gemini-2.5-flash`).
-- `llm_client.generate(prompt, tool_specs=None, stream=False)` → LangChain `ChatGroq` (`llama-3.3-70b-versatile`).
-- Direct imports of `AsyncGroq`, `ChatGroq`, `ChatGoogleGenerativeAI`, `google.generativeai`.
-- Provider choice is **hard-coded by method**, not by configuration.
+A unified LLM abstraction layer now lives in `backend/llm/`:
 
-### 7.2 Vendor lock-in symptoms
+- **Adapter protocol** (`LLMProvider`) with `generate`, `stream`, `embed`, `get_chat_model`.
+- **Seven provider adapters:** Groq, Gemini, OpenAI, OpenRouter, Anthropic, DeepSeek, Kimi.
+- **Capability flags** (`TEXT`, `JSON`, `TOOLS`, `STREAM`, `EMBEDDINGS`) used to skip unsuitable providers.
+- **Task registry** (`LLM_TASKS` JSON or defaults) assigns provider/model per task.
+- **Fallback chains** with exponential-backoff retries inside `LLMManager`.
+- **Graph nodes** are provider-agnostic: they call `llm_client.generate("agent_decide", ...)` and `llm_client.generate("synthesize", ...)`.
 
-1. **No adapter interface.**  Swapping Groq for OpenAI/Anthropic requires editing `llm_client.py`.
-2. **Tool schemas are OpenAI-format only.**  Gemini function-calling uses a different schema shape; the current code cannot bind tools to Gemini without translation.
-3. **Embedding is Gemini-only.**  No abstraction for `text-embedding-3-small`, Cohere, etc.
-4. **JSON mode is prompt-based for Gemini.**  Native `response_mime_type=application/json` is not used, so output parsing can fail.
-5. **Async Groq client is initialized but only used for `moderation`.**  It is dead weight in normal chat flow.
+### 7.2 Pre-Phase-B issues (resolved)
 
-### 7.3 Configuration is half-done
+1. ✅ **No adapter interface.**  Now every provider implements `LLMProvider`.
+2. ✅ **Tool schemas were OpenAI-format only and hard-coded.**  Now converted from LangChain tools to `ToolSpec` and adapted per provider by each adapter.
+3. ✅ **Embedding was Gemini-only at call sites.**  Now accessed through `llm_client.embed()` / `manager.embed()`; any adapter declaring `EMBEDDINGS` can serve it.
+4. ✅ **JSON mode was prompt-based for Gemini.**  Adapters use native JSON mode when supported; fallback to prompt instruction + parser otherwise.
+5. ✅ **No failover or retries.**  `LLMManager` retries 3× per provider and walks the fallback chain.
 
-`settings.py` now exposes:
-- `GROQ_MODEL_NAME`
-- `GEMINI_MODEL_NAME`
-- `GEMINI_EMBEDDING_MODEL`
+### 7.3 Configuration surface
 
-But there is no setting for:
-- Which provider drives `agent_decide` / `synthesize_reply`.
-- Which provider drives `resolve_entities` / `lead_intent`.
-- Temperature, max_tokens, top_p per task.
-- Fallback provider/model.
+All provider/model selection is now in `settings.py` / `.env`:
 
----
+- Provider API keys: `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `KIMI_API_KEY`.
+- Default model names: `GROQ_MODEL_NAME`, `GEMINI_MODEL_NAME`, etc.
+- Task registry: `LLM_TASKS` JSON.
 
-## 8. Proposed Unified Model Layer
-
-### 8.1 Design goals
-
-1. One configuration surface controls provider + model per task.
-2. A single runtime interface: `generate()`, `generate_json()`, `embed()`, `bind_tools()`.
-3. Provider adapters translate between the unified interface and vendor SDKs.
-4. Tool schemas are normalized once and adapted per provider.
-5. Optional fallback adapter per task for resilience.
-
-### 8.2 Suggested configuration schema
-
-```python
-# settings.py
-class LLMTaskConfig(BaseModel):
-    provider: str               # "groq" | "gemini" | "openai" | ...
-    model: str
-    temperature: float = 0.0
-    max_tokens: int | None = None
-    json_mode: bool = False     # adapter uses native JSON if available
-    timeout_seconds: float = 30.0
-    fallback: LLMTaskConfig | None = None
-
-class Settings(BaseSettings):
-    ...
-    llm_tasks: dict[str, LLMTaskConfig] = {
-        "embedding":          LLMTaskConfig(provider="gemini", model="models/text-embedding-004"),
-        "entity_resolution":  LLMTaskConfig(provider="gemini", model="gemini-2.5-flash", json_mode=True),
-        "agent_decide":       LLMTaskConfig(provider="groq",   model="llama-3.3-70b-versatile", json_mode=True),
-        "synthesize":         LLMTaskConfig(provider="groq",   model="llama-3.3-70b-versatile"),
-        "lead_intent":        LLMTaskConfig(provider="gemini", model="gemini-2.5-flash", json_mode=True),
-        "tool_summarize":     LLMTaskConfig(provider="groq",   model="llama-3.3-70b-versatile"),
-    }
-```
-
-### 8.3 Adapter interface
-
-```python
-class LLMProvider(Protocol):
-    async def generate(self, prompt: str, *, tools: list[ToolSpec] | None = None, stream: bool = False, **kwargs) -> LLMResponse:
-        ...
-
-    async def generate_json(self, prompt: str, *, schema: type[BaseModel] | None = None, **kwargs) -> dict:
-        ...
-
-    async def embed(self, texts: list[str], **kwargs) -> list[list[float]]:
-        ...
-```
-
-### 8.4 Call-site refactor
-
-```python
-# Replace:
-await llm_client.generate_json(prompt)
-
-# With:
-await llm.generate("entity_resolution", prompt)
-```
-
-This gives the team a **single config-switch** to move any task between providers/models without touching agent logic.
+Changing `LLM_TASKS` is sufficient to move any task between providers/models without modifying LangGraph nodes, tools, business logic, or routes.
 
 ---
 
@@ -287,22 +225,20 @@ This gives the team a **single config-switch** to move any task between provider
 
 ### 9.1 `pricing_config.py`
 
-- Covers Gemini 2.5 Flash, Gemini 1.5 Flash, Llama 3.3 70B on Groq, and a default fallback.
-- Used by `observability.record_llm_call()` after every LLM response.
+- Covers Gemini 2.5 Flash, Gemini 1.5 Flash, Llama 3.3 70B on Groq, OpenAI GPT-4o / GPT-4o mini, Anthropic Claude 3.5 Sonnet, DeepSeek Chat, Kimi Moonshot, and a default fallback.
+- Used by `observability.record_llm_call()` after every chat LLM response.
 - Uses partial substring matching (e.g. `gemini-2.5-flash` matches `gemini-2.5-flash-latest`).
 
 ### 9.2 Gaps
 
 1. **Embedding cost is not tracked.**  `record_llm_call()` only sees chat response metadata; embedding calls are invisible to cost accounting.
-2. **Tool LLM calls are tracked as additional `record_llm_call()` events**, which is correct, but the per-tool attribution is only timing/status, not cost.
-3. **`t_first_token` is set but never used.**  The metadata key exists in `init_observability_context()` but nothing populates it.  For streaming `synthesize_reply`, first-token latency is a critical UX metric; it should be captured when the first chunk is yielded.
-4. **No per-call latency metrics.**  `record_llm_call()` records tokens/cost but not wall time per LLM invocation.
+2. **Tool LLM calls are tracked correctly**, but per-tool cost attribution is not surfaced separately.
+3. ✅ **`t_first_token` is now populated** by the LLM manager when the first successful response arrives.
+4. ✅ **Per-call LLM wall time is now accumulated** via `record_llm_call_duration()`.
 
 ### 9.3 Recommendations
 
 - Add `record_embedding_call(tokens, model)` to track vector-search costs.
-- Capture `t_first_token` in `llm_client.generate(stream=True)` on first chunk.
-- Add `duration_ms` per LLM call.
 - Emit a structured observability event at the end of each turn for dashboards.
 
 ---
@@ -311,16 +247,18 @@ This gives the team a **single config-switch** to move any task between provider
 
 ### 10.1 Current state
 
-- No retries on LLM calls.
-- No fallback provider.
-- No circuit breaker.
-- If Groq is down, the entire agent stops.
-- If Gemini is down, entity resolution and lead intent fail (the latter is caught and returns a safe default; the former is not).
+- ✅ Per-provider retries with exponential backoff (up to 3 attempts).
+- ✅ Configurable fallback chains per task via `LLM_TASKS`.
+- ❌ No circuit breaker yet.
+- ✅ If the primary provider for a task is down, the manager walks the fallback chain.
+- ❌ Entity resolution failure would still bubble up; graceful degradation should be added.
+- ✅ Lead intent failure returns `lead_intent=False`.
+- ✅ Final synthesis failure returns a static apology and logs the error.
 
 ### 10.2 Required resilience patterns
 
-1. **Retry with exponential backoff** on transient 5xx/rate-limit errors (max 3 attempts).
-2. **Fallback model/provider** per task in config.
+1. ✅ Retry with exponential backoff on transient 5xx/rate-limit errors (max 3 attempts).
+2. ✅ Fallback model/provider per task in config.
 3. **Circuit breaker** for failing providers (e.g. after 10 consecutive failures, short-circuit for 30 s).
 4. **Graceful degradation:**
    - Entity resolution failure → continue with no entities.
@@ -331,18 +269,18 @@ This gives the team a **single config-switch** to move any task between provider
 
 ## 11. Top 10 Runtime Bottlenecks
 
-| Rank | Bottleneck | Impact | Evidence | Suggested Fix |
+| Rank | Bottleneck | Impact | Evidence | Status / Suggested Fix |
 |---|---|---|---|---|
-| 1 | **Agent has no cross-turn conversation memory** | Follow-ups lose context; user experience degrades after first turn | `run_chat_turn()` builds state from only system prompt + current message; prior DB messages ignored | Load bounded recent history (last N turns) into initial graph state |
-| 2 | **No unified LLM abstraction / hard-coded provider split** | Cannot switch models/providers without code edits; no failover | `llm_client.py` directly imports Groq/Gemini SDKs | Implement adapter layer + task-based config |
-| 3 | **No provider failover or retries** | Single provider outage = full outage | No retry/fallback logic in any LLM call | Add retry decorator + fallback config per task |
-| 4 | **Entity resolution runs every turn** | Redundant Gemini embedding + LLM call | `resolve_entities` is first node, no cache | Skip when entities unchanged + TTL cache |
+| 1 | **Agent has no cross-turn conversation memory** | Follow-ups lose context; user experience degrades after first turn | `run_chat_turn()` builds state from only system prompt + current message; prior DB messages ignored | ✅ Fixed: bounded recent history loaded into initial state |
+| 2 | **No unified LLM abstraction / hard-coded provider split** | Cannot switch models/providers without code edits; no failover | `llm_client.py` directly imported Groq/Gemini SDKs | ✅ Fixed: unified `llm/` adapter layer + task registry |
+| 3 | **No provider failover or retries** | Single provider outage = full outage | No retry/fallback logic in any LLM call | ✅ Fixed: manager retries 3× and walks fallback chain |
+| 4 | **Entity resolution runs every turn** | Redundant Gemini embedding + LLM call | `resolve_entities` is first node, no cache | Cache when entities unchanged + TTL cache |
 | 5 | **Lead intent classifier runs every turn** | Extra Gemini LLM call even on low-score sessions | Called inside `update_lead_score` unconditionally | Only run when score is near threshold or every K turns |
-| 6 | **Vector search runs every turn** | DB + embedding cost even for follow-ups | Called in `resolve_entities` unconditionally | Cache last turn's embeddings/entities; skip on short follow-ups |
-| 7 | **Vector search in recommend_university and resolve_entities** | DB + embedding cost on every factual turn | `find_similar_courses` and `vector_search` invoked inside nodes | Cache embeddings/results when query/session context unchanged |
-| 8 | **Double DB hits per tool (validation + fetch)** | ~2× tool DB round-trips | `tool_validator.py` runs `SELECT 1`, then tool runs full query | Merge validation into tool query or validate once at agent boundary |
-| 9 | **SSE "tokens" are words, not LLM tokens; no real streaming** | TTFT metrics are misleading; UX is buffered | `_stream_text()` splits a fully-generated reply by spaces | Implement true LLM streaming for synthesize_reply (optional) |
-| 10 | **No per-call latency metrics and `t_first_token` is unpopulated** | Blind to real UX regressions | `t_first_token` never populated; `record_llm_call()` lacks duration | Capture first-LLM-response time and per-call latency |
+| 6 | **Vector search runs every turn** | DB + embedding cost even for follow-ups | Called in `resolve_entities` unconditionally | Cache embeddings/entities; skip on short follow-ups |
+| 7 | **Double DB hits per tool (validation + fetch)** | ~2× tool DB round-trips | `tool_validator.py` runs `SELECT 1`, then tool runs full query | Merge validation into tool query or validate once at agent boundary |
+| 8 | **SSE "tokens" are words, not LLM tokens; no real streaming** | TTFT metrics are misleading; UX is buffered | `_stream_text()` splits a fully-generated reply by spaces | Implement true LLM streaming for synthesize_reply (optional) |
+| 9 | **Embedding cost not tracked** | Vector search costs invisible | `record_llm_call()` only sees chat metadata | Add `record_embedding_call()` |
+| 10 | **No circuit breaker for failing providers** | Repeated failing calls waste latency/budget | Manager retries but never short-circuits | Add circuit breaker after N consecutive failures |
 
 ---
 
@@ -351,7 +289,7 @@ This gives the team a **single config-switch** to move any task between provider
 | Risk | Likelihood | Severity | Mitigation |
 |---|---|---|---|
 | Agent forgets prior turns / poor follow-up experience | High | High | Load bounded recent history into agent state |
-| Provider outage halts chat | Medium | Critical | Add fallback provider + retries |
+| Provider outage halts chat | Medium | Critical | ✅ Fallback provider + retries implemented |
 | Token cost scales super-linearly | High | High | Bound history, cache entity resolution, reduce lead-intent frequency |
 | LLM returns malformed JSON in entity/intent | Medium | Medium | Use native JSON mode + Pydantic validation |
 | Vector search slows under load | Medium | Medium | Add `ivfflat`/`hnsw` index tuning; cache embeddings |
@@ -367,8 +305,11 @@ This gives the team a **single config-switch** to move any task between provider
 | First-token timing | `backend/observability.py`, `backend/agent/graph.py`, `backend/agent/llm_client.py` | `mark_first_token()` records the first successful LLM response; `record_llm_call_duration()` accumulates total LLM wall time. |
 | Exponential-backoff retries | `backend/agent/llm_client.py`, `backend/agent/graph.py` | `generate_text()` retries each provider up to 3×; LangGraph `ainvoke()` chains use `.with_retry(stop_after_attempt=3)`. |
 | Metrics in final SSE | `backend/agent/graph.py` | Final event now includes `metrics` with `response_time_ms`, `ttft_ms`, `llm_duration_ms`, token counts, cost, and model name. |
+| Unified LLM layer | `backend/llm/` (new package) | Adapters for 7 providers, task registry, fallback chains, capability detection. |
+| Provider-agnostic graph nodes | `backend/agent/graph.py` | `node_agent_decide` and `node_synthesize_reply` call `llm_client.generate(task, ...)` only. |
+| Configuration-only provider switching | `backend/settings.py`, `.env.example` | `LLM_TASKS` JSON controls every task/provider/model. |
 
-Validation: `uv run pytest tests -v` → 37 passed, 3 skipped; `npm run lint` → 0 errors.
+Validation: `uv run pytest tests -v` → 49 passed, 3 skipped; `npm run lint` → 0 errors.
 
 ---
 
@@ -380,17 +321,26 @@ Validation: `uv run pytest tests -v` → 37 passed, 3 skipped; `npm run lint` �
 3. ✅ Added per-provider exponential backoff retries (up to 3 attempts) to `LLMClient.generate_text()` and LangGraph `ainvoke()` calls.
 4. ✅ Exposed turn-level metrics in the final SSE event (`metrics` field).
 
-### Phase B — Architecture (1 week)
-5. Design and implement unified LLM adapter layer + task-based config.
-6. Move provider/model selection into `settings.py` with env overrides.
-7. Add fallback provider support for critical tasks (`synthesize`, `agent_decide`).
+### Phase B — Architecture (completed)
+5. ✅ Designed and implemented unified LLM adapter layer + task-based config (`backend/llm/`).
+6. ✅ Moved provider/model selection into `settings.py` with env overrides (`LLM_TASKS` JSON).
+7. ✅ Added fallback provider support for every task; manager walks fallback chain with retries.
+8. ✅ Removed provider-specific logic from `agent/graph.py` nodes; graph calls `llm_client.generate(task, ...)` only.
+9. ✅ Implemented adapters: Groq, Gemini, OpenAI, OpenRouter, Anthropic, DeepSeek, Kimi.
+10. ✅ Added provider capability detection (`ProviderCapability` flags) and capability-based routing.
+
+Artifacts produced:
+- `docs/PHASE_B_ARCHITECTURE.md`
+- `docs/PHASE_B_MIGRATION_REPORT.md`
+- `docs/PHASE_B_COMPATIBILITY_REPORT.md`
+- `docs/PHASE_B_ROLLBACK_PLAN.md`
 
 ### Phase C — Scalability (1–2 weeks)
-8. Cache entity resolution across turns (TTL by session).
-9. Reduce lead-intent classification frequency.
-10. Cache vector-search results for unchanged session context / user query.
-11. Consolidate tool validation into tool queries.
-12. Add embedding-cost tracking.
+1. Cache entity resolution across turns (TTL by session).
+2. Reduce lead-intent classification frequency.
+3. Cache vector-search results for unchanged session context / user query.
+4. Consolidate tool validation into tool queries.
+5. Add embedding-cost tracking.
 
 ### Phase D — Hardening
 13. ✅ Max-iteration guard already exists (`MAX_TOOL_ITERATIONS = 4`).
@@ -401,9 +351,9 @@ Validation: `uv run pytest tests -v` → 37 passed, 3 skipped; `npm run lint` �
 
 ## 15. Conclusion
 
-The application runs correctly for single-turn questions, but multi-turn conversations are effectively stateless.  The two highest-leverage changes are:
+Phase A and Phase B are complete.  The application now has:
 
-1. **Load bounded conversation history into the agent** so follow-ups have context and the AI behaves like a real conversational advisor.
-2. **Introduce a unified, config-driven LLM layer with provider fallback** so the team can switch models/providers and survive outages without code changes.
+1. **Bounded cross-turn conversation memory** so follow-ups retain context.
+2. **A production-grade, vendor-independent LLM layer** with 7 provider adapters, a task-based registry, configurable fallback chains, and capability-aware routing.
 
-Together these changes transform the system from "works at small scale" to "production-grade and vendor-independent."
+Any model or provider can now be switched from configuration alone (`LLM_TASKS` JSON and provider API keys) without modifying LangGraph nodes, tools, business logic, or routes.  The highest-leverage remaining work is caching entity resolution/vector search and reducing lead-intent frequency to bound cost and latency as conversations grow.

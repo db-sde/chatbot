@@ -24,8 +24,6 @@ import logging
 import time
 from typing import Annotated, Any, AsyncIterator, TypedDict
 
-import groq
-
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -43,9 +41,10 @@ from observability import (
     init_observability_context,
     mark_llm_start,
     mark_first_token,
-    record_llm_call,
     record_llm_call_duration,
 )
+from llm.adapters.base import langchain_tools_to_specs, llm_response_to_ai_message
+from llm.types import LLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -210,30 +209,11 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
     The LLM (with tools bound) decides which tool(s) to call or returns a
     direct reply.  Supports parallel tool calling in a single response.
 
-    A context note is only injected when slugs were established through real
-    user intent (extraction or prior conversational context).  Page-hint-only
-    resolutions (e.g. greeting on an NMIMS page) produce no context note so
-    the LLM is free to reply naturally.
+    This node is fully provider-agnostic: it calls the unified LLM layer with
+    the "agent_decide" task and converts the normalized response back into a
+    LangChain AIMessage.
     """
-    if llm_client.groq_chat and llm_client.gemini_chat:
-        model_with_tools = llm_client.groq_chat.bind_tools(TOOLS).with_retry(
-            stop_after_attempt=3
-        ).with_fallbacks(
-            [llm_client.gemini_chat.bind_tools(TOOLS).with_retry(stop_after_attempt=3)]
-        )
-    elif llm_client.groq_chat:
-        model_with_tools = llm_client.groq_chat.bind_tools(TOOLS).with_retry(stop_after_attempt=3)
-    elif llm_client.gemini_chat:
-        model_with_tools = llm_client.gemini_chat.bind_tools(TOOLS).with_retry(stop_after_attempt=3)
-    else:
-        model_with_tools = (
-            llm_client.chat_model.bind_tools(TOOLS).with_retry(stop_after_attempt=3)
-            if llm_client.chat_model
-            else None
-        )
-
-    if model_with_tools is None:
-        # No LLM key — return a static offline fallback.
+    if not llm_client.enabled:
         return {
             "messages": [
                 AIMessage(
@@ -269,21 +249,23 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
     mark_llm_start()
     t_start = time.perf_counter()
     try:
-        response: AIMessage = await model_with_tools.ainvoke(_clean_messages(messages))
+        response = await llm_client.generate(
+            "agent_decide",
+            _clean_messages(messages),
+            tools=langchain_tools_to_specs(TOOLS),
+        )
+        if isinstance(response, LLMResponse):
+            mark_first_token()
+            ai_message = llm_response_to_ai_message(response)
+            return {"messages": [ai_message]}
+        # Streaming is not expected here; drain defensively.
+        text = ""
+        async for chunk in response:
+            text += chunk
         mark_first_token()
-        if hasattr(response, "response_metadata"):
-            record_llm_call(response.response_metadata)
-    except groq.RateLimitError:
-        logger.warning("Groq rate limit hit in node_agent_decide — returning rate-limit message.")
-        return {
-            "messages": [
-                AIMessage(
-                    content="I'm temporarily unavailable due to high demand. Please try again in a moment."
-                )
-            ]
-        }
+        return {"messages": [AIMessage(content=text)]}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Groq agent call failed: %s", exc)
+        logger.warning("agent_decide failed: %s", exc)
         return {
             "messages": [
                 AIMessage(
@@ -293,8 +275,6 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
         }
     finally:
         record_llm_call_duration(int((time.perf_counter() - t_start) * 1000))
-
-    return {"messages": [response]}  # add_messages will append, not replace
 
 
 async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
@@ -355,7 +335,7 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
         }
 
     # Tool calls ran — ask the LLM to synthesise a final reply.
-    if llm_client.chat_model is None:
+    if not llm_client.enabled:
         reply_text = (
             "I found the data but couldn't format it — please check with our team."
         )
@@ -372,17 +352,21 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
         mark_llm_start()
         t_start = time.perf_counter()
         try:
-            response: AIMessage = await llm_client.chat_model.with_retry(
-                stop_after_attempt=3
-            ).ainvoke(_clean_messages(synthesis_messages))
-            mark_first_token()
-            if hasattr(response, "response_metadata"):
-                record_llm_call(response.response_metadata)
-            reply_text = str(response.content) if response.content else (
-                "I found the data but couldn't format it — please check with our team."
-            )
+            response = await llm_client.generate("synthesize", _clean_messages(synthesis_messages))
+            if isinstance(response, LLMResponse):
+                mark_first_token()
+                reply_text = str(response.content) if response.content else (
+                    "I found the data but couldn't format it — please check with our team."
+                )
+            else:
+                # Streaming is not expected here; drain defensively.
+                text = ""
+                async for chunk in response:
+                    text += chunk
+                mark_first_token()
+                reply_text = text
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Groq synthesis failed: %s", exc)
+            logger.warning("synthesize failed: %s", exc)
             reply_text = "I found the data but couldn't format it — please try again in a moment."
         finally:
             record_llm_call_duration(int((time.perf_counter() - t_start) * 1000))

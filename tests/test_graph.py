@@ -124,41 +124,39 @@ def patch_pool(monkeypatch):
 @pytest.fixture()
 def patch_llm(monkeypatch):
     """
-    Replace both the bare genai model and the LangChain chat_model so the
-    graph can run without a real API key.
-
-    chat_model.bind_tools() returns a Runnable whose ainvoke() returns an
-    AIMessage with no tool_calls — simulating the LLM choosing a direct reply.
+    Replace the unified LLM generate calls so the graph runs without a real
+    API key.  The graph now calls llm_client.generate("agent_decide", ...) and
+    llm_client.generate("synthesize", ...), which return normalized LLMResponse
+    objects.
     """
     from langchain_core.messages import AIMessage
     import agent.llm_client as llm_mod
+    from llm.types import LLMResponse
+    import agent.resolve as resolve_mod
 
-    # ── Bare model (entity extraction) ──
-    fake_genai_model = MagicMock()
-    fake_response = MagicMock()
-    fake_response.choices = [
-        MagicMock(message=MagicMock(content='{"university": "nmims", "course": "mba"}'))
-    ]
-    fake_genai_model.chat.completions.create = AsyncMock(return_value=fake_response)
+    # ── Entity extraction (resolve.py) ──
+    async def fake_generate_json(prompt, *, task="entity_resolution"):
+        return {"university": "nmims", "course": "mba"}
 
-    # ── LangChain chat model (agent_decide + synthesize_reply) ──
-    # First call (agent_decide): return direct reply, no tool calls
-    # Second call (synthesize_reply): return a final answer
-    decide_ai = AIMessage(content="", tool_calls=[])
-    synth_ai = AIMessage(content="The NMIMS Online MBA fee is Rs 2,20,000.")
+    monkeypatch.setattr(resolve_mod.llm_client, "generate_json", fake_generate_json)
 
-    fake_chat = MagicMock()
-    fake_chat.bind_tools = MagicMock(return_value=fake_chat)
-    fake_chat.ainvoke = AsyncMock(side_effect=[decide_ai, synth_ai])
-    monkeypatch.setattr(llm_mod.llm_client, "groq_model", fake_genai_model)
+    # ── Agent decide / synthesize (graph.py) ──
+    # First call (agent_decide): direct reply, no tool calls
+    # Second call (synthesize): final answer
+    decide_response = LLMResponse(content="", tool_calls=[])
+    synth_response = LLMResponse(content="The NMIMS Online MBA fee is Rs 2,20,000.")
 
-    monkeypatch.setattr(llm_mod.llm_client, "gemini_model", None)
-    monkeypatch.setattr(llm_mod.llm_client, "chat_model", fake_chat)
-    monkeypatch.setattr(llm_mod.llm_client, "groq_chat", fake_chat)
-    monkeypatch.setattr(llm_mod.llm_client, "gemini_chat", None)
-    monkeypatch.setattr(llm_mod.llm_client, "enabled", True)
+    _call_count = {"n": 0}
 
-    return fake_chat
+    async def fake_generate(task, prompt, *, tools=None, stream=False, json_mode=False):
+        _call_count["n"] += 1
+        if task == "agent_decide":
+            return decide_response
+        return synth_response
+
+    monkeypatch.setattr(llm_mod.llm_client, "generate", fake_generate)
+
+    return fake_generate
 
 
 
@@ -282,6 +280,14 @@ async def test_graph_loop_iteration_cap(monkeypatch):
     from langchain_core.messages import AIMessage
     import agent.graph as graph_mod
     import agent.llm_client as llm_mod
+    import agent.resolve as resolve_mod
+    from llm.types import LLMResponse
+
+    # Mock entity extraction
+    async def fake_generate_json(prompt, *, task="entity_resolution"):
+        return {"university": "nmims", "course": "mba"}
+
+    monkeypatch.setattr(resolve_mod.llm_client, "generate_json", fake_generate_json)
 
     # Mock LLM to always return a tool call
     fake_tool_call = {
@@ -290,17 +296,11 @@ async def test_graph_loop_iteration_cap(monkeypatch):
         "id": "call_123",
         "type": "tool_call"
     }
-    # Mock LLM to keep returning this tool call
-    fake_chat = MagicMock()
-    fake_chat.bind_tools = MagicMock(return_value=fake_chat)
-    fake_chat.ainvoke = AsyncMock(
-        return_value=AIMessage(content="", tool_calls=[fake_tool_call])
-    )
 
-    monkeypatch.setattr(llm_mod.llm_client, "chat_model", fake_chat)
-    monkeypatch.setattr(llm_mod.llm_client, "groq_chat", fake_chat)
-    monkeypatch.setattr(llm_mod.llm_client, "gemini_chat", None)
-    monkeypatch.setattr(llm_mod.llm_client, "enabled", True)
+    async def fake_generate(task, prompt, *, tools=None, stream=False, json_mode=False):
+        return LLMResponse(content="", tool_calls=[fake_tool_call])
+
+    monkeypatch.setattr(llm_mod.llm_client, "generate", fake_generate)
 
     events = []
     async for event in graph_mod.run_chat_turn(

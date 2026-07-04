@@ -11,8 +11,37 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "postgresql://postgres:postgres@localhost:5432/degreebaba_ai"
-    gemini_api_key: str | None = None
+    # Provider API keys
     groq_api_key: str | None = None
+    gemini_api_key: str | None = None
+    openai_api_key: str | None = None
+    openai_base_url: str | None = None
+    openrouter_api_key: str | None = None
+    openrouter_base_url: str | None = "https://openrouter.ai/api/v1"
+    anthropic_api_key: str | None = None
+    deepseek_api_key: str | None = None
+    deepseek_base_url: str | None = "https://api.deepseek.com"
+    kimi_api_key: str | None = None
+    kimi_base_url: str | None = "https://api.moonshot.cn/v1"
+
+    # Default model names (used when LLM_TASKS JSON does not override)
+    groq_model_name: str = "llama-3.3-70b-versatile"
+    gemini_model_name: str = "gemini-2.5-flash"
+    gemini_embedding_model: str = "models/text-embedding-004"
+    openai_model_name: str = "gpt-4o-mini"
+    openrouter_model_name: str = "openai/gpt-4o-mini"
+    anthropic_model_name: str = "claude-3-5-sonnet-20241022"
+    deepseek_model_name: str = "deepseek-chat"
+    kimi_model_name: str = "moonshot-v1-8k"
+
+    # Task-based model registry JSON.  Example:
+    # {
+    #   "agent_decide": {"provider": "groq", "model": "llama-3.3-70b-versatile",
+    #                    "capabilities_required": ["text", "tools"],
+    #                    "fallback": [{"provider": "gemini", "model": "gemini-2.5-flash"}]},
+    #   "synthesize": {"provider": "openai", "model": "gpt-4o"}
+    # }
+    llm_tasks: str = ""
 
     allowed_site_keys: str = '{"degreebaba_dev":["localhost","127.0.0.1"],"degreebaba_prod":["degreebaba.com","www.degreebaba.com"]}'
     crm_webhook_url: str | None = None
@@ -20,11 +49,6 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 10
     daily_message_cap_per_site: int = 2000
     postgres_password: str = "postgres"
-
-    # LLM model names (configurable so providers/models can be swapped without code changes)
-    groq_model_name: str = "llama-3.3-70b-versatile"
-    gemini_model_name: str = "gemini-2.5-flash"
-    gemini_embedding_model: str = "models/text-embedding-004"
 
     # Comma-separated list of IPs that are trusted to set X-Forwarded-For
     # (your reverse proxy — Nginx/Caddy/Cloudflare Tunnel). Required for
