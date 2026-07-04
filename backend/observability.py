@@ -5,8 +5,11 @@ import logging
 import contextvars
 import ipaddress
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable, TypeVar
 import functools
+import inspect
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 from pricing_config import calculate_message_cost
 
@@ -35,10 +38,10 @@ def init_observability_context() -> None:
         "estimated_cost_usd": 0.0,
     })
 
-def timed_tool_execution(func):
+def timed_tool_execution(func: F) -> F:
     """Decorator to time tool execution, capture status, and record metrics in ContextVar."""
     @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
         started_at = datetime.now(timezone.utc).isoformat()
         t_start = time.perf_counter()
         status = "SUCCESS"
@@ -66,7 +69,9 @@ def timed_tool_execution(func):
         tool_metrics_var.set(current_metrics + [metric])
         
         return result
-    return wrapper
+    
+    wrapper.__signature__ = inspect.signature(func)  # type: ignore
+    return wrapper  # type: ignore
 
 def record_llm_call(response_metadata: dict[str, Any]) -> None:
     """Extract model name, token usage and update cumulative request stats."""

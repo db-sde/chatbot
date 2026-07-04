@@ -68,9 +68,9 @@ DEFAULT_COMPARISON_FIELDS = [
 # Small internal helpers
 # ---------------------------------------------------------------------------
 
-def _fail(reason: str, **extra: Any) -> dict[str, Any]:
+def _fail(reason: str | None, **extra: Any) -> dict[str, Any]:
     """Uniform failure envelope. See module docstring for why this matters."""
-    payload: dict[str, Any] = {"not_found": True, "reason": reason}
+    payload: dict[str, Any] = {"not_found": True, "reason": reason or "unknown_error"}
     payload.update(extra)
     return payload
 
