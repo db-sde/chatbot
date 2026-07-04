@@ -123,4 +123,8 @@ export const api = {
   async getAnalyticsFunnel() {
     return request("/analytics/funnel");
   },
+
+  async getAnalyticsLeads() {
+    return request("/analytics/leads");
+  },
 };

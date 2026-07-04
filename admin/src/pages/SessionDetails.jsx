@@ -121,6 +121,46 @@ export default function SessionDetails() {
         </div>
       </div>
 
+      {/* Prominent Lead Profile Banner */}
+      {leads.length > 0 && (
+        <div className="bg-gradient-to-r from-emerald-950/40 to-blue-950/20 border border-emerald-500/30 rounded-xl p-6 flex flex-col justify-between gap-4 shadow-[0_0_15px_rgba(16,185,129,0.05)]">
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+            <div className="space-y-1">
+              <span className="text-[10px] text-emerald-400 font-bold uppercase tracking-wider">Acquired Lead Profile</span>
+              <h2 className="text-xl font-extrabold text-gray-100">{leads[0].name}</h2>
+              <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-gray-400 pt-1">
+                <span className="font-semibold">Phone: <strong className="text-gray-200 font-mono">{leads[0].phone}</strong></span>
+                <span className="text-gray-600 font-bold">•</span>
+                <span>Email: <strong className="text-gray-200 font-mono">{leads[0].email || "—"}</strong></span>
+              </div>
+            </div>
+            
+            <div className="flex flex-col items-start md:items-end text-left md:text-right gap-1 shrink-0">
+              <span className="text-[10px] text-gray-500 uppercase tracking-wider">Trigger Mechanism</span>
+              <Badge variant={leads[0].trigger_reason === "LLM Intent" ? "success" : "primary"}>
+                {leads[0].trigger_reason || "Score Engine"}
+              </Badge>
+              <span className="text-[9px] text-gray-500 font-mono mt-1">
+                Acquired: {new Date(leads[0].created_at).toLocaleString()}
+              </span>
+            </div>
+          </div>
+          
+          {session.lead_intent_detected && (
+            <div className="pt-3 border-t border-emerald-500/10 text-xs text-gray-400 flex flex-wrap gap-x-6 gap-y-1.5 font-mono">
+              <span>Trigger Reason: <strong className="text-emerald-400 font-sans">Lead Intent Detected</strong></span>
+              <span>Intent Type: <strong className="text-gray-200">{session.lead_intent_type || "—"}</strong></span>
+              <span>Confidence: <strong className="text-gray-200">{session.lead_intent_confidence || "—"}</strong></span>
+              {session.lead_intent_reasoning && (
+                <div className="w-full text-[11px] text-gray-500 font-sans italic mt-1">
+                  Reasoning: "{session.lead_intent_reasoning}"
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Info Cards Row */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         {/* Session Metadata Card */}

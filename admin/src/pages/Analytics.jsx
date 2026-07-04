@@ -25,6 +25,7 @@ export default function Analytics() {
   const [universities, setUniversities] = useState([]);
   const [costs, setCosts] = useState(null);
   const [funnel, setFunnel] = useState(null);
+  const [leadIntentStats, setLeadIntentStats] = useState({ source_breakdown: [], intent_categories: [] });
   
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -34,13 +35,14 @@ export default function Analytics() {
     setLoading(true);
     setError(null);
     try {
-      const [overRes, modRes, toolRes, uniRes, costRes, funRes] = await Promise.all([
+      const [overRes, modRes, toolRes, uniRes, costRes, funRes, leadRes] = await Promise.all([
         api.getAnalyticsOverview(),
         api.getAnalyticsModels(),
         api.getAnalyticsTools(),
         api.getAnalyticsUniversities(),
         api.getAnalyticsCosts(),
         api.getAnalyticsFunnel(),
+        api.getAnalyticsLeads(),
       ]);
       setOverview(overRes);
       setModels(modRes || []);
@@ -48,6 +50,7 @@ export default function Analytics() {
       setUniversities(uniRes || []);
       setCosts(costRes);
       setFunnel(funRes);
+      setLeadIntentStats(leadRes || { source_breakdown: [], intent_categories: [] });
     } catch (err) {
       setError(err.message || "Failed to load observability metrics.");
     } finally {
@@ -112,6 +115,7 @@ export default function Analytics() {
           { id: "universities", label: "University Contexts" },
           { id: "costs", label: "Cost Breakdown" },
           { id: "funnel", label: "Acquisition Funnel" },
+          { id: "leads", label: "Lead Intent" },
         ].map((tab) => (
           <button
             key={tab.id}
@@ -400,6 +404,75 @@ export default function Analytics() {
                     Calculated by dividing the total estimated model/token spend by the respective funnel stage volume.
                   </div>
                 </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Lead Intent Tab */}
+        {activeTab === "leads" && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Left Card: Lead Source Breakdown */}
+            <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-6 space-y-4">
+              <div>
+                <h4 className="text-xs font-bold text-gray-200 uppercase tracking-wider flex items-center gap-2">
+                  <TrendingUp size={14} className="text-emerald-500" />
+                  Lead Source Breakdown
+                </h4>
+                <p className="text-[10px] text-gray-500 mt-1">Comparison of lead acquisitions triggered by Score Engine vs next-gen LLM Intent detection.</p>
+              </div>
+              <div className="space-y-4 pt-2">
+                {!leadIntentStats?.source_breakdown || leadIntentStats.source_breakdown.length === 0 ? (
+                  <div className="text-xs text-gray-500 py-4 text-center">No lead sources logged yet.</div>
+                ) : (
+                  leadIntentStats.source_breakdown.map((src, idx) => (
+                    <div key={idx} className="space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="font-semibold text-gray-300">{src.source}</span>
+                        <span className="font-mono text-gray-400">{src.count} ({src.percentage}%)</span>
+                      </div>
+                      <div className="w-full bg-gray-800 rounded-full h-2">
+                        <div
+                          className={`h-2 rounded-full transition-all duration-500 ${
+                            src.source === "LLM Intent" ? "bg-emerald-500" : "bg-blue-500"
+                          }`}
+                          style={{ width: `${src.percentage}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Right Card: Intent Categories */}
+            <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-6 space-y-4">
+              <div>
+                <h4 className="text-xs font-bold text-gray-200 uppercase tracking-wider flex items-center gap-2">
+                  <Cpu size={14} className="text-indigo-500" />
+                  Intent Categories Distribution
+                </h4>
+                <p className="text-[10px] text-gray-500 mt-1">Semantic classification categories identified by the LLM Intent Classifier.</p>
+              </div>
+              <div className="space-y-4 pt-2">
+                {!leadIntentStats?.intent_categories || leadIntentStats.intent_categories.length === 0 ? (
+                  <div className="text-xs text-gray-500 py-4 text-center">No intent categories recorded yet.</div>
+                ) : (
+                  leadIntentStats.intent_categories.map((cat, idx) => (
+                    <div key={idx} className="space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="font-semibold text-gray-300">{cat.category}</span>
+                        <span className="font-mono text-gray-400">{cat.count} ({cat.percentage}%)</span>
+                      </div>
+                      <div className="w-full bg-gray-800 rounded-full h-2">
+                        <div
+                          className="h-2 rounded-full bg-indigo-500 transition-all duration-500"
+                          style={{ width: `${cat.percentage}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           </div>

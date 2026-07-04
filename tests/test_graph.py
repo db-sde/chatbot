@@ -316,3 +316,45 @@ async def test_graph_loop_iteration_cap(monkeypatch):
     assert len(events) > 0
     assert events[-1]["event"] == "final"
 
+
+@pytest.mark.asyncio
+async def test_lead_intent_node(monkeypatch):
+    """
+    Verify that node_update_lead_score triggers lead ask and stores classification
+    metrics properly when the LLM lead intent classifier detects high intent.
+    """
+    import agent.graph as graph_mod
+    from unittest.mock import AsyncMock
+
+    # Mock lead_intent_classifier to return high intent
+    mock_classifier = AsyncMock(return_value={
+        "lead_intent": True,
+        "confidence": 0.95,
+        "intent_type": "admission_guidance",
+        "reasoning": "Student wishes to talk to counsellor."
+    })
+    monkeypatch.setattr(graph_mod, "lead_intent_classifier", mock_classifier)
+
+    # Mock database query helper functions
+    mock_save = AsyncMock()
+    mock_mark = AsyncMock()
+    
+    async def fake_exists(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(graph_mod.queries, "save_lead_intent_status", mock_save)
+    monkeypatch.setattr(graph_mod.queries, "mark_lead_ask", mock_mark)
+    monkeypatch.setattr(graph_mod.queries, "lead_ask_exists", fake_exists)
+
+    state = {
+        "session_id": "00000000-0000-0000-0000-000000000000",
+        "raw_message": "please call me to guide me about mba program",
+        "messages": []
+    }
+
+    res = await graph_mod.node_update_lead_score(state)
+    assert res["lead_ask"] is True
+    assert res["lead_ask_triggered_by"] == "LLM Intent"
+    assert mock_save.called
+    assert mock_mark.called
+

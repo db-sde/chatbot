@@ -84,12 +84,15 @@ export default function Conversations() {
 
   // Client side search filtering
   const filteredSessions = sessions.filter((s) => {
-    const query = searchQuery.toLowerCase().strip ? searchQuery.toLowerCase().trim() : searchQuery.toLowerCase();
+    const query = searchQuery.toLowerCase().trim();
     if (!query) return true;
     const matchId = s.id.toLowerCase().includes(query);
     const matchUni = s.page_university_slug && s.page_university_slug.toLowerCase().includes(query);
     const matchSummary = s.summary && s.summary.toLowerCase().includes(query);
-    return matchId || matchUni || matchSummary;
+    const matchName = s.lead_name && s.lead_name.toLowerCase().includes(query);
+    const matchPhone = s.lead_phone && s.lead_phone.toLowerCase().includes(query);
+    const matchEmail = s.lead_email && s.lead_email.toLowerCase().includes(query);
+    return matchId || matchUni || matchSummary || matchName || matchPhone || matchEmail;
   });
 
   const selectSession = (id) => {
@@ -178,13 +181,20 @@ export default function Conversations() {
                   `}
                 >
                   <div className="min-w-0 flex-1 pr-2">
-                    <div className="flex items-center space-x-2 mb-1.5">
-                      <span className="text-[10px] font-mono text-gray-400 font-semibold truncate max-w-[120px]">
-                        {session.id.substring(0, 8)}...
-                      </span>
-                      {session.page_university_slug && (
-                        <span className="text-[9px] bg-blue-950 text-blue-400 border border-blue-900/50 px-1.5 py-0.5 rounded uppercase font-bold shrink-0">
-                          {session.page_university_slug}
+                    <div className="flex flex-col mb-1.5">
+                      <div className="flex items-center space-x-2">
+                        <span className="text-xs font-bold text-gray-200 truncate">
+                          {session.lead_name || `${session.id.substring(0, 8)}...`}
+                        </span>
+                        {session.page_university_slug && (
+                          <span className="text-[9px] bg-blue-950 text-blue-400 border border-blue-900/50 px-1.5 py-0.5 rounded uppercase font-bold shrink-0">
+                            {session.page_university_slug}
+                          </span>
+                        )}
+                      </div>
+                      {session.lead_name && (
+                        <span className="text-[9px] font-mono text-gray-500 mt-0.5">
+                          Session: {session.id.substring(0, 8)}...
                         </span>
                       )}
                     </div>

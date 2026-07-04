@@ -524,8 +524,12 @@ async def list_conversations(pool, university: str | None, date_from: str | None
     rows = await pool.fetch(
         """
         SELECT s.id, s.site_id, s.page_university_slug, s.summary, s.started_at, s.last_active_at, s.message_count, s.ip_address,
+               s.lead_intent_detected, s.lead_intent_type, s.lead_intent_confidence, s.lead_intent_reasoning, s.lead_ask_triggered_by,
                EXISTS(SELECT 1 FROM leads l WHERE l.session_id = s.id) AS has_lead,
-               EXISTS(SELECT 1 FROM unanswered_questions uq WHERE uq.session_id = s.id) AS has_unanswered
+               EXISTS(SELECT 1 FROM unanswered_questions uq WHERE uq.session_id = s.id) AS has_unanswered,
+               (SELECT name FROM leads l WHERE l.session_id = s.id LIMIT 1) AS lead_name,
+               (SELECT phone FROM leads l WHERE l.session_id = s.id LIMIT 1) AS lead_phone,
+               (SELECT email FROM leads l WHERE l.session_id = s.id LIMIT 1) AS lead_email
         FROM sessions s
         WHERE ($1::text IS NULL OR s.page_university_slug = $1)
           AND ($2::timestamptz IS NULL OR s.started_at >= $2::timestamptz)
@@ -847,4 +851,81 @@ async def get_analytics_funnel(pool) -> dict[str, Any]:
     return dict(row) if row else {
         "visitors": 0, "conversations": 0, "qualified_conversations": 0,
         "leads": 0, "total_cost": 0.0, "cost_per_lead": 0.0, "cost_per_conversation": 0.0
+    }
+
+
+async def save_lead_intent_status(
+    pool,
+    session_id: str,
+    lead_intent_detected: bool,
+    lead_intent_type: str | None,
+    lead_intent_confidence: float | None,
+    lead_intent_reasoning: str | None,
+    lead_ask_triggered_by: str | None,
+) -> None:
+    """Save semantic lead intent classification logs to the session."""
+    await pool.execute(
+        """
+        UPDATE sessions
+        SET lead_intent_detected = $2,
+            lead_intent_type = $3,
+            lead_intent_confidence = $4,
+            lead_intent_reasoning = $5,
+            lead_ask_triggered_by = COALESCE(lead_ask_triggered_by, $6)
+        WHERE id = $1::uuid
+        """,
+        session_id,
+        lead_intent_detected,
+        lead_intent_type,
+        lead_intent_confidence,
+        lead_intent_reasoning,
+        lead_ask_triggered_by,
+    )
+
+
+async def get_lead_intent_analytics(pool) -> dict[str, Any]:
+    """Calculate lead capture source breakdown percentages and semantic classification distributions."""
+    # 1. Source breakdown
+    source_rows = await pool.fetch(
+        """
+        SELECT coalesce(trigger_reason, 'Score Engine') AS source, count(*) AS count
+        FROM leads
+        GROUP BY trigger_reason
+        """
+    )
+    total_leads = sum(r["count"] for r in source_rows)
+    source_breakdown = []
+    for r in source_rows:
+        source_name = "LLM Intent" if r["source"] == "LLM Intent" else "Score Engine"
+        pct = round(100.0 * r["count"] / total_leads, 2) if total_leads > 0 else 0.0
+        source_breakdown.append({"source": source_name, "count": r["count"], "percentage": pct})
+        
+    # 2. Intent categories breakdown
+    intent_rows = await pool.fetch(
+        """
+        SELECT lead_intent_type AS category, count(*) AS count
+        FROM sessions
+        WHERE lead_intent_detected = TRUE AND lead_intent_type IS NOT NULL
+        GROUP BY lead_intent_type
+        ORDER BY count DESC
+        """
+    )
+    total_intents = sum(r["count"] for r in intent_rows)
+    intent_categories = []
+    for r in intent_rows:
+        pct = round(100.0 * r["count"] / total_intents, 2) if total_intents > 0 else 0.0
+        friendly_names = {
+            "human_advisor_request": "Human Advisor Request",
+            "admission_guidance": "Admission Guidance",
+            "career_counselling": "Career Counselling",
+            "scholarship_support": "Scholarship Support",
+            "application_support": "Application Support",
+            "none": "General Inquiry"
+        }
+        category_name = friendly_names.get(r["category"], r["category"].replace("_", " ").title())
+        intent_categories.append({"category": category_name, "count": r["count"], "percentage": pct})
+        
+    return {
+        "source_breakdown": source_breakdown,
+        "intent_categories": intent_categories
     }

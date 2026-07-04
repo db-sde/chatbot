@@ -53,7 +53,7 @@ app.add_middleware(
 # every request instead of the real visitor IP. trusted_hosts must be the
 # proxy's own IP (or "*" only if this app is never reachable except through
 # that proxy) — see settings.trusted_proxies / TRUSTED_PROXIES env var.
-app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxies)
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxies)  # type: ignore
 
 
 class ChatRequest(BaseModel):
@@ -326,6 +326,13 @@ async def admin_analytics_funnel(_: Annotated[None, Depends(check_admin_auth)]) 
     """Return overall user funnel counts and conversions (qualified chats, leads, cost per lead)."""
     pool = await get_pool()
     return await queries.get_analytics_funnel(pool)
+
+
+@app.get("/api/admin/analytics/leads")
+async def admin_analytics_leads(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Return lead source breakdowns and category distributions."""
+    pool = await get_pool()
+    return await queries.get_lead_intent_analytics(pool)
 
 
 @app.get("/api/admin/security/summary")

@@ -190,6 +190,21 @@ async def capture_lead(
 ) -> dict:
     try:
         pool = await get_pool()
+        # Ensure session exists in DB before inserting lead to avoid foreign key constraint issues (e.g. after truncation)
+        session_exists = await pool.fetchval("SELECT 1 FROM sessions WHERE id = $1::uuid", session_id)
+        if not session_exists:
+            await pool.execute(
+                "INSERT INTO sessions (id, site_id, page_university_slug) VALUES ($1::uuid, $2, $3) ON CONFLICT DO NOTHING",
+                session_id,
+                "degreebaba_dev",
+                None
+            )
+        if trigger_reason == "widget_form":
+            sess_trigger = await pool.fetchval("SELECT lead_ask_triggered_by FROM sessions WHERE id = $1::uuid", session_id)
+            if sess_trigger:
+                trigger_reason = sess_trigger
+            else:
+                trigger_reason = "Score Engine"
         return await queries.insert_lead(pool, session_id, name, phone, email, course_interest, trigger_reason)
     except Exception:
         logger.exception("capture_lead failed (session=%s)", session_id)

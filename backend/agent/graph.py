@@ -49,6 +49,7 @@ from observability import (
 logger = logging.getLogger(__name__)
 
 from leads.scoring import classify_score_events, log_score_events, should_append_lead_ask
+from leads.intent import lead_intent_classifier, LEAD_INTENT_CONFIDENCE_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,7 @@ class ChatState(TypedDict, total=False):
     reply: str
     tool_calls_log: list[dict[str, Any]]
     lead_ask: bool
+    lead_ask_triggered_by: str
     tool_call_count: int
 
 
@@ -390,10 +392,55 @@ async def node_update_lead_score(state: ChatState) -> dict[str, Any]:
     """Silent node — scores the turn and sets lead_ask flag if threshold crossed."""
     session_id = state["session_id"]
     message = state["raw_message"]
+    pool = await get_pool()
+
+    # 1. Run traditional score engine
     events = classify_score_events(message)
     score = await log_score_events(session_id, events)
-    lead_ask = await should_append_lead_ask(session_id, score)
-    return {"lead_ask": lead_ask}
+    score_triggered = await should_append_lead_ask(session_id, score)
+
+    # 2. Run next-generation semantic LLM Intent classification
+    history = []
+    for m in state.get("messages", []):
+        history.append({
+            "role": "user" if isinstance(m, HumanMessage) else "assistant",
+            "content": str(m.content)
+        })
+
+    intent_res = await lead_intent_classifier(session_id, message, history)
+    lead_intent_detected = intent_res.get("lead_intent", False)
+    lead_intent_type = intent_res.get("intent_type", "none")
+    lead_intent_confidence = intent_res.get("confidence", 0.0)
+    lead_intent_reasoning = intent_res.get("reasoning", "")
+
+    intent_triggered = False
+    if lead_intent_detected and lead_intent_confidence >= LEAD_INTENT_CONFIDENCE_THRESHOLD:
+        if not await queries.lead_ask_exists(pool, session_id):
+            intent_triggered = True
+            await queries.mark_lead_ask(pool, session_id)
+
+    # Determine final trigger source
+    triggered_by = None
+    if score_triggered:
+        triggered_by = "Score Engine"
+    elif intent_triggered:
+        triggered_by = "LLM Intent"
+
+    # Save to database session record
+    await queries.save_lead_intent_status(
+        pool,
+        session_id,
+        lead_intent_detected,
+        lead_intent_type,
+        lead_intent_confidence,
+        lead_intent_reasoning,
+        triggered_by,
+    )
+
+    return {
+        "lead_ask": score_triggered or intent_triggered,
+        "lead_ask_triggered_by": triggered_by or "Score Engine",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +557,7 @@ async def run_chat_turn(
 
     reply: str = final_state.get("reply", "")
     lead_ask: bool = final_state.get("lead_ask", False)
+    lead_ask_triggered_by: str = final_state.get("lead_ask_triggered_by", "Score Engine")
 
     # ── Log unanswered only when every tool call failed, or there's no reply ──
     if _all_tool_calls_failed(final_state) or not reply:
@@ -522,11 +570,17 @@ async def run_chat_turn(
 
     # ── Append soft lead capture prompt ──
     if lead_ask:
-        reply += (
-            "\n\nI can also put together a personalised fee-comparison PDF or "
-            "arrange a callback from a counsellor. Just share your name and phone — "
-            "or choose 'No thanks' if you prefer to keep browsing."
-        )
+        if lead_ask_triggered_by == "LLM Intent":
+            reply += (
+                "\n\nI'd be happy to connect you with one of our admission advisors. "
+                "If you'd like personalized guidance, please share your details below and a counsellor can reach out."
+            )
+        else:
+            reply += (
+                "\n\nI can also put together a personalised fee-comparison PDF or "
+                "arrange a callback from a counsellor. Just share your name and phone — "
+                "or choose 'No thanks' if you prefer to keep browsing."
+            )
 
     # ── Output security scan ──
     scan = scan_output(reply)
