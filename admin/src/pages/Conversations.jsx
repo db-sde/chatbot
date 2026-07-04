@@ -1,86 +1,55 @@
-import React, { useEffect, useState } from "react";
-import { useParams, useNavigate, Link } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Search,
-  Filter,
-  Calendar,
-  UserCheck,
-  HelpCircle,
   Clock,
   ChevronRight,
-  MessageSquare,
-  School,
-  ExternalLink,
-  Code
 } from "lucide-react";
 import { api } from "../services/api";
 import { Badge, LoadingState, ErrorState, EmptyState } from "../components/Common";
 
 export default function Conversations() {
-  const { sessionId } = useParams();
   const navigate = useNavigate();
 
   const [sessions, setSessions] = useState([]);
   const [loadingList, setLoadingList] = useState(true);
   const [errorList, setErrorList] = useState(null);
 
-  // Selected Session Details
-  const [activeSession, setActiveSession] = useState(null);
-  const [loadingActive, setLoadingActive] = useState(false);
-  const [errorActive, setErrorActive] = useState(null);
-
   // Filters State
   const [searchQuery, setSearchQuery] = useState("");
-  const [universityFilter, setUniversityFilter] = useState("");
   const [hasLeadFilter, setHasLeadFilter] = useState("");
   const [hasUnansweredFilter, setHasUnansweredFilter] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
-
-  const fetchSessionList = async () => {
-    setLoadingList(true);
-    setErrorList(null);
-    try {
-      const filters = {
-        university: universityFilter || null,
-        date_from: dateFrom || null,
-        date_to: dateTo || null,
-        has_lead: hasLeadFilter === "true" ? true : hasLeadFilter === "false" ? false : null,
-        has_unanswered: hasUnansweredFilter === "true" ? true : hasUnansweredFilter === "false" ? false : null,
-      };
-      const data = await api.getConversations(filters);
-      setSessions(data || []);
-    } catch (err) {
-      setErrorList(err.message || "Failed to load session list.");
-    } finally {
-      setLoadingList(false);
-    }
-  };
-
-  const fetchActiveSession = async (id) => {
-    setLoadingActive(true);
-    setErrorActive(null);
-    try {
-      const data = await api.getConversation(id);
-      setActiveSession(data || null);
-    } catch (err) {
-      setErrorActive(err.message || "Failed to load conversation messages.");
-    } finally {
-      setLoadingActive(false);
-    }
-  };
+  const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
-    fetchSessionList();
-  }, [universityFilter, hasLeadFilter, hasUnansweredFilter, dateFrom, dateTo]);
-
-  useEffect(() => {
-    if (sessionId) {
-      fetchActiveSession(sessionId);
-    } else {
-      setActiveSession(null);
+    let cancelled = false;
+    async function run() {
+      setLoadingList(true);
+      setErrorList(null);
+      try {
+        const filters = {
+          date_from: dateFrom || null,
+          date_to: dateTo || null,
+          has_lead: hasLeadFilter === "true" ? true : hasLeadFilter === "false" ? false : null,
+          has_unanswered: hasUnansweredFilter === "true" ? true : hasUnansweredFilter === "false" ? false : null,
+        };
+        const data = await api.getConversations(filters);
+        if (cancelled) return;
+        setSessions(data || []);
+      } catch (err) {
+        if (cancelled) return;
+        setErrorList(err.message || "Failed to load session list.");
+      } finally {
+        if (!cancelled) {
+          setLoadingList(false);
+        }
+      }
     }
-  }, [sessionId]);
+    run();
+    return () => { cancelled = true; };
+  }, [hasLeadFilter, hasUnansweredFilter, dateFrom, dateTo, refresh]);
 
   // Client side search filtering
   const filteredSessions = sessions.filter((s) => {
@@ -100,9 +69,8 @@ export default function Conversations() {
   };
 
   return (
-    <div className="h-[calc(100vh-8rem)] flex flex-col lg:flex-row gap-6 overflow-hidden">
-      {/* Left Panel: Search, Filters & Session List */}
-      <div className="w-full lg:w-96 flex flex-col bg-[#111827] border border-[#1F2937] rounded-xl overflow-hidden shrink-0 h-1/2 lg:h-full">
+    <div className="h-[calc(100vh-8rem)] flex flex-col gap-6 overflow-hidden">
+      <div className="w-full flex flex-col bg-[#111827] border border-[#1F2937] rounded-xl overflow-hidden shrink-0 h-full">
         {/* Search & Filter Inputs */}
         <div className="p-4 border-b border-[#1F2937] space-y-3 bg-[#0E131F]/50">
           <div className="relative">
@@ -164,21 +132,17 @@ export default function Conversations() {
           {loadingList ? (
             <div className="py-8"><LoadingState message="Loading sessions..." /></div>
           ) : errorList ? (
-            <div className="p-4"><ErrorState title="List failed" description={errorList} retry={fetchSessionList} /></div>
+            <div className="p-4"><ErrorState title="List failed" description={errorList} retry={() => setRefresh((r) => r + 1)} /></div>
           ) : filteredSessions.length === 0 ? (
             <div className="p-4"><EmptyState title="No matching sessions" description="Try adjusting search or filter attributes." /></div>
           ) : (
             filteredSessions.map((session) => {
-              const isSelected = session.id === sessionId;
               const formattedTime = new Date(session.last_active_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
               return (
                 <div
                   key={session.id}
                   onClick={() => selectSession(session.id)}
-                  className={`
-                    p-4 cursor-pointer transition-all flex justify-between items-start text-left
-                    ${isSelected ? "bg-blue-950/20 border-l-2 border-blue-500" : "hover:bg-[#1C2333]/50"}
-                  `}
+                  className="p-4 cursor-pointer transition-all flex justify-between items-start text-left hover:bg-[#1C2333]/50"
                 >
                   <div className="min-w-0 flex-1 pr-2">
                     <div className="flex flex-col mb-1.5">
@@ -235,132 +199,6 @@ export default function Conversations() {
             })
           )}
         </div>
-      </div>
-
-      {/* Right Panel: Selected Conversation preview timeline */}
-      <div className="flex-1 bg-[#111827] border border-[#1F2937] rounded-xl flex flex-col overflow-hidden h-1/2 lg:h-full">
-        {loadingActive ? (
-          <div className="flex-1 flex items-center justify-center"><LoadingState message="Fetching chat history..." /></div>
-        ) : errorActive ? (
-          <div className="p-8"><ErrorState title="History load failed" description={errorActive} /></div>
-        ) : !activeSession ? (
-          <div className="flex-1 flex items-center justify-center">
-            <EmptyState
-              title="No Conversation Selected"
-              description="Click a session item on the left panel to preview transcript timeline."
-              icon={MessageSquare}
-            />
-          </div>
-        ) : (
-          <>
-            {/* Session Metadata Header */}
-            <div className="p-4 md:p-6 border-b border-[#1F2937] bg-[#0E131F]/50 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-              <div>
-                <div className="flex items-center space-x-2 mb-1">
-                  <h3 className="font-bold text-sm text-gray-200">Session Transcript</h3>
-                  <span className="text-xs font-mono text-gray-500 font-medium">({activeSession.session?.id})</span>
-                </div>
-                <div className="flex flex-wrap gap-2 items-center text-[10px] text-gray-400">
-                  <span className="flex items-center space-x-1">
-                    <School size={12} className="text-blue-500" />
-                    <span>Site: <strong className="text-gray-300">{activeSession.session?.site_id}</strong></span>
-                  </span>
-                  {activeSession.session?.page_university_slug && (
-                    <>
-                      <span>•</span>
-                      <span>Page: <strong className="text-gray-300 uppercase">{activeSession.session?.page_university_slug}</strong></span>
-                    </>
-                  )}
-                  {activeSession.session?.ip_address && (
-                    <>
-                      <span>•</span>
-                      <span className="bg-emerald-950/40 text-emerald-400 px-1.5 py-0.5 rounded font-mono font-bold">
-                        IP: {activeSession.session?.ip_address}
-                      </span>
-                    </>
-                  )}
-                </div>
-              </div>
-              <div className="flex gap-2">
-                {activeSession.leads?.length > 0 && (
-                  <Badge variant="success">Lead Profile Active</Badge>
-                )}
-                <Link
-                  to={`/admin/conversations/${activeSession.session?.id}`}
-                  className="p-2 bg-[#1F2937] hover:bg-[#2D3748] border border-[#2D3748] rounded-lg text-gray-300 transition-all text-xs flex items-center gap-1.5"
-                >
-                  <ExternalLink size={12} />
-                  <span>Detail View</span>
-                </Link>
-              </div>
-            </div>
-
-            {/* Chat Timeline (GPT Rendering style) */}
-            <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6 bg-[#0E131F]/20">
-              {activeSession.messages?.length === 0 ? (
-                <EmptyState title="No messages recorded" description="This session contains zero transcripts." />
-              ) : (
-                activeSession.messages?.map((msg, index) => {
-                  const isUser = msg.role === "user";
-                  let toolCalls = msg.tool_calls;
-                  if (typeof toolCalls === "string") {
-                    try {
-                      toolCalls = JSON.parse(toolCalls);
-                    } catch (_) {
-                      toolCalls = [];
-                    }
-                  }
-
-                  return (
-                    <div key={index} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-                      <div className={`
-                        max-w-[85%] rounded-2xl p-4 text-left shadow-sm border
-                        ${isUser
-                          ? "bg-blue-600 text-white border-blue-500"
-                          : "bg-[#111827] text-gray-200 border-[#1F2937]"
-                        }
-                      `}>
-                        <div className="flex justify-between items-center w-full min-w-[140px] mb-1 text-[9px] font-semibold tracking-wider opacity-60">
-                          <span>{isUser ? "STUDENT" : "ADVISOR"}</span>
-                          <span className="ml-4">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                        </div>
-                        <p className="text-xs whitespace-pre-wrap leading-relaxed">{msg.content}</p>
-
-                        {/* Tool Calls logs */}
-                        {toolCalls && Array.isArray(toolCalls) && toolCalls.length > 0 && (
-                          <div className="mt-3 pt-3 border-t border-[#1F2937]/50 space-y-2">
-                            <span className="text-[9px] font-bold text-gray-400 flex items-center gap-1">
-                              <Code size={10} className="text-blue-400" />
-                              <span>TOOL EVENTS EXECUTED</span>
-                            </span>
-                            {toolCalls.map((tc, tcIdx) => (
-                              <div key={tcIdx} className="bg-[#1C2433] rounded p-2.5 border border-[#2D3748] space-y-1.5 font-mono text-[9px]">
-                                <div className="flex justify-between text-blue-400 font-bold">
-                                  <span>{tc.name || "ToolCall"}</span>
-                                  <span className="text-gray-500 text-[8px] font-normal">
-                                    {tc.status || "success"}
-                                  </span>
-                                </div>
-                                <div className="text-gray-300 break-all bg-[#111827] p-1.5 rounded border border-gray-800/40">
-                                  <span className="text-gray-500 font-bold">Args:</span> {JSON.stringify(tc.args)}
-                                </div>
-                                {tc.result_summary && (
-                                  <div className="text-gray-300 break-all bg-[#111827] p-1.5 rounded border border-gray-800/20 whitespace-pre-wrap">
-                                    <span className="text-gray-500 font-bold">Result:</span> {tc.result_summary}
-                                  </div>
-                                )}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </>
-        )}
       </div>
     </div>
   );

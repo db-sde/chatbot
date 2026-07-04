@@ -1,17 +1,14 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
   ArrowLeft,
   Calendar,
   MessageSquare,
   Users,
-  AlertTriangle,
   Code,
   Terminal,
   Server,
   Play,
-  CheckCircle,
-  HelpCircle,
   ChevronDown,
   ChevronUp,
   Activity
@@ -33,25 +30,32 @@ export default function SessionDetails() {
     }));
   };
 
-  const fetchDetails = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await api.getConversation(sessionId);
-      setData(result || null);
-    } catch (err) {
-      setError(err.message || "Failed to load session transaction.");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
-    fetchDetails();
-  }, [sessionId]);
+    let cancelled = false;
+    async function run() {
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await api.getConversation(sessionId);
+        if (cancelled) return;
+        setData(result || null);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err.message || "Failed to load session transaction.");
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+    run();
+    return () => { cancelled = true; };
+  }, [sessionId, refresh]);
 
   if (loading) return <LoadingState message="Fetching session transaction details..." />;
-  if (error) return <ErrorState title="Session query failed" description={error} retry={fetchDetails} />;
+  if (error) return <ErrorState title="Session query failed" description={error} retry={() => setRefresh((r) => r + 1)} />;
   if (!data) return <EmptyState title="Session not found" description="No details are active for this Session ID." />;
 
   const session = data.session || {};
@@ -65,7 +69,7 @@ export default function SessionDetails() {
     if (typeof toolCalls === "string") {
       try {
         toolCalls = JSON.parse(toolCalls);
-      } catch (_) {
+      } catch {
         toolCalls = [];
       }
     }

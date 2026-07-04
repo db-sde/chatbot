@@ -3,12 +3,6 @@ from __future__ import annotations
 from db import queries
 from db.pool import get_pool
 
-SCORE_RULES = {
-    "asked_fee_or_eligibility": 2,
-    "repeated_question_same_entity": 2,
-    "three_plus_turns": 1,
-    "session_ending_signal": 1,
-}
 THRESHOLD = 3
 
 

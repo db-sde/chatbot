@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -11,7 +11,7 @@ from fastapi import HTTPException
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import auth
-from agent import guardrail, resolve, tools
+from agent import resolve, tools
 from security import policy, scanner
 from leads import scoring
 

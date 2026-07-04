@@ -16,7 +16,6 @@ from __future__ import annotations
 import re
 from typing import TypedDict
 
-from db import queries
 from db.pool import get_pool
 
 # Slugs are lowercase alphanumeric + hyphens only.

@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from typing import Any
+import random
+import time
+from typing import Any, Callable
 
-import groq
 from groq import AsyncGroq
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from settings import settings
 
+from observability import (
+    mark_first_token,
+    mark_llm_start,
+    record_llm_call_duration,
+)
+
 logger = logging.getLogger(__name__)
+
+# Retry configuration for LLM calls
+_MAX_RETRIES = 3
+_BASE_DELAY = 1.0  # seconds
+_MAX_DELAY = 8.0   # seconds
 
 SYSTEM_PROMPT = (
     "You are DegreeBaba's AI assistant. "
@@ -36,7 +49,7 @@ class LLMClient:
         if settings.groq_api_key:
             self.groq_model = AsyncGroq(api_key=settings.groq_api_key)
             self.groq_chat = ChatGroq(
-                model="llama-3.3-70b-versatile",
+                model=settings.groq_model_name,
                 api_key=settings.groq_api_key,
                 temperature=0,
             )
@@ -45,9 +58,9 @@ class LLMClient:
         if settings.gemini_api_key:
             import google.generativeai as genai
             genai.configure(api_key=settings.gemini_api_key)
-            self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+            self.gemini_model = genai.GenerativeModel(settings.gemini_model_name)
             self.gemini_chat = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash",
+                model=settings.gemini_model_name,
                 google_api_key=settings.gemini_api_key,
                 temperature=0,
             )
@@ -64,29 +77,57 @@ class LLMClient:
         else:
             self.chat_model = None
 
+    async def _try_groq(self, prompt: str) -> str | None:
+        if not self.groq_model:
+            return None
+        response = await self.groq_model.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=settings.groq_model_name,
+        )
+        return response.choices[0].message.content or ""
+
+    async def _try_gemini(self, prompt: str) -> str | None:
+        if not self.gemini_model:
+            return None
+        response = await self.gemini_model.generate_content_async(prompt)
+        return response.text or ""
+
     async def generate_text(self, prompt: str) -> str:
         if not self.enabled:
             return ""
 
-        # Try Groq first
-        if self.groq_model:
-            try:
-                response = await self.groq_model.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile",
-                )
-                return response.choices[0].message.content or ""
-            except Exception as exc:
-                logger.warning("Groq generate_text failed, trying Gemini fallback: %s", exc)
+        mark_llm_start()
+        t_start = time.perf_counter()
 
-        # Try Gemini second
-        if self.gemini_model:
-            try:
-                response = await self.gemini_model.generate_content_async(prompt)
-                return response.text or ""
-            except Exception as exc:
-                logger.warning("Gemini generate_text failed: %s", exc)
+        providers: list[tuple[str, Callable[[str], Any]]] = [
+            ("groq", self._try_groq),
+            ("gemini", self._try_gemini),
+        ]
 
+        last_error: Exception | None = None
+        for provider_name, provider_fn in providers:
+            for attempt in range(1, _MAX_RETRIES + 1):
+                try:
+                    result = await provider_fn(prompt)
+                    if result is not None:
+                        mark_first_token()
+                        duration_ms = int((time.perf_counter() - t_start) * 1000)
+                        record_llm_call_duration(duration_ms)
+                        return result
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    logger.warning(
+                        "%s generate_text attempt %d/%d failed: %s",
+                        provider_name, attempt, _MAX_RETRIES, exc
+                    )
+                    if attempt < _MAX_RETRIES:
+                        delay = min(_BASE_DELAY * (2 ** (attempt - 1)) + random.random(), _MAX_DELAY)
+                        await asyncio.sleep(delay)
+
+        if last_error:
+            logger.error("All LLM providers failed for generate_text: %s", last_error)
+        duration_ms = int((time.perf_counter() - t_start) * 1000)
+        record_llm_call_duration(duration_ms)
         return ""
 
     async def generate_json(self, prompt: str) -> dict[str, Any]:

@@ -1,5 +1,3 @@
-import React from "react";
-
 export default function StatsCard({ title, value, subtext, icon: Icon, trend, trendType = "neutral", loading }) {
   if (loading) {
     return (

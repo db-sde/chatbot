@@ -3,9 +3,8 @@ from __future__ import annotations
 import time
 import logging
 import contextvars
-import ipaddress
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, TypeVar
+from typing import Any, Callable, TypeVar
 import functools
 import inspect
 
@@ -107,9 +106,23 @@ def mark_llm_start() -> None:
         metadata["t_llm_start"] = time.perf_counter()
         request_metadata_var.set(metadata)
 
+
 def mark_first_token() -> None:
-    """Record the timestamp when the first chunk/token is received/streamed."""
+    """Record the timestamp when the first LLM response begins.
+
+    Because the current architecture buffers the full reply before SSE word-chunking,
+    this is the closest proxy for "first token produced" in a non-streaming setup.
+    """
     metadata = request_metadata_var.get()
     if metadata.get("t_first_token") is None:
         metadata["t_first_token"] = time.perf_counter()
         request_metadata_var.set(metadata)
+
+
+def record_llm_call_duration(duration_ms: int) -> None:
+    """Accumulate total LLM wall-clock time for the turn."""
+    metadata = request_metadata_var.get()
+    metadata.setdefault("llm_duration_ms", 0)
+    metadata["llm_duration_ms"] += duration_ms
+    request_metadata_var.set(metadata)
+

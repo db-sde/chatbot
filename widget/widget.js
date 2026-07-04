@@ -1,7 +1,11 @@
 (function () {
   const script = document.currentScript;
-  const siteKey = script && script.dataset.siteKey ? script.dataset.siteKey : "degreebaba_dev";
-  const apiBase = script && script.dataset.apiBase ? script.dataset.apiBase : "http://localhost:2323";
+  const siteKey = script && script.dataset.siteKey;
+  const apiBase = script && script.dataset.apiBase;
+  if (!siteKey || !apiBase) {
+    console.error("DegreeBaba widget: data-site-key and data-api-base are required.");
+    return;
+  }
   const pageSlug = (script && script.dataset.universitySlug) || location.pathname.split("/").filter(Boolean).pop() || null;
   const storageKey = "degreebaba_ai_session_id";
   const sessionId = localStorage.getItem(storageKey) || crypto.randomUUID();

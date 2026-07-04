@@ -176,22 +176,6 @@ async def insert_message(
     await pool.execute("UPDATE sessions SET message_count = message_count + 1, last_active_at = now() WHERE id = $1::uuid", session_id)
     return row["id"] if row else None
 
-
-async def recent_messages(pool, session_id: str, limit: int = 8) -> list[dict[str, Any]]:
-    rows = await pool.fetch(
-        """
-        SELECT role, content, tool_calls, created_at
-        FROM messages
-        WHERE session_id = $1::uuid
-        ORDER BY id DESC
-        LIMIT $2
-        """,
-        session_id,
-        limit,
-    )
-    return list(reversed(dict_rows(rows)))
-
-
 async def count_site_messages_today(pool, site_id: str) -> int:
     value = await pool.fetchval(
         """
@@ -210,8 +194,17 @@ async def find_entity_search(pool, entity_type: str) -> list[dict[str, Any]]:
     return dict_rows(rows)
 
 
+_ENTITY_TABLES = {"university": "universities", "course": "courses", "specialization": "specializations"}
+
+
+def _entity_table(entity_type: str) -> str:
+    if entity_type not in _ENTITY_TABLES:
+        raise ValueError(f"Invalid entity_type: {entity_type}")
+    return _ENTITY_TABLES[entity_type]
+
+
 async def slug_for_entity_id(pool, entity_type: str, entity_id: int) -> str | None:
-    table = {"university": "universities", "course": "courses", "specialization": "specializations"}[entity_type]
+    table = _entity_table(entity_type)
     return await pool.fetchval(f"SELECT slug FROM {table} WHERE id = $1", entity_id)
 
 
@@ -263,7 +256,14 @@ async def get_eligibility(pool, university_slug: str, course_slug: str) -> dict[
 
 async def list_courses(pool, course_type: str | None, mode: str | None, max_fee: float | None, min_naac: str | None, sort_by: str | None, order: str, limit: int) -> list[dict[str, Any]]:
     order_dir = "DESC" if order.lower() == "desc" else "ASC"
-    sort_expr = "c.total_fee" if sort_by == "fee" else "c.duration" if sort_by == "duration" else "c.program_name"
+    sort_columns = {
+        "fee": "c.total_fee",
+        "duration": "c.duration",
+        "name": "c.program_name",
+    }
+    sort_expr = sort_columns.get(sort_by, "c.program_name")
+    if sort_expr not in sort_columns.values():
+        sort_expr = "c.program_name"
     rows = await pool.fetch(
         f"""
         SELECT c.slug, c.program_name, c.duration, c.mode, c.total_fee, c.starting_fee, c.naac_grade, u.slug AS university_slug, u.name AS university_name
@@ -286,19 +286,20 @@ async def list_courses(pool, course_type: str | None, mode: str | None, max_fee:
 
 
 async def compare_entities(pool, entity_type: str, slugs: list[str], fields: list[str]) -> list[dict[str, Any]]:
+    table = _entity_table(entity_type)
     allowed = {
-        "university": ("universities", {"slug", "name", "full_name", "starting_fee", "naac_grade", "ugc_approved", "mode_of_learning", "placement_content"}),
-        "course": ("courses", {"slug", "program_name", "duration", "mode", "total_fee", "starting_fee", "naac_grade", "ugc_status", "placement_content", "eligibility_summary"}),
-        "specialization": ("specializations", {"slug", "spec_name", "duration", "mode", "total_fee", "naac_grade", "ugc_status", "placement_content", "eligibility_summary"}),
+        "university": {"slug", "name", "full_name", "starting_fee", "naac_grade", "ugc_approved", "mode_of_learning", "placement_content"},
+        "course": {"slug", "program_name", "duration", "mode", "total_fee", "starting_fee", "naac_grade", "ugc_status", "placement_content", "eligibility_summary"},
+        "specialization": {"slug", "spec_name", "duration", "mode", "total_fee", "naac_grade", "ugc_status", "placement_content", "eligibility_summary"},
     }
-    table, allowed_fields = allowed[entity_type]
+    allowed_fields = allowed[entity_type]
     selected = ["slug"] + [field for field in fields if field in allowed_fields and field != "slug"]
     rows = await pool.fetch(f"SELECT {', '.join(selected)} FROM {table} WHERE slug = ANY($1::text[])", slugs)
     return dict_rows(rows)
 
 
 async def get_faq(pool, entity_type: str, entity_slug: str, query_text: str | None) -> list[dict[str, Any]]:
-    table = {"university": "universities", "course": "courses", "specialization": "specializations"}[entity_type]
+    table = _entity_table(entity_type)
     entity_id = await pool.fetchval(f"SELECT id FROM {table} WHERE slug = $1", entity_slug)
     if not entity_id:
         return []
@@ -523,19 +524,24 @@ async def mark_lead_ask(pool, session_id: str) -> None:
 async def list_conversations(pool, university: str | None, date_from: str | None, date_to: str | None, has_lead: bool | None, has_unanswered: bool | None, limit: int, offset: int) -> list[dict[str, Any]]:
     rows = await pool.fetch(
         """
-        SELECT s.id, s.site_id, s.page_university_slug, s.summary, s.started_at, s.last_active_at, s.message_count, s.ip_address,
-               s.lead_intent_detected, s.lead_intent_type, s.lead_intent_confidence, s.lead_intent_reasoning, s.lead_ask_triggered_by,
-               EXISTS(SELECT 1 FROM leads l WHERE l.session_id = s.id) AS has_lead,
-               EXISTS(SELECT 1 FROM unanswered_questions uq WHERE uq.session_id = s.id) AS has_unanswered,
-               (SELECT name FROM leads l WHERE l.session_id = s.id LIMIT 1) AS lead_name,
-               (SELECT phone FROM leads l WHERE l.session_id = s.id LIMIT 1) AS lead_phone,
-               (SELECT email FROM leads l WHERE l.session_id = s.id LIMIT 1) AS lead_email
+        SELECT s.id, s.site_id, s.page_university_slug, s.summary, s.started_at, s.last_active_at,
+               s.message_count, s.ip_address,
+               s.lead_intent_detected, s.lead_intent_type, s.lead_intent_confidence,
+               s.lead_intent_reasoning, s.lead_ask_triggered_by,
+               bool_or(l.id IS NOT NULL) AS has_lead,
+               bool_or(uq.id IS NOT NULL) AS has_unanswered,
+               max(l.name) AS lead_name,
+               max(l.phone) AS lead_phone,
+               max(l.email) AS lead_email
         FROM sessions s
+        LEFT JOIN leads l ON l.session_id = s.id
+        LEFT JOIN unanswered_questions uq ON uq.session_id = s.id
         WHERE ($1::text IS NULL OR s.page_university_slug = $1)
           AND ($2::timestamptz IS NULL OR s.started_at >= $2::timestamptz)
           AND ($3::timestamptz IS NULL OR s.started_at <= $3::timestamptz)
-          AND ($4::boolean IS NULL OR EXISTS(SELECT 1 FROM leads l WHERE l.session_id = s.id) = $4)
-          AND ($5::boolean IS NULL OR EXISTS(SELECT 1 FROM unanswered_questions uq WHERE uq.session_id = s.id) = $5)
+        GROUP BY s.id
+        HAVING ($4::boolean IS NULL OR bool_or(l.id IS NOT NULL) = $4)
+           AND ($5::boolean IS NULL OR bool_or(uq.id IS NOT NULL) = $5)
         ORDER BY s.last_active_at DESC
         LIMIT $6 OFFSET $7
         """,

@@ -1,22 +1,18 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   BarChart3,
   School,
   Activity,
   Award,
-  BookOpen,
   Cpu,
   Terminal,
   DollarSign,
   Clock,
-  TrendingUp,
-  Percent,
-  Search,
-  Filter
+  TrendingUp
 } from "lucide-react";
 import { api } from "../services/api";
 import StatsCard from "../components/StatsCard";
-import { Badge, LoadingState, ErrorState, EmptyState } from "../components/Common";
+import { LoadingState, ErrorState } from "../components/Common";
 
 export default function Analytics() {
   const [overview, setOverview] = useState(null);
@@ -31,39 +27,46 @@ export default function Analytics() {
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState("overview");
 
-  const fetchData = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [overRes, modRes, toolRes, uniRes, costRes, funRes, leadRes] = await Promise.all([
-        api.getAnalyticsOverview(),
-        api.getAnalyticsModels(),
-        api.getAnalyticsTools(),
-        api.getAnalyticsUniversities(),
-        api.getAnalyticsCosts(),
-        api.getAnalyticsFunnel(),
-        api.getAnalyticsLeads(),
-      ]);
-      setOverview(overRes);
-      setModels(modRes || []);
-      setTools(toolRes || []);
-      setUniversities(uniRes || []);
-      setCosts(costRes);
-      setFunnel(funRes);
-      setLeadIntentStats(leadRes || { source_breakdown: [], intent_categories: [] });
-    } catch (err) {
-      setError(err.message || "Failed to load observability metrics.");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
-    fetchData();
-  }, []);
+    let cancelled = false;
+    async function run() {
+      setLoading(true);
+      setError(null);
+      try {
+        const [overRes, modRes, toolRes, uniRes, costRes, funRes, leadRes] = await Promise.all([
+          api.getAnalyticsOverview(),
+          api.getAnalyticsModels(),
+          api.getAnalyticsTools(),
+          api.getAnalyticsUniversities(),
+          api.getAnalyticsCosts(),
+          api.getAnalyticsFunnel(),
+          api.getAnalyticsLeads(),
+        ]);
+        if (cancelled) return;
+        setOverview(overRes);
+        setModels(modRes || []);
+        setTools(toolRes || []);
+        setUniversities(uniRes || []);
+        setCosts(costRes);
+        setFunnel(funRes);
+        setLeadIntentStats(leadRes || { source_breakdown: [], intent_categories: [] });
+      } catch (err) {
+        if (cancelled) return;
+        setError(err.message || "Failed to load observability metrics.");
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+    run();
+    return () => { cancelled = true; };
+  }, [refresh]);
 
   if (loading) return <LoadingState message="Calculating AI observability metrics and costs..." />;
-  if (error) return <ErrorState title="observability fetch failed" description={error} retry={fetchData} />;
+  if (error) return <ErrorState title="observability fetch failed" description={error} retry={() => setRefresh((r) => r + 1)} />;
 
   return (
     <div className="space-y-8 text-left">

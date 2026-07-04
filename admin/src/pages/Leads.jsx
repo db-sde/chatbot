@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Search,
@@ -7,8 +7,7 @@ import {
   ChevronRight,
   ArrowUpDown,
   Mail,
-  Phone,
-  Bookmark
+  Phone
 } from "lucide-react";
 import { api } from "../services/api";
 import { Badge, LoadingState, ErrorState, EmptyState } from "../components/Common";
@@ -25,22 +24,29 @@ export default function Leads() {
   const [sortDirection, setSortDirection] = useState("desc");
   const itemsPerPage = 10;
 
-  const fetchLeads = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.getLeads(200, 0); // Fetch top 200 leads for sorting/pagination client side
-      setLeads(data || []);
-    } catch (err) {
-      setError(err.message || "Failed to load lead generation list.");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
-    fetchLeads();
-  }, []);
+    let cancelled = false;
+    async function run() {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await api.getLeads(200, 0);
+        if (cancelled) return;
+        setLeads(data || []);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err.message || "Failed to load lead generation list.");
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+    run();
+    return () => { cancelled = true; };
+  }, [refresh]);
 
   const handleSort = (field) => {
     const isAsc = sortField === field && sortDirection === "asc";
@@ -85,7 +91,7 @@ export default function Leads() {
   const currentLeads = sortedLeads.slice(indexOfFirstItem, indexOfLastItem);
 
   if (loading) return <LoadingState message="Connecting to CRM/leads datastore..." />;
-  if (error) return <ErrorState title="CRM synchronisation failed" description={error} retry={fetchLeads} />;
+  if (error) return <ErrorState title="CRM synchronisation failed" description={error} retry={() => setRefresh((r) => r + 1)} />;
 
   return (
     <div className="bg-[#111827] border border-[#1F2937] rounded-xl overflow-hidden shadow-sm">

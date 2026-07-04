@@ -21,6 +21,7 @@ It owns all session / message persistence so the graph nodes stay pure.
 import asyncio
 import json
 import logging
+import time
 from typing import Annotated, Any, AsyncIterator, TypedDict
 
 import groq
@@ -30,7 +31,6 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from agent.guardrail import OFF_TOPIC_REDIRECT
 from security.output_scan import scan_output
 from agent.llm_client import SYSTEM_PROMPT, llm_client
 from agent.resolve import resolve_entities as _resolve_entities
@@ -42,8 +42,9 @@ from observability import (
     request_metadata_var,
     init_observability_context,
     mark_llm_start,
-    record_llm_call,
     mark_first_token,
+    record_llm_call,
+    record_llm_call_duration,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,10 +86,16 @@ def _make_state(
     message: str,
     page_university_slug: str | None,
     context: dict[str, Any],
+    history_messages: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
-    """Build the initial graph state from a single user turn."""
+    """Build the initial graph state from a single user turn.
+
+    `history_messages` are prior user/assistant turns loaded from the database.
+    They are bounded (default 20) so the prompt does not grow unbounded.
+    """
+    history_messages = history_messages or []
     return {
-        "messages": [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=message)],
+        "messages": [SystemMessage(content=SYSTEM_PROMPT), *history_messages, HumanMessage(content=message)],
         "session_id": session_id,
         "site_id": site_id,
         "raw_message": message,
@@ -209,15 +216,21 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
     the LLM is free to reply naturally.
     """
     if llm_client.groq_chat and llm_client.gemini_chat:
-        model_with_tools = llm_client.groq_chat.bind_tools(TOOLS).with_fallbacks(
-            [llm_client.gemini_chat.bind_tools(TOOLS)]
+        model_with_tools = llm_client.groq_chat.bind_tools(TOOLS).with_retry(
+            stop_after_attempt=3
+        ).with_fallbacks(
+            [llm_client.gemini_chat.bind_tools(TOOLS).with_retry(stop_after_attempt=3)]
         )
     elif llm_client.groq_chat:
-        model_with_tools = llm_client.groq_chat.bind_tools(TOOLS)
+        model_with_tools = llm_client.groq_chat.bind_tools(TOOLS).with_retry(stop_after_attempt=3)
     elif llm_client.gemini_chat:
-        model_with_tools = llm_client.gemini_chat.bind_tools(TOOLS)
+        model_with_tools = llm_client.gemini_chat.bind_tools(TOOLS).with_retry(stop_after_attempt=3)
     else:
-        model_with_tools = llm_client.chat_model.bind_tools(TOOLS) if llm_client.chat_model else None
+        model_with_tools = (
+            llm_client.chat_model.bind_tools(TOOLS).with_retry(stop_after_attempt=3)
+            if llm_client.chat_model
+            else None
+        )
 
     if model_with_tools is None:
         # No LLM key — return a static offline fallback.
@@ -254,8 +267,10 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
         messages = messages[:-1] + [SystemMessage(content=context_note)] + messages[-1:]
 
     mark_llm_start()
+    t_start = time.perf_counter()
     try:
         response: AIMessage = await model_with_tools.ainvoke(_clean_messages(messages))
+        mark_first_token()
         if hasattr(response, "response_metadata"):
             record_llm_call(response.response_metadata)
     except groq.RateLimitError:
@@ -276,6 +291,9 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
                 )
             ]
         }
+    finally:
+        record_llm_call_duration(int((time.perf_counter() - t_start) * 1000))
+
     return {"messages": [response]}  # add_messages will append, not replace
 
 
@@ -352,8 +370,12 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
             )
         ]
         mark_llm_start()
+        t_start = time.perf_counter()
         try:
-            response: AIMessage = await llm_client.chat_model.ainvoke(_clean_messages(synthesis_messages))
+            response: AIMessage = await llm_client.chat_model.with_retry(
+                stop_after_attempt=3
+            ).ainvoke(_clean_messages(synthesis_messages))
+            mark_first_token()
             if hasattr(response, "response_metadata"):
                 record_llm_call(response.response_metadata)
             reply_text = str(response.content) if response.content else (
@@ -362,6 +384,8 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Groq synthesis failed: %s", exc)
             reply_text = "I found the data but couldn't format it — please try again in a moment."
+        finally:
+            record_llm_call_duration(int((time.perf_counter() - t_start) * 1000))
 
     return {"reply": reply_text, "tool_calls_log": tool_calls_log}
 
@@ -538,8 +562,25 @@ async def run_chat_turn(
     init_observability_context()
     pool = await get_pool()
 
-    # ── Session bootstrap + user message persistence ──
+    # ── Session bootstrap + bounded conversation history ──
     await queries.ensure_session(pool, session_id, site_id, page_university_slug, ip_address, user_agent)
+
+    # Load prior user/assistant turns BEFORE inserting the current message so the
+    # current turn is not duplicated in the prompt.  Bounded window keeps token
+    # usage and latency predictable as conversations grow.
+    history_result = await queries.get_session_history(pool, session_id, limit=20)
+    history_messages: list[BaseMessage] = []
+    for msg in history_result.get("messages", []):
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "user":
+            history_messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            # Skip empty assistant tool-call-only rows so they do not pollute the prompt.
+            if content:
+                history_messages.append(AIMessage(content=content))
+
+    # ── Persist user message ──
     await queries.insert_message(pool, session_id, "user", message)
 
     # ── Load prior session context so slugs carry forward ──
@@ -552,6 +593,7 @@ async def run_chat_turn(
         message=message,
         page_university_slug=page_university_slug,
         context=context,
+        history_messages=history_messages,
     )
     final_state: dict[str, Any] = await _graph.ainvoke(initial_state)
 
@@ -644,5 +686,16 @@ async def run_chat_turn(
                 if lead_ask
                 else ["Check fees", "Eligibility", "Talk to counsellor"]
             ),
+            "metrics": {
+                "response_time_ms": response_time_ms,
+                "ttft_ms": ttft_ms,
+                "llm_duration_ms": metadata.get("llm_duration_ms", 0),
+                "tool_execution_time_ms": tool_exec_time,
+                "input_tokens": metadata["input_tokens"],
+                "output_tokens": metadata["output_tokens"],
+                "total_tokens": metadata["total_tokens"],
+                "estimated_cost_usd": metadata["estimated_cost_usd"],
+                "model_name": metadata["model_name"],
+            },
         },
     }

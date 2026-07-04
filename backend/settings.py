@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,12 +21,29 @@ class Settings(BaseSettings):
     daily_message_cap_per_site: int = 2000
     postgres_password: str = "postgres"
 
+    # LLM model names (configurable so providers/models can be swapped without code changes)
+    groq_model_name: str = "llama-3.3-70b-versatile"
+    gemini_model_name: str = "gemini-2.5-flash"
+    gemini_embedding_model: str = "models/text-embedding-004"
+
     # Comma-separated list of IPs that are trusted to set X-Forwarded-For
-    # (your reverse proxy — Nginx/Caddy — or "*" if the app is never reachable
-    # except through that proxy, e.g. behind Cloudflare Tunnel). Required for
+    # (your reverse proxy — Nginx/Caddy/Cloudflare Tunnel). Required for
     # SlowAPI's get_remote_address to see the real visitor IP instead of the
     # proxy's IP once this is deployed behind Nginx/Caddy/Cloudflare.
+    # "*" is rejected at startup because it allows any client to spoof
+    # X-Forwarded-For and bypass per-IP rate limits.
     trusted_proxies_raw: str = Field(default="127.0.0.1", alias="TRUSTED_PROXIES")
+
+    @field_validator("trusted_proxies_raw")
+    @classmethod
+    def _reject_wildcard_trusted_proxies(cls, value: str) -> str:
+        if value.strip() == "*":
+            raise ValueError(
+                "TRUSTED_PROXIES='*' is not allowed because it lets any client "
+                "spoof X-Forwarded-For and bypass per-IP rate limits. "
+                "Set explicit proxy IPs instead."
+            )
+        return value
 
     @property
     def trusted_proxies(self) -> list[str]:
@@ -65,7 +82,6 @@ class Settings(BaseSettings):
                         origins.add(f"https://{domain}{port}")
                 else:
                     origins.add(f"https://{domain}")
-                    origins.add(f"http://{domain}")
         return sorted(origins)
 
 

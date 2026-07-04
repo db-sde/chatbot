@@ -15,7 +15,7 @@ sys.path.insert(0, str(root_dir / "backend"))
 sys.path.insert(0, str(root_dir))
 
 from db import migrate
-from db.pool import get_pool, close_pool
+from db.pool import close_pool
 from ingestion.microapp_to_db import ingest
 from agent import tools
 

@@ -1,11 +1,10 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   HelpCircle,
   HelpCircle as QuestionIcon,
   ChevronDown,
   ChevronUp,
   School,
-  Activity,
   Bookmark
 } from "lucide-react";
 import { api } from "../services/api";
@@ -17,22 +16,29 @@ export default function Unanswered() {
   const [error, setError] = useState(null);
   const [expandedGroupId, setExpandedGroupId] = useState(null);
 
-  const fetchUnanswered = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.getUnanswered();
-      setGroups(data || []);
-    } catch (err) {
-      setError(err.message || "Failed to load unanswered question log.");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
-    fetchUnanswered();
-  }, []);
+    let cancelled = false;
+    async function run() {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await api.getUnanswered();
+        if (cancelled) return;
+        setGroups(data || []);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err.message || "Failed to load unanswered question log.");
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+    run();
+    return () => { cancelled = true; };
+  }, [refresh]);
 
   const toggleGroup = (id) => {
     if (expandedGroupId === id) {
@@ -43,7 +49,7 @@ export default function Unanswered() {
   };
 
   if (loading) return <LoadingState message="Scanning unanswered database for knowledge gaps..." />;
-  if (error) return <ErrorState title="Unanswered scan failed" description={error} retry={fetchUnanswered} />;
+  if (error) return <ErrorState title="Unanswered scan failed" description={error} retry={() => setRefresh((r) => r + 1)} />;
 
   return (
     <div className="space-y-6 text-left">

@@ -38,7 +38,9 @@ const request = async (path, options = {}) => {
       if (data && data.detail) {
         errMsg = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
       }
-    } catch (_) {}
+    } catch {
+      // Ignore JSON parse errors; fall back to status-based message
+    }
     throw new ApiError(errMsg, response.status);
   }
 
@@ -86,10 +88,6 @@ export const api = {
 
   async getUnanswered() {
     return request("/unanswered");
-  },
-
-  async getFlagged(limit = 100, offset = 0) {
-    return request(`/flagged?limit=${limit}&offset=${offset}`);
   },
 
   async getSecuritySummary() {

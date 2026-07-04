@@ -1,4 +1,3 @@
-import React from "react";
 import { Loader2, Inbox, AlertTriangle } from "lucide-react";
 
 export function Badge({ variant = "neutral", children }) {

@@ -1,11 +1,9 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ShieldAlert,
   ShieldAlert as SecurityIcon,
   AlertTriangle,
-  Play,
   Activity,
-  UserCheck
 } from "lucide-react";
 import { api } from "../services/api";
 import StatsCard from "../components/StatsCard";
@@ -17,29 +15,36 @@ export default function Security() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const fetchSecurity = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [summaryData, attacksData] = await Promise.all([
-        api.getSecuritySummary(),
-        api.getSecurityAttacks(20),
-      ]);
-      setSummary(summaryData);
-      setAttacks(attacksData || []);
-    } catch (err) {
-      setError(err.message || "Failed to load security summary.");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
-    fetchSecurity();
-  }, []);
+    let cancelled = false;
+    async function run() {
+      setLoading(true);
+      setError(null);
+      try {
+        const [summaryData, attacksData] = await Promise.all([
+          api.getSecuritySummary(),
+          api.getSecurityAttacks(20),
+        ]);
+        if (cancelled) return;
+        setSummary(summaryData);
+        setAttacks(attacksData || []);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err.message || "Failed to load security summary.");
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+    run();
+    return () => { cancelled = true; };
+  }, [refresh]);
 
   if (loading) return <LoadingState message="Querying Prompt Guard 2 & Policy logs..." />;
-  if (error) return <ErrorState title="Security scan failed" description={error} retry={fetchSecurity} />;
+  if (error) return <ErrorState title="Security scan failed" description={error} retry={() => setRefresh((r) => r + 1)} />;
 
   // Aggregate blocks by layer
   const totalBlocks = summary?.total_blocks || 0;

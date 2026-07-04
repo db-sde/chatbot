@@ -93,7 +93,7 @@ async def _get_embedding(text: str) -> list[float] | None:
             import google.generativeai as genai
             genai.configure(api_key=settings.gemini_api_key)
             result = genai.embed_content(
-                model="models/text-embedding-004",
+                model=settings.gemini_embedding_model,
                 contents=text,
             )
             return result.get("embedding")

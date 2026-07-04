@@ -6,13 +6,12 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Body
+from fastapi import Depends, FastAPI, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel, EmailStr, Field
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from agent.graph import run_chat_turn
@@ -51,9 +50,27 @@ app.add_middleware(
 # add-order) — it must rewrite request.client.host from X-Forwarded-For
 # BEFORE CORS/SlowAPI run, or get_remote_address() sees the proxy's IP for
 # every request instead of the real visitor IP. trusted_hosts must be the
-# proxy's own IP (or "*" only if this app is never reachable except through
-# that proxy) — see settings.trusted_proxies / TRUSTED_PROXIES env var.
+# proxy's own IP. "*" is rejected in settings because it lets any client
+# spoof X-Forwarded-For and bypass per-IP rate limits.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxies)  # type: ignore
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "connect-src 'self'; "
+        "img-src 'self' data:;"
+    )
+    return response
 
 
 class ChatRequest(BaseModel):
@@ -113,8 +130,6 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                     risk_score=safety["risk_score"],
                     reason=safety["reason"] or "injection",
                 )
-                await queries.insert_message(pool, body.session_id, "user", body.message)
-                await queries.insert_message(pool, body.session_id, "assistant", _PROMPT_GUARD_BLOCKED, [])
                 yield f"event: token\ndata: {json.dumps({'text': _PROMPT_GUARD_BLOCKED})}\n\n"
                 yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
                 return
@@ -137,8 +152,6 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                     risk_score=0.9,
                     reason=policy["rule"] or "policy_violation",
                 )
-                await queries.insert_message(pool, body.session_id, "user", body.message)
-                await queries.insert_message(pool, body.session_id, "assistant", _POLICY_BLOCKED, [])
                 yield f"event: token\ndata: {json.dumps({'text': _POLICY_BLOCKED})}\n\n"
                 yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
                 return

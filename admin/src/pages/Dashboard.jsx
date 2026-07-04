@@ -1,20 +1,18 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
-  MessageSquare,
   Users,
   AlertOctagon,
   HelpCircle,
   TrendingUp,
   School,
   Activity,
-  Bookmark,
   Clock,
   DollarSign,
   BarChart3
 } from "lucide-react";
 import { api } from "../services/api";
 import StatsCard from "../components/StatsCard";
-import { LoadingState, ErrorState, EmptyState } from "../components/Common";
+import { LoadingState, ErrorState } from "../components/Common";
 
 export default function Dashboard() {
   const [data, setData] = useState(null);
@@ -23,31 +21,38 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const fetchData = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [analyticsData, securityData, overviewData] = await Promise.all([
-        api.getAnalytics(),
-        api.getSecuritySummary(),
-        api.getAnalyticsOverview(),
-      ]);
-      setData(analyticsData);
-      setSecurity(securityData);
-      setOverview(overviewData);
-    } catch (err) {
-      setError(err.message || "Failed to load dashboard metrics.");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
-    fetchData();
-  }, []);
+    let cancelled = false;
+    async function run() {
+      setLoading(true);
+      setError(null);
+      try {
+        const [analyticsData, securityData, overviewData] = await Promise.all([
+          api.getAnalytics(),
+          api.getSecuritySummary(),
+          api.getAnalyticsOverview(),
+        ]);
+        if (cancelled) return;
+        setData(analyticsData);
+        setSecurity(securityData);
+        setOverview(overviewData);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err.message || "Failed to load dashboard metrics.");
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+    run();
+    return () => { cancelled = true; };
+  }, [refresh]);
 
   if (loading) return <LoadingState message="Connecting to analytics pipeline..." />;
-  if (error) return <ErrorState title="Dashboard connection failed" description={error} retry={fetchData} />;
+  if (error) return <ErrorState title="Dashboard connection failed" description={error} retry={() => setRefresh((r) => r + 1)} />;
 
   // Computed metrics
   const totalSessions = data?.conversation_count || 0;
