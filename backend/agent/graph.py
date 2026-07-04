@@ -443,6 +443,8 @@ async def run_chat_turn(
     site_id: str,
     message: str,
     page_university_slug: str | None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     Drive a single user turn through the full agent pipeline and stream SSE
@@ -455,7 +457,7 @@ async def run_chat_turn(
     pool = await get_pool()
 
     # ── Session bootstrap + user message persistence ──
-    await queries.ensure_session(pool, session_id, site_id, page_university_slug)
+    await queries.ensure_session(pool, session_id, site_id, page_university_slug, ip_address, user_agent)
     await queries.insert_message(pool, session_id, "user", message)
 
     # ── Load prior session context so slugs carry forward ──

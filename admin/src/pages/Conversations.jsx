@@ -200,6 +200,14 @@ export default function Conversations() {
                       <span className="text-[9px] text-gray-500 font-medium">
                         {session.message_count} msgs
                       </span>
+                      {session.ip_address && (
+                        <>
+                          <span className="text-[9px] text-gray-500 font-bold">•</span>
+                          <span className="text-[9px] font-mono text-emerald-500 font-semibold">
+                            {session.ip_address}
+                          </span>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -251,6 +259,14 @@ export default function Conversations() {
                     <>
                       <span>•</span>
                       <span>Page: <strong className="text-gray-300 uppercase">{activeSession.session?.page_university_slug}</strong></span>
+                    </>
+                  )}
+                  {activeSession.session?.ip_address && (
+                    <>
+                      <span>•</span>
+                      <span className="bg-emerald-950/40 text-emerald-400 px-1.5 py-0.5 rounded font-mono font-bold">
+                        IP: {activeSession.session?.ip_address}
+                      </span>
                     </>
                   )}
                 </div>

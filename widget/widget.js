@@ -24,6 +24,10 @@
       .msg { max-width: 84%; padding: 10px 12px; border-radius: 8px; line-height: 1.38; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
       .user { align-self: flex-end; background: #135d66; color: white; }
       .bot { align-self: flex-start; background: white; border: 1px solid #d7e1df; color: #172326; }
+      .history-divider { align-self: stretch; text-align: center; font-size: 11px; color: #9ca3af; padding: 4px 0 8px; display: flex; align-items: center; gap: 8px; }
+      .history-divider::before, .history-divider::after { content: ""; flex: 1; height: 1px; background: #d7e1df; }
+      .load-more { align-self: center; background: none; border: 1px solid #b9cbc8; color: #135d66; padding: 5px 14px; border-radius: 999px; cursor: pointer; font-size: 12px; margin-bottom: 4px; }
+      .load-more:hover { background: #eef4f3; }
       .chips { display: flex; gap: 8px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid #e7eeee; background: white; }
       .chip { border: 1px solid #b9cbc8; background: white; color: #135d66; padding: 7px 10px; border-radius: 999px; cursor: pointer; font-size: 13px; }
       .composer { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #e7eeee; background: white; }
@@ -37,7 +41,7 @@
       .typing span:nth-child(3) { animation-delay: .4s; }
       @keyframes blink { 0%,80%,100% { opacity:.4; transform:scale(1); } 40% { opacity:1; transform:scale(1.25); } }
     </style>
-    <button class="bubble" aria-label="Open DegreeBaba chat">?</button>
+    <button class="bubble" aria-label="Open DegreeBaba chat">💬</button>
     <section class="panel" aria-label="DegreeBaba AI Chat">
       <div class="head"><span>DegreeBaba AI</span><button class="close" aria-label="Close">×</button></div>
       <div class="msgs"></div>
@@ -58,6 +62,10 @@
   const input = root.querySelector("input");
   const chips = root.querySelector(".chips");
 
+  // Pagination state for history restoration
+  let oldestLoadedId = null;
+  let historyFullyLoaded = false;
+
   function addMessage(text, role) {
     const node = document.createElement("div");
     node.className = `msg ${role}`;
@@ -65,6 +73,80 @@
     msgs.appendChild(node);
     msgs.scrollTop = msgs.scrollHeight;
     return node;
+  }
+
+  function makeLoadMoreBtn() {
+    const btn = document.createElement("button");
+    btn.className = "load-more";
+    btn.textContent = "Load earlier messages";
+    btn.addEventListener("click", loadMoreHistory);
+    return btn;
+  }
+
+  // Prepend historical messages above existing DOM content.
+  // hasMore=true adds a "Load earlier messages" button at the very top.
+  function prependHistoryMessages(messages, hasMore) {
+    const fragment = document.createDocumentFragment();
+    if (hasMore) fragment.appendChild(makeLoadMoreBtn());
+    messages.forEach((msg) => {
+      const node = document.createElement("div");
+      node.className = `msg ${msg.role === "user" ? "user" : "bot"}`;
+      node.textContent = msg.content;
+      fragment.appendChild(node);
+    });
+    msgs.insertBefore(fragment, msgs.firstChild);
+  }
+
+  async function loadHistory() {
+    try {
+      const url =
+        `${apiBase}/api/session/history` +
+        `?session_id=${encodeURIComponent(sessionId)}` +
+        `&site_key=${encodeURIComponent(siteKey)}` +
+        `&limit=20`;
+      const res = await fetch(url);
+      if (!res.ok) return; // silently skip — don't block fresh sessions
+      const data = await res.json();
+      const messages = data.messages || [];
+      if (messages.length === 0) return;
+
+      oldestLoadedId = data.oldest_id;
+      historyFullyLoaded = !data.has_more;
+
+      // Insert the "Earlier conversation" divider first (at current bottom of msgs)
+      const divider = document.createElement("div");
+      divider.className = "history-divider";
+      divider.textContent = "Earlier conversation";
+      msgs.appendChild(divider);
+
+      // Then prepend the actual history above the divider
+      prependHistoryMessages(messages, data.has_more);
+    } catch (_) {
+      // Network errors must never crash the widget
+    }
+  }
+
+  async function loadMoreHistory() {
+    if (!oldestLoadedId || historyFullyLoaded) return;
+    // Remove the existing "Load earlier messages" button before fetching
+    const existingBtn = msgs.querySelector(".load-more");
+    if (existingBtn) existingBtn.remove();
+    try {
+      const url =
+        `${apiBase}/api/session/history` +
+        `?session_id=${encodeURIComponent(sessionId)}` +
+        `&site_key=${encodeURIComponent(siteKey)}` +
+        `&limit=20` +
+        `&before_id=${oldestLoadedId}`;
+      const res = await fetch(url);
+      if (!res.ok) return;
+      const data = await res.json();
+      const messages = data.messages || [];
+      if (messages.length === 0) { historyFullyLoaded = true; return; }
+      oldestLoadedId = data.oldest_id;
+      historyFullyLoaded = !data.has_more;
+      prependHistoryMessages(messages, data.has_more);
+    } catch (_) {}
   }
 
   function renderLeadForm(courseInterest) {
@@ -98,7 +180,6 @@
     addMessage(message, "user");
     input.value = "";
 
-    // Show typing indicator while waiting for the first token
     const typingNode = document.createElement("div");
     typingNode.className = "typing";
     typingNode.innerHTML = "<span></span><span></span><span></span>";
@@ -106,7 +187,7 @@
     msgs.scrollTop = msgs.scrollHeight;
 
     const bot = addMessage("", "bot");
-    bot.style.display = "none"; // hide until first token arrives
+    bot.style.display = "none";
 
     const response = await fetch(`${apiBase}/chat`, {
       method: "POST",
@@ -150,7 +231,6 @@
         }
       }
     }
-    // If stream ended without tokens (error path), clean up typing indicator
     if (firstToken) typingNode.remove();
   }
 
@@ -163,4 +243,7 @@
   chips.addEventListener("click", (event) => {
     if (event.target.matches(".chip")) send(event.target.textContent);
   });
+
+  // Load history after the widget mounts — non-blocking, silently fails on errors
+  loadHistory();
 })();

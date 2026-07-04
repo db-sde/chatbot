@@ -1,28 +1,50 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 from typing import Any
 
 
+def _clean_row(d: dict[str, Any]) -> dict[str, Any]:
+    for k, v in d.items():
+        if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            d[k] = str(v)
+    return d
+
+
 def dict_row(row: Any) -> dict[str, Any] | None:
-    return dict(row) if row else None
+    return _clean_row(dict(row)) if row else None
 
 
 def dict_rows(rows: list[Any]) -> list[dict[str, Any]]:
-    return [dict(row) for row in rows]
+    return [_clean_row(dict(row)) for row in rows]
 
 
-async def ensure_session(pool, session_id: str, site_id: str, page_university_slug: str | None) -> None:
+async def ensure_session(
+    pool,
+    session_id: str,
+    site_id: str,
+    page_university_slug: str | None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> None:
     await pool.execute(
         """
-        INSERT INTO sessions(id, site_id, page_university_slug)
-        VALUES($1::uuid, $2, $3)
-        ON CONFLICT (id) DO UPDATE SET last_active_at = now(),
-            page_university_slug = COALESCE(EXCLUDED.page_university_slug, sessions.page_university_slug)
+        INSERT INTO sessions(id, site_id, page_university_slug, ip_address, user_agent)
+        VALUES($1::uuid, $2, $3, $4::inet, $5)
+        ON CONFLICT (id) DO UPDATE SET
+            last_active_at = now(),
+            page_university_slug = COALESCE(EXCLUDED.page_university_slug, sessions.page_university_slug),
+            -- Only write ip/ua on first insert; do not overwrite with later values
+            -- so the stored metadata reflects where the session was originally opened.
+            ip_address = COALESCE(sessions.ip_address, EXCLUDED.ip_address),
+            user_agent = COALESCE(sessions.user_agent, EXCLUDED.user_agent)
         """,
         session_id,
         site_id,
         page_university_slug,
+        ip_address,
+        user_agent,
     )
     # Insert a blank session_context row — conversational slugs start as NULL.
     # The page_university_slug is intentionally NOT written here; it is a
@@ -47,6 +69,39 @@ async def get_session_context(pool, session_id: str) -> dict[str, Any]:
         session_id,
     )
     return dict_row(row) or {}
+
+
+async def get_session_history(
+    pool,
+    session_id: str,
+    limit: int = 20,
+    before_id: int | None = None,
+) -> dict[str, Any]:
+    """
+    Return previous messages for a session in ascending chronological order.
+    Used by the widget to restore prior conversation on page load.
+    Only user/assistant roles are returned — tool call JSON is omitted
+    from this public endpoint (available in the admin /api/admin/conversations/{id}).
+    Cursor-based pagination: pass before_id to load messages older than that id.
+    """
+    limit = min(limit, 50)  # cap at 50 regardless of caller
+    rows = await pool.fetch(
+        """
+        SELECT id, role, content, created_at
+        FROM messages
+        WHERE session_id = $1::uuid
+          AND ($2::int IS NULL OR id < $2)
+        ORDER BY id DESC
+        LIMIT $3
+        """,
+        session_id,
+        before_id,
+        limit,
+    )
+    messages = list(reversed(dict_rows(rows)))  # ascending order for rendering
+    has_more = len(rows) == limit
+    oldest_id = messages[0]["id"] if messages else None
+    return {"session_id": session_id, "messages": messages, "has_more": has_more, "oldest_id": oldest_id}
 
 
 
@@ -428,7 +483,7 @@ async def mark_lead_ask(pool, session_id: str) -> None:
 async def list_conversations(pool, university: str | None, date_from: str | None, date_to: str | None, has_lead: bool | None, has_unanswered: bool | None, limit: int, offset: int) -> list[dict[str, Any]]:
     rows = await pool.fetch(
         """
-        SELECT s.id, s.site_id, s.page_university_slug, s.summary, s.started_at, s.last_active_at, s.message_count,
+        SELECT s.id, s.site_id, s.page_university_slug, s.summary, s.started_at, s.last_active_at, s.message_count, s.ip_address,
                EXISTS(SELECT 1 FROM leads l WHERE l.session_id = s.id) AS has_lead,
                EXISTS(SELECT 1 FROM unanswered_questions uq WHERE uq.session_id = s.id) AS has_unanswered
         FROM sessions s

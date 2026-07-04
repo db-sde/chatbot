@@ -126,6 +126,18 @@ export default function SessionDetails() {
               <span className="text-gray-500">Last Active</span>
               <span className="text-gray-300">{new Date(session.last_active_at).toLocaleString()}</span>
             </div>
+            <div className="border-t border-[#1F2937] pt-3 flex justify-between">
+              <span className="text-gray-500">IP Address</span>
+              <span className="font-mono text-emerald-400 font-medium">
+                {session.ip_address || <span className="text-gray-600 italic">—</span>}
+              </span>
+            </div>
+            <div className="flex justify-between items-start gap-2">
+              <span className="text-gray-500 shrink-0">User Agent</span>
+              <span className="font-mono text-gray-400 text-right break-all leading-relaxed">
+                {session.user_agent || <span className="text-gray-600 italic">—</span>}
+              </span>
+            </div>
           </div>
         </div>
 

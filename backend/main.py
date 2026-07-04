@@ -86,6 +86,10 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
     if await queries.count_site_messages_today(pool, body.site_key) >= settings.daily_message_cap_per_site:
         raise HTTPException(status_code=429, detail="Daily site message cap exceeded")
 
+    # Extract visitor metadata from the HTTP layer (server-side; not from the client body)
+    client_ip: str | None = request.client.host if request.client else None
+    client_ua: str | None = request.headers.get("user-agent")
+
     _PROMPT_GUARD_BLOCKED = (
         "I'm not able to process that message. "
         "I'm here to help with universities, courses, fees, and admissions."
@@ -145,6 +149,8 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 site_id=body.site_key,
                 message=body.message,
                 page_university_slug=body.page_university_slug,
+                ip_address=client_ip,
+                user_agent=client_ua,
             ):
                 yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
 
@@ -177,6 +183,26 @@ async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[
         async with httpx.AsyncClient(timeout=8) as client:
             await client.post(settings.crm_webhook_url, json=body.model_dump())
     return {"ok": True}
+
+
+@app.get("/api/session/history")
+@limiter.limit("20/minute")
+async def session_history(
+    request: Request,
+    session_id: str,
+    site_key: str,
+    limit: int = 20,
+    before_id: int | None = None,
+) -> dict:
+    """Public endpoint for the widget to load prior messages on page load.
+
+    Gated by origin + site_key validation (same as /chat) — no admin token
+    required. Tool call payloads are intentionally excluded from this response;
+    they are available only through the admin /api/admin/conversations/{id} route.
+    """
+    validate_site_request(site_key, request.headers.get("origin"), request.headers.get("referer"))
+    pool = await get_pool()
+    return await queries.get_session_history(pool, session_id, limit=limit, before_id=before_id)
 
 
 # ── Single Page Application Static Files Routing for built React app ──
