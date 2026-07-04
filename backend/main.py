@@ -286,6 +286,48 @@ async def admin_analytics(_: Annotated[None, Depends(check_admin_auth)]) -> dict
     return await queries.analytics(pool)
 
 
+@app.get("/api/admin/analytics/overview")
+async def admin_analytics_overview(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Return high-level overview metrics for the AI Advisor performance dashboard."""
+    pool = await get_pool()
+    return await queries.get_analytics_overview(pool)
+
+
+@app.get("/api/admin/analytics/models")
+async def admin_analytics_models(_: Annotated[None, Depends(check_admin_auth)]) -> list[dict]:
+    """Return token count, cost, and latency averages grouped by LLM model."""
+    pool = await get_pool()
+    return await queries.get_analytics_models(pool)
+
+
+@app.get("/api/admin/analytics/tools")
+async def admin_analytics_tools(_: Annotated[None, Depends(check_admin_auth)]) -> list[dict]:
+    """Return execution counts, average durations, and success rates for all tools."""
+    pool = await get_pool()
+    return await queries.get_analytics_tools(pool)
+
+
+@app.get("/api/admin/analytics/universities")
+async def admin_analytics_universities(_: Annotated[None, Depends(check_admin_auth)]) -> list[dict]:
+    """Return conversation volume, conversion rate, token usage, and cost grouped by university page context."""
+    pool = await get_pool()
+    return await queries.get_analytics_universities(pool)
+
+
+@app.get("/api/admin/analytics/costs")
+async def admin_analytics_costs(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Return platform cost stats (daily, weekly, monthly) and list most expensive conversations."""
+    pool = await get_pool()
+    return await queries.get_analytics_costs(pool)
+
+
+@app.get("/api/admin/analytics/funnel")
+async def admin_analytics_funnel(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Return overall user funnel counts and conversions (qualified chats, leads, cost per lead)."""
+    pool = await get_pool()
+    return await queries.get_analytics_funnel(pool)
+
+
 @app.get("/api/admin/security/summary")
 async def admin_security_summary(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
     """Security block summary: total, by layer, by reason, last 24h."""

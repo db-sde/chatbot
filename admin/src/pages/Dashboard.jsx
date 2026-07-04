@@ -7,7 +7,10 @@ import {
   TrendingUp,
   School,
   Activity,
-  Bookmark
+  Bookmark,
+  Clock,
+  DollarSign,
+  BarChart3
 } from "lucide-react";
 import { api } from "../services/api";
 import StatsCard from "../components/StatsCard";
@@ -16,6 +19,7 @@ import { LoadingState, ErrorState, EmptyState } from "../components/Common";
 export default function Dashboard() {
   const [data, setData] = useState(null);
   const [security, setSecurity] = useState(null);
+  const [overview, setOverview] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -23,12 +27,14 @@ export default function Dashboard() {
     setLoading(true);
     setError(null);
     try {
-      const [analyticsData, securityData] = await Promise.all([
+      const [analyticsData, securityData, overviewData] = await Promise.all([
         api.getAnalytics(),
         api.getSecuritySummary(),
+        api.getAnalyticsOverview(),
       ]);
       setData(analyticsData);
       setSecurity(securityData);
+      setOverview(overviewData);
     } catch (err) {
       setError(err.message || "Failed to load dashboard metrics.");
     } finally {
@@ -73,10 +79,28 @@ export default function Dashboard() {
           icon={Activity}
         />
         <StatsCard
-          title="Total Messages"
-          value={totalMessages.toLocaleString()}
-          subtext="Volume of incoming & outgoing messages"
-          icon={MessageSquare}
+          title="Avg Response Time"
+          value={`${((overview?.avg_response_time_ms || 0) / 1000).toFixed(2)}s`}
+          subtext="E2E message generation latency"
+          icon={Clock}
+        />
+        <StatsCard
+          title="Avg TTFT"
+          value={`${(overview?.avg_ttft_ms || 0).toFixed(0)}ms`}
+          subtext="First token/decision latency"
+          icon={Activity}
+        />
+        <StatsCard
+          title="Tokens Today"
+          value={(overview?.total_tokens_today || 0).toLocaleString()}
+          subtext="Prompt + completion tokens today"
+          icon={BarChart3}
+        />
+        <StatsCard
+          title="Cost Today"
+          value={`$${(overview?.total_cost_today || 0).toFixed(4)}`}
+          subtext="Estimated running model cost today"
+          icon={DollarSign}
         />
         <StatsCard
           title="Total Leads"
@@ -91,6 +115,12 @@ export default function Dashboard() {
           icon={TrendingUp}
           trend={totalSessions > 0 ? "Active" : null}
           trendType={totalSessions > 0 ? "positive" : "neutral"}
+        />
+        <StatsCard
+          title="Cost Per Lead"
+          value={`$${(overview?.cost_per_lead || 0).toFixed(4)}`}
+          subtext="Model cost divided by leads count"
+          icon={TrendingUp}
         />
         <StatsCard
           title="Blocked Attacks"

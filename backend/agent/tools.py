@@ -35,6 +35,7 @@ from security.tool_validator import (
     validate_specialization_slug,
     validate_university_slug,
 )
+from observability import timed_tool_execution
 
 logger = logging.getLogger(__name__)
 
@@ -286,6 +287,7 @@ async def compare_programs(course_slugs: list[str], fields: list[str] | None = N
 # ---------------------------------------------------------------------------
 
 @tool
+@timed_tool_execution
 async def get_fee_tool(university_slug: str, course_slug: str | None = None, specialization_slug: str | None = None) -> dict:
     """Return fee data (total fee, starting fee, EMI/fee-plan breakdown) for a university,
     and optionally a specific course or specialization within it.
@@ -310,6 +312,7 @@ async def get_fee_tool(university_slug: str, course_slug: str | None = None, spe
 
 
 @tool
+@timed_tool_execution
 async def get_eligibility_tool(university_slug: str, course_slug: str) -> dict:
     """Return eligibility criteria for a specific course at a specific university.
     Use ONLY for eligibility / admission-criteria questions.
@@ -326,6 +329,7 @@ async def get_eligibility_tool(university_slug: str, course_slug: str) -> dict:
 
 
 @tool
+@timed_tool_execution
 async def get_university_overview_tool(university_slug: str) -> dict:
     """Return a university's general profile: about content, NAAC grade, UGC approval
     status, why-choose content, and placement summary.
@@ -340,6 +344,7 @@ async def get_university_overview_tool(university_slug: str) -> dict:
 
 
 @tool
+@timed_tool_execution
 async def get_university_programs_tool(university_slug: str, limit: int = DEFAULT_LIMIT) -> list[dict] | dict:
     """List all courses/programs offered by ONE specific, already-known university.
     Use for 'what programs/courses does X offer' questions.
@@ -352,6 +357,7 @@ async def get_university_programs_tool(university_slug: str, limit: int = DEFAUL
 
 
 @tool
+@timed_tool_execution
 async def get_program_details_tool(course_slug: str, university_slug: str | None = None) -> dict:
     """Return full details (duration, fee, eligibility, placement, certificate info)
     for ONE specific, already-known course.
@@ -370,6 +376,7 @@ async def get_program_details_tool(course_slug: str, university_slug: str | None
 
 
 @tool
+@timed_tool_execution
 async def get_specializations_tool(course_slug: str, university_slug: str | None = None, limit: int = DEFAULT_LIMIT) -> list[dict] | dict:
     """List all specializations available under ONE specific, already-known course
     (e.g. all MBA specializations at NMIMS).
@@ -387,6 +394,7 @@ async def get_specializations_tool(course_slug: str, university_slug: str | None
 
 
 @tool
+@timed_tool_execution
 async def list_courses_tool(
     course_type: str | None = None,
     mode: str | None = None,
@@ -405,6 +413,7 @@ async def list_courses_tool(
 
 
 @tool
+@timed_tool_execution
 async def search_catalog_tool(query_text: str, entity_type: str | None = None, limit: int = DEFAULT_LIMIT) -> list[dict] | dict:
     """Broad semantic/keyword search across the ENTIRE catalog for questions that don't
     map cleanly to a specific university/course lookup — e.g. 'show me finance-related
@@ -424,6 +433,7 @@ async def search_catalog_tool(query_text: str, entity_type: str | None = None, l
 
 
 @tool
+@timed_tool_execution
 async def compare_entities_tool(entity_type: str, slugs: list[str], fields: list[str]) -> list[dict] | dict:
     """Low-level comparison of explicit fields across explicit entities of ONE type
     (university, course, or specialization) — e.g. comparing two universities directly.
@@ -462,6 +472,7 @@ async def compare_entities_tool(entity_type: str, slugs: list[str], fields: list
 
 
 @tool
+@timed_tool_execution
 async def compare_programs_tool(course_slugs: list[str], fields: list[str] | None = None) -> list[dict] | dict:
     """Compare two or more specific, already-known COURSES side by side
     (e.g. 'compare NMIMS Online MBA with Amity Online MBA') across a sensible
@@ -486,6 +497,7 @@ async def compare_programs_tool(course_slugs: list[str], fields: list[str] | Non
 
 
 @tool
+@timed_tool_execution
 async def get_faq_tool(entity_type: str, entity_slug: str, query_text: str | None = None) -> list[dict] | dict:
     """Return FAQs for a university, course, or specialization.
     Use for policy / definition / general-knowledge-style questions about a specific

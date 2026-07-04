@@ -37,6 +37,14 @@ from agent.resolve import resolve_entities as _resolve_entities
 from agent.tools import TOOLS, log_anonymous_signal, log_unanswered
 from db import queries
 from db.pool import get_pool
+from observability import (
+    tool_metrics_var,
+    request_metadata_var,
+    init_observability_context,
+    mark_llm_start,
+    record_llm_call,
+    mark_first_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -243,8 +251,11 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
         # Insert as a SystemMessage right before the last HumanMessage
         messages = messages[:-1] + [SystemMessage(content=context_note)] + messages[-1:]
 
+    mark_llm_start()
     try:
         response: AIMessage = await model_with_tools.ainvoke(_clean_messages(messages))
+        if hasattr(response, "response_metadata"):
+            record_llm_call(response.response_metadata)
     except groq.RateLimitError:
         logger.warning("Groq rate limit hit in node_agent_decide — returning rate-limit message.")
         return {
@@ -275,6 +286,9 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
     messages = state["messages"]
 
     # Gather tool call log for admin
+    metrics = tool_metrics_var.get() or []
+    metric_iter = iter(metrics)
+
     tool_calls_log: list[dict[str, Any]] = []
     tool_result_iter = iter(
         [m for m in messages if isinstance(m, ToolMessage)]
@@ -282,7 +296,24 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
     for msg in messages:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
-                entry: dict[str, Any] = {"name": tc["name"], "args": tc["args"]}
+                entry: dict[str, Any] = {
+                    "name": tc["name"],
+                    "args": tc["args"],
+                    "status": "SUCCESS",
+                    "duration_ms": 0,
+                    "started_at": None,
+                    "completed_at": None
+                }
+                # Match with recorded execution metrics from context
+                try:
+                    m_obs = next(metric_iter)
+                    entry["started_at"] = m_obs.get("started_at")
+                    entry["completed_at"] = m_obs.get("completed_at")
+                    entry["duration_ms"] = m_obs.get("duration_ms", 0)
+                    entry["status"] = m_obs.get("status", "SUCCESS")
+                except StopIteration:
+                    pass
+
                 # Attach the next tool result to this call
                 try:
                     tm = next(tool_result_iter)
@@ -318,8 +349,11 @@ async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
                 )
             )
         ]
+        mark_llm_start()
         try:
             response: AIMessage = await llm_client.chat_model.ainvoke(_clean_messages(synthesis_messages))
+            if hasattr(response, "response_metadata"):
+                record_llm_call(response.response_metadata)
             reply_text = str(response.content) if response.content else (
                 "I found the data but couldn't format it — please check with our team."
             )
@@ -454,6 +488,7 @@ async def run_chat_turn(
       { event: "token", data: { text: "..." } }   — one per word token
       { event: "final", data: { lead_ask: bool, quick_replies: [...] } }
     """
+    init_observability_context()
     pool = await get_pool()
 
     # ── Session bootstrap + user message persistence ──
@@ -505,9 +540,42 @@ async def run_chat_turn(
         )
         reply = scan["safe_reply"]
 
+    # Calculate final observability stats
+    import time
+    from datetime import datetime, timezone
+    metadata = request_metadata_var.get()
+    started_at = metadata["started_at"]
+    completed_at = datetime.now(timezone.utc)
+    
+    t_now = time.perf_counter()
+    response_time_ms = int((t_now - metadata["t_start"]) * 1000)
+    
+    t_first = metadata.get("t_first_token") or t_now
+    ttft_ms = int((t_first - metadata["t_start"]) * 1000)
+    
+    # Tool execution sum
+    tools_executed = tool_metrics_var.get() or []
+    tool_exec_time = sum(m.get("duration_ms", 0) for m in tools_executed)
+
     # ── Persist assistant reply + compact tool log ──
     tool_calls_log: list[dict[str, Any]] = final_state.get("tool_calls_log", [])
-    await queries.insert_message(pool, session_id, "assistant", reply, tool_calls_log)
+    await queries.insert_message(
+        pool,
+        session_id,
+        "assistant",
+        reply,
+        tool_calls=tool_calls_log,
+        response_time_ms=response_time_ms,
+        ttft_ms=ttft_ms,
+        model_name=metadata["model_name"],
+        input_tokens=metadata["input_tokens"],
+        output_tokens=metadata["output_tokens"],
+        total_tokens=metadata["total_tokens"],
+        estimated_cost_usd=metadata["estimated_cost_usd"],
+        tool_execution_time_ms=tool_exec_time,
+        started_at=started_at,
+        completed_at=completed_at,
+    )
 
     # ── Stream reply tokens ──
     async for token in _stream_text(reply):

@@ -13,7 +13,8 @@ import {
   CheckCircle,
   HelpCircle,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Activity
 } from "lucide-react";
 import { api } from "../services/api";
 import { Badge, LoadingState, ErrorState, EmptyState } from "../components/Common";
@@ -78,6 +79,29 @@ export default function SessionDetails() {
     }
   });
 
+  // Compute session metrics dynamically from messages
+  const assistantMessages = messages.filter((m) => m.role === "assistant");
+  const totalMessagesCount = messages.length;
+  
+  // Total Tokens
+  const totalTokensSum = assistantMessages.reduce((sum, m) => sum + (m.total_tokens || 0), 0);
+  const inputTokensSum = assistantMessages.reduce((sum, m) => sum + (m.input_tokens || 0), 0);
+  const outputTokensSum = assistantMessages.reduce((sum, m) => sum + (m.output_tokens || 0), 0);
+  
+  // Total Cost
+  const totalCostSum = assistantMessages.reduce((sum, m) => sum + (parseFloat(m.estimated_cost_usd) || 0.0), 0.0);
+  
+  // Averages
+  const timedMessages = assistantMessages.filter((m) => m.response_time_ms !== undefined && m.response_time_ms !== null);
+  const avgResponseTimeSec = timedMessages.length > 0
+    ? (timedMessages.reduce((sum, m) => sum + m.response_time_ms, 0) / timedMessages.length / 1000).toFixed(2)
+    : "—";
+    
+  const ttftMessages = assistantMessages.filter((m) => m.ttft_ms !== undefined && m.ttft_ms !== null);
+  const avgTtftMs = ttftMessages.length > 0
+    ? (ttftMessages.reduce((sum, m) => sum + m.ttft_ms, 0) / ttftMessages.length).toFixed(0)
+    : "—";
+
   return (
     <div className="space-y-8">
       {/* Back Button & Header */}
@@ -98,7 +122,7 @@ export default function SessionDetails() {
       </div>
 
       {/* Info Cards Row */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         {/* Session Metadata Card */}
         <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-6 space-y-4">
           <div className="flex items-center space-x-2">
@@ -206,6 +230,38 @@ export default function SessionDetails() {
             ))
           )}
         </div>
+
+        {/* Conversation Summary Card */}
+        <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-6 space-y-4">
+          <div className="flex items-center space-x-2">
+            <Activity size={16} className="text-emerald-500" />
+            <h3 className="text-xs font-bold text-gray-300 uppercase tracking-wider">Conversation Summary</h3>
+          </div>
+          <div className="space-y-3 text-xs">
+            <div className="flex justify-between">
+              <span className="text-gray-500">Total Messages</span>
+              <span className="text-gray-300 font-semibold">{totalMessagesCount}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-500">Total Tokens</span>
+              <span className="text-gray-300 font-mono font-medium">
+                {totalTokensSum.toLocaleString()} <span className="text-[10px] text-gray-500">({inputTokensSum} in / {outputTokensSum} out)</span>
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-500">Avg Response Time</span>
+              <span className="text-gray-300 font-mono font-semibold">{avgResponseTimeSec}s</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-500">Avg TTFT</span>
+              <span className="text-gray-300 font-mono font-semibold">{avgTtftMs}ms</span>
+            </div>
+            <div className="border-t border-[#1F2937]/60 pt-3 flex justify-between">
+              <span className="text-gray-400 font-semibold">Total Cost</span>
+              <span className="font-mono text-emerald-400 font-bold">${totalCostSum.toFixed(6)}</span>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Main Conversation & Tool Execution Section */}
@@ -233,6 +289,25 @@ export default function SessionDetails() {
                       <span className="ml-4">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                     </div>
                     <p className="text-xs whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                    {!isUser && (msg.model_name || msg.response_time_ms !== undefined) && (
+                      <div className="mt-3 pt-2 border-t border-[#1F2937]/60 flex flex-wrap gap-x-4 gap-y-1.5 text-[9px] text-gray-500 font-mono">
+                        {msg.model_name && (
+                          <span>Model: <strong className="text-gray-400">{msg.model_name}</strong></span>
+                        )}
+                        {msg.response_time_ms !== undefined && msg.response_time_ms !== null && (
+                          <span>Response: <strong className="text-gray-400">{(msg.response_time_ms / 1000).toFixed(2)}s</strong></span>
+                        )}
+                        {msg.ttft_ms !== undefined && msg.ttft_ms !== null && (
+                          <span>TTFT: <strong className="text-gray-400">{msg.ttft_ms}ms</strong></span>
+                        )}
+                        {msg.total_tokens !== undefined && msg.total_tokens > 0 && (
+                          <span>Tokens: <strong className="text-gray-400">{msg.total_tokens} ({msg.input_tokens} in / {msg.output_tokens} out)</strong></span>
+                        )}
+                        {msg.estimated_cost_usd !== undefined && msg.estimated_cost_usd !== null && (
+                          <span>Cost: <strong className="text-emerald-400">${parseFloat(msg.estimated_cost_usd).toFixed(6)}</strong></span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -275,6 +350,18 @@ export default function SessionDetails() {
                       <div className="flex justify-between items-center w-full">
                         <span className="text-xs font-bold text-blue-400 font-mono break-all">{tc.name}</span>
                         <div className="flex items-center space-x-2 shrink-0 ml-2">
+                          {tc.duration_ms !== undefined && tc.duration_ms !== null && (
+                            <span className="text-[9px] font-mono text-gray-400 bg-gray-900 border border-gray-800 px-1 py-0.5 rounded">
+                              {tc.duration_ms}ms
+                            </span>
+                          )}
+                          {tc.status && (
+                            <span className={`text-[9px] px-1 py-0.5 rounded uppercase font-bold shrink-0 ${
+                              tc.status === "FAILURE" ? "bg-red-950/40 text-red-400 border border-red-900/50" : "bg-emerald-950/40 text-emerald-400 border border-emerald-900/50"
+                            }`}>
+                              {tc.status}
+                            </span>
+                          )}
                           <span className="text-[9px] text-gray-500">
                             {new Date(tc.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                           </span>

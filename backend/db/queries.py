@@ -123,18 +123,58 @@ async def update_session_context(pool, session_id: str, university_slug: str | N
     )
 
 
-async def insert_message(pool, session_id: str, role: str, content: str, tool_calls: list[dict] | None = None) -> None:
-    await pool.execute(
+async def insert_message(
+    pool,
+    session_id: str,
+    role: str,
+    content: str,
+    tool_calls: list[dict] | None = None,
+    response_time_ms: int | None = None,
+    ttft_ms: int | None = None,
+    model_name: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    total_tokens: int | None = None,
+    estimated_cost_usd: float | None = None,
+    tool_execution_time_ms: int | None = None,
+    started_at: Any | None = None,
+    completed_at: Any | None = None,
+) -> int | None:
+    row = await pool.fetchrow(
         """
-        INSERT INTO messages(session_id, role, content, tool_calls)
-        VALUES($1::uuid, $2, $3, $4::jsonb)
+        INSERT INTO messages(
+            session_id, role, content, tool_calls,
+            response_time_ms, ttft_ms, model_name,
+            input_tokens, output_tokens, total_tokens,
+            estimated_cost_usd, tool_execution_time_ms,
+            started_at, completed_at
+        )
+        VALUES(
+            $1::uuid, $2, $3, $4::jsonb,
+            $5, $6, $7,
+            $8, $9, $10,
+            $11, $12,
+            $13, $14
+        )
+        RETURNING id
         """,
         session_id,
         role,
         content,
         json.dumps(tool_calls) if tool_calls is not None else None,
+        response_time_ms,
+        ttft_ms,
+        model_name,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        estimated_cost_usd,
+        tool_execution_time_ms,
+        started_at,
+        completed_at,
     )
     await pool.execute("UPDATE sessions SET message_count = message_count + 1, last_active_at = now() WHERE id = $1::uuid", session_id)
+    return row["id"] if row else None
 
 
 async def recent_messages(pool, session_id: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -508,7 +548,20 @@ async def list_conversations(pool, university: str | None, date_from: str | None
 
 async def get_conversation(pool, session_id: str) -> dict[str, Any]:
     session = dict_row(await pool.fetchrow("SELECT * FROM sessions WHERE id = $1::uuid", session_id)) or {}
-    messages = dict_rows(await pool.fetch("SELECT role, content, tool_calls, created_at FROM messages WHERE session_id = $1::uuid ORDER BY id", session_id))
+    messages = dict_rows(
+        await pool.fetch(
+            """
+            SELECT id, role, content, tool_calls, created_at,
+                   response_time_ms, ttft_ms, model_name,
+                   input_tokens, output_tokens, total_tokens,
+                   estimated_cost_usd
+            FROM messages
+            WHERE session_id = $1::uuid
+            ORDER BY id
+            """,
+            session_id,
+        )
+    )
     for msg in messages:
         if isinstance(msg.get("tool_calls"), str):
             try:
@@ -646,3 +699,152 @@ async def get_top_attack_patterns(pool, limit: int = 20) -> list[dict[str, Any]]
         limit,
     )
     return dict_rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Next-Generation AI Observability & Cost Analytics Queries
+# ---------------------------------------------------------------------------
+
+async def get_analytics_overview(pool) -> dict[str, Any]:
+    """Retrieve high-level overview metrics for the AI Advisor performance dashboard."""
+    avg_response = await pool.fetchval("SELECT coalesce(avg(response_time_ms), 0.0) FROM messages WHERE role = 'assistant'")
+    avg_ttft = await pool.fetchval("SELECT coalesce(avg(ttft_ms), 0.0) FROM messages WHERE role = 'assistant'")
+    total_tokens_today = await pool.fetchval("SELECT coalesce(sum(total_tokens), 0) FROM messages WHERE role = 'assistant' AND created_at >= date_trunc('day', now())")
+    total_cost_today = await pool.fetchval("SELECT coalesce(sum(estimated_cost_usd), 0.0) FROM messages WHERE role = 'assistant' AND created_at >= date_trunc('day', now())")
+    
+    total_leads = await pool.fetchval("SELECT count(*) FROM leads")
+    total_cost = await pool.fetchval("SELECT coalesce(sum(estimated_cost_usd), 0.0) FROM messages WHERE role = 'assistant'")
+    cost_per_lead = (float(total_cost) / total_leads) if total_leads > 0 else 0.0
+    
+    return {
+        "avg_response_time_ms": float(avg_response or 0.0),
+        "avg_ttft_ms": float(avg_ttft or 0.0),
+        "total_tokens_today": int(total_tokens_today or 0),
+        "total_cost_today": float(total_cost_today or 0.0),
+        "total_leads": int(total_leads or 0),
+        "cost_per_lead": float(cost_per_lead),
+    }
+
+
+async def get_analytics_models(pool) -> list[dict[str, Any]]:
+    """Return token count, cost, and latency averages grouped by LLM model."""
+    rows = await pool.fetch(
+        """
+        SELECT model_name,
+               count(*) AS messages,
+               coalesce(sum(input_tokens), 0) AS input_tokens,
+               coalesce(sum(output_tokens), 0) AS output_tokens,
+               coalesce(sum(total_tokens), 0) AS total_tokens,
+               coalesce(sum(estimated_cost_usd), 0.0) AS total_cost,
+               coalesce(avg(response_time_ms), 0.0) AS avg_response_time,
+               coalesce(avg(ttft_ms), 0.0) AS avg_ttft
+        FROM messages
+        WHERE role = 'assistant' AND model_name IS NOT NULL
+        GROUP BY model_name
+        ORDER BY total_cost DESC
+        """
+    )
+    return dict_rows(rows)
+
+
+async def get_analytics_tools(pool) -> list[dict[str, Any]]:
+    """Flatten and aggregate tool call duration and success statistics from JSONB records."""
+    rows = await pool.fetch(
+        """
+        SELECT t.name,
+               count(*) AS executions,
+               coalesce(avg((t.item->>'duration_ms')::int), 0.0) AS avg_duration,
+               coalesce(max((t.item->>'duration_ms')::int), 0) AS max_duration,
+               sum(case when t.item->>'status' = 'FAILURE' then 1 else 0 end) AS failure_count,
+               round(100.0 * sum(case when t.item->>'status' = 'SUCCESS' then 1 else 0 end) / nullif(count(*), 0), 2) AS success_rate
+        FROM messages m,
+             lateral jsonb_array_elements(m.tool_calls) AS t(item)
+        WHERE m.role = 'assistant' AND m.tool_calls IS NOT NULL
+        GROUP BY t.name
+        ORDER BY executions DESC
+        """
+    )
+    return dict_rows(rows)
+
+
+async def get_analytics_universities(pool) -> list[dict[str, Any]]:
+    """Group analytics and costs by university page-hint context."""
+    rows = await pool.fetch(
+        """
+        SELECT coalesce(s.page_university_slug, 'general') AS university,
+               count(distinct s.id) AS chats,
+               count(distinct m.id) AS messages,
+               count(distinct l.id) AS leads,
+               round(100.0 * count(distinct l.id) / nullif(count(distinct s.id), 0), 2) AS conversion_rate,
+               coalesce(sum(m.total_tokens), 0) AS total_tokens,
+               coalesce(sum(m.estimated_cost_usd), 0.0) AS total_cost,
+               coalesce(avg(m.response_time_ms), 0.0) AS avg_response_time
+        FROM sessions s
+        LEFT JOIN messages m ON m.session_id = s.id
+        LEFT JOIN leads l ON l.session_id = s.id
+        GROUP BY s.page_university_slug
+        ORDER BY chats DESC
+        """
+    )
+    return dict_rows(rows)
+
+
+async def get_analytics_costs(pool) -> dict[str, Any]:
+    """Retrieve detailed platform running costs (daily, weekly, monthly) and list most expensive chats."""
+    cost_today = await pool.fetchval("SELECT coalesce(sum(estimated_cost_usd), 0.0) FROM messages WHERE role = 'assistant' AND created_at >= date_trunc('day', now())")
+    cost_week = await pool.fetchval("SELECT coalesce(sum(estimated_cost_usd), 0.0) FROM messages WHERE role = 'assistant' AND created_at >= now() - interval '7 days'")
+    cost_month = await pool.fetchval("SELECT coalesce(sum(estimated_cost_usd), 0.0) FROM messages WHERE role = 'assistant' AND created_at >= now() - interval '30 days'")
+    total_cost = await pool.fetchval("SELECT coalesce(sum(estimated_cost_usd), 0.0) FROM messages WHERE role = 'assistant'")
+    
+    expensive_chats_rows = await pool.fetch(
+        """
+        SELECT s.id AS session_id,
+               count(m.id) AS message_count,
+               coalesce(sum(m.total_tokens), 0) AS total_tokens,
+               coalesce(sum(m.estimated_cost_usd), 0.0) AS total_cost,
+               s.started_at
+        FROM sessions s
+        JOIN messages m ON m.session_id = s.id
+        GROUP BY s.id, s.started_at
+        ORDER BY total_cost DESC
+        LIMIT 10
+        """
+    )
+    
+    return {
+        "cost_today": float(cost_today or 0.0),
+        "cost_week": float(cost_week or 0.0),
+        "cost_month": float(cost_month or 0.0),
+        "total_cost": float(total_cost or 0.0),
+        "expensive_conversations": dict_rows(expensive_chats_rows)
+    }
+
+
+async def get_analytics_funnel(pool) -> dict[str, Any]:
+    """Return qualified funnel metrics stage counts and overall conversions."""
+    row = await pool.fetchrow(
+        """
+        WITH stats AS (
+            SELECT count(distinct s.id) AS total_sessions,
+                   count(distinct case when s.message_count > 0 then s.id end) AS conversations,
+                   count(distinct case when s.message_count >= 3 then s.id end) AS qualified_conversations,
+                   count(distinct l.id) AS leads,
+                   coalesce(sum(m.estimated_cost_usd), 0.0) AS total_cost
+            FROM sessions s
+            LEFT JOIN messages m ON m.session_id = s.id
+            LEFT JOIN leads l ON l.session_id = s.id
+        )
+        SELECT total_sessions AS visitors,
+               conversations,
+               qualified_conversations,
+               leads,
+               total_cost,
+               round(total_cost / nullif(leads, 0), 4) AS cost_per_lead,
+               round(total_cost / nullif(conversations, 0), 4) AS cost_per_conversation
+        FROM stats
+        """
+    )
+    return dict(row) if row else {
+        "visitors": 0, "conversations": 0, "qualified_conversations": 0,
+        "leads": 0, "total_cost": 0.0, "cost_per_lead": 0.0, "cost_per_conversation": 0.0
+    }

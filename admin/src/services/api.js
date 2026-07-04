@@ -99,4 +99,28 @@ export const api = {
   async getSecurityAttacks(limit = 20) {
     return request(`/security/attacks?limit=${limit}`);
   },
+
+  async getAnalyticsOverview() {
+    return request("/analytics/overview");
+  },
+
+  async getAnalyticsModels() {
+    return request("/analytics/models");
+  },
+
+  async getAnalyticsTools() {
+    return request("/analytics/tools");
+  },
+
+  async getAnalyticsUniversities() {
+    return request("/analytics/universities");
+  },
+
+  async getAnalyticsCosts() {
+    return request("/analytics/costs");
+  },
+
+  async getAnalyticsFunnel() {
+    return request("/analytics/funnel");
+  },
 };
