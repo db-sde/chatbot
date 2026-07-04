@@ -1,13 +1,14 @@
 
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Annotated
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel, EmailStr, Field
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -170,23 +171,39 @@ async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[
     return {"ok": True}
 
 
-@app.get("/admin", response_class=HTMLResponse)
-async def admin_page(_: Annotated[None, Depends(check_admin_auth)]) -> str:
-    return """
-    <!doctype html><html><head><title>DegreeBaba Admin</title></head>
-    <body><h1>DegreeBaba AI Admin</h1><pre id="out">Loading...</pre>
-    <script>
-    const token = prompt("Admin token");
-    Promise.all([
-      fetch('/admin/conversations', {headers:{Authorization:`Bearer ${token}`}}).then(r=>r.json()),
-      fetch('/admin/leads', {headers:{Authorization:`Bearer ${token}`}}).then(r=>r.json()),
-      fetch('/admin/unanswered', {headers:{Authorization:`Bearer ${token}`}}).then(r=>r.json())
-    ]).then(data => out.textContent = JSON.stringify({conversations:data[0], leads:data[1], unanswered:data[2]}, null, 2));
-    </script></body></html>
-    """
+# ── Single Page Application Static Files Routing for built React app ──
+
+admin_dist_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "admin", "dist"
+)
+
+@app.get("/admin")
+async def serve_admin_dashboard_root():
+    index_file = os.path.join(admin_dist_path, "index.html")
+    if os.path.isfile(index_file):
+        return FileResponse(index_file)
+    return HTMLResponse(
+        "Dashboard build output not found. Please run <code>npm run build</code> inside the <code>admin</code> folder."
+    )
 
 
-@app.get("/admin/conversations")
+@app.get("/admin/{path_name:path}")
+async def serve_admin_dashboard(path_name: str):
+    file_path = os.path.join(admin_dist_path, path_name)
+    if path_name and os.path.isfile(file_path):
+        return FileResponse(file_path)
+    # Default to single-page application fallback
+    index_file = os.path.join(admin_dist_path, "index.html")
+    if os.path.isfile(index_file):
+        return FileResponse(index_file)
+    return HTMLResponse(
+        "Dashboard build output not found. Please run <code>npm run build</code> inside the <code>admin</code> folder."
+    )
+
+
+# ── Backend Administration API Endpoints (prefixed with /api/admin) ──
+
+@app.get("/api/admin/conversations")
 async def admin_conversations(
     _: Annotated[None, Depends(check_admin_auth)],
     university: str | None = None,
@@ -201,25 +218,25 @@ async def admin_conversations(
     return await queries.list_conversations(pool, university, date_from, date_to, has_lead, has_unanswered, limit, offset)
 
 
-@app.get("/admin/conversations/{session_id}")
+@app.get("/api/admin/conversations/{session_id}")
 async def admin_conversation(session_id: str, _: Annotated[None, Depends(check_admin_auth)]) -> dict:
     pool = await get_pool()
     return await queries.get_conversation(pool, session_id)
 
 
-@app.get("/admin/leads")
+@app.get("/api/admin/leads")
 async def admin_leads(_: Annotated[None, Depends(check_admin_auth)], limit: int = 100, offset: int = 0) -> list[dict]:
     pool = await get_pool()
     return await queries.list_leads(pool, limit, offset)
 
 
-@app.get("/admin/unanswered")
+@app.get("/api/admin/unanswered")
 async def admin_unanswered(_: Annotated[None, Depends(check_admin_auth)]) -> list[dict]:
     pool = await get_pool()
     return await queries.group_unanswered(pool)
 
 
-@app.get("/admin/flagged")
+@app.get("/api/admin/flagged")
 async def admin_flagged(
     _: Annotated[None, Depends(check_admin_auth)],
     limit: int = 100,
@@ -229,21 +246,20 @@ async def admin_flagged(
     return await queries.list_flagged_messages(pool, limit, offset)
 
 
-
-@app.get("/admin/analytics")
+@app.get("/api/admin/analytics")
 async def admin_analytics(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
     pool = await get_pool()
     return await queries.analytics(pool)
 
 
-@app.get("/admin/security/summary")
+@app.get("/api/admin/security/summary")
 async def admin_security_summary(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
     """Security block summary: total, by layer, by reason, last 24h."""
     pool = await get_pool()
     return await queries.get_security_summary(pool)
 
 
-@app.get("/admin/security/attacks")
+@app.get("/api/admin/security/attacks")
 async def admin_security_attacks(
     _: Annotated[None, Depends(check_admin_auth)],
     limit: int = 20,
@@ -256,5 +272,6 @@ async def admin_security_attacks(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=2323, reload=True)
+
 
 
