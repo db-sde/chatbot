@@ -458,7 +458,7 @@ async def list_leads(pool, limit: int, offset: int) -> list[dict[str, Any]]:
 async def group_unanswered(pool) -> list[dict[str, Any]]:
     rows = await pool.fetch(
         """
-        SELECT university_slug, course_slug, count(*) AS count, array_agg(question ORDER BY created_at DESC)[:10] AS examples
+        SELECT university_slug, course_slug, count(*) AS count, (array_agg(question ORDER BY created_at DESC))[1:10] AS examples
         FROM unanswered_questions
         GROUP BY university_slug, course_slug
         ORDER BY count(*) DESC
