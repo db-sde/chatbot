@@ -222,6 +222,152 @@ async def get_faq(pool, entity_type: str, entity_slug: str, query_text: str | No
     return dict_rows(rows)
 
 
+# ---------------------------------------------------------------------------
+# Catalog discovery & comparison queries
+# (backing get_university_overview_tool / get_university_programs_tool /
+#  get_program_details_tool / get_specializations_tool / search_catalog_tool /
+#  compare_programs_tool in agent/tools.py)
+# ---------------------------------------------------------------------------
+
+async def get_university_overview(pool, university_slug: str) -> dict[str, Any] | None:
+    """Broad university profile for 'tell me about X' questions."""
+    return dict_row(
+        await pool.fetchrow(
+            """
+            SELECT slug, name, full_name, established_year, naac_grade, ugc_approved,
+                   mode_of_learning, starting_fee, num_programs, about_content,
+                   why_choose_content, placement_content, faculty_intro
+            FROM universities
+            WHERE slug = $1
+            """,
+            university_slug,
+        )
+    )
+
+
+async def get_university_programs(pool, university_slug: str, limit: int = 20) -> list[dict[str, Any]]:
+    """All courses offered by one specific, already-known university."""
+    rows = await pool.fetch(
+        """
+        SELECT c.slug, c.program_name, c.duration, c.mode, c.total_fee, c.starting_fee, c.naac_grade
+        FROM courses c
+        JOIN universities u ON u.id = c.university_id
+        WHERE u.slug = $1
+        ORDER BY c.program_name
+        LIMIT $2
+        """,
+        university_slug,
+        max(1, min(limit, 20)),
+    )
+    return dict_rows(rows)
+
+
+async def get_program_details(pool, course_slug: str, university_slug: str | None = None) -> dict[str, Any] | None:
+    """Full detail record for one specific, already-known course.
+
+    university_slug is optional — course slugs are already globally unique —
+    but when provided it acts as an extra scoping/safety check, consistent
+    with how get_fee/get_eligibility always scope by university.
+    """
+    return dict_row(
+        await pool.fetchrow(
+            """
+            SELECT c.slug, c.program_name, c.duration, c.mode, c.total_fee, c.starting_fee,
+                   c.naac_grade, c.ugc_status, c.num_specializations, c.about_content,
+                   c.eligibility_summary, c.eligibility_content, c.admission_steps,
+                   c.admission_fee_note, c.syllabus_content, c.placement_content,
+                   c.certificate_description, c.validity, c.emi_amount,
+                   u.slug AS university_slug, u.name AS university_name
+            FROM courses c
+            JOIN universities u ON u.id = c.university_id
+            WHERE c.slug = $1
+              AND ($2::text IS NULL OR u.slug = $2)
+            """,
+            course_slug,
+            university_slug,
+        )
+    )
+
+
+async def get_specializations(pool, course_slug: str, university_slug: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    """All specializations available under one specific, already-known course."""
+    rows = await pool.fetch(
+        """
+        SELECT s.slug, s.spec_name, s.duration, s.mode, s.total_fee, s.naac_grade, s.ugc_status
+        FROM specializations s
+        JOIN courses c ON c.id = s.course_id
+        JOIN universities u ON u.id = s.university_id
+        WHERE c.slug = $1
+          AND ($2::text IS NULL OR u.slug = $2)
+        ORDER BY s.spec_name
+        LIMIT $3
+        """,
+        course_slug,
+        university_slug,
+        max(1, min(limit, 20)),
+    )
+    return dict_rows(rows)
+
+
+async def search_catalog(pool, query_text: str, entity_type: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    """Broad catalog search for questions that don't map to a specific entity.
+
+    Matches against entity_search.search_text (ILIKE) and resolves each hit
+    back to its display row across whichever of the three catalog tables it
+    belongs to. This is a text-match implementation for now — entity_search
+    already carries an `embedding` column, so a vector-similarity pass can be
+    layered in later (e.g. ORDER BY embedding <=> $query_embedding) without
+    changing this function's signature, once a query embedding is produced
+    upstream by the agent/LLM layer.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT es.entity_type,
+               COALESCE(u.slug, c.slug, s.slug) AS slug,
+               COALESCE(u.name, c.program_name, s.spec_name) AS name,
+               COALESCE(u.starting_fee, c.total_fee, s.total_fee) AS fee_hint
+        FROM entity_search es
+        LEFT JOIN universities u ON es.entity_type = 'university' AND u.id = es.entity_id
+        LEFT JOIN courses c ON es.entity_type = 'course' AND c.id = es.entity_id
+        LEFT JOIN specializations s ON es.entity_type = 'specialization' AND s.id = es.entity_id
+        WHERE es.search_text ILIKE '%' || $1 || '%'
+          AND ($2::text IS NULL OR es.entity_type = $2)
+        LIMIT $3
+        """,
+        query_text,
+        entity_type,
+        max(1, min(limit, 20)),
+    )
+    return dict_rows(rows)
+
+
+async def compare_programs(pool, course_slugs: list[str], fields: list[str]) -> list[dict[str, Any]]:
+    """Course-vs-course comparison with a fixed, comparison-friendly column
+    whitelist (deliberately narrower than compare_entities' whitelist —
+    fields like raw_json or long wysiwyg blobs are excluded on purpose).
+    Falls back to a sensible default set if `fields` filters down to nothing.
+    """
+    allowed_fields = {
+        "program_name", "total_fee", "starting_fee", "duration", "mode",
+        "naac_grade", "ugc_status", "eligibility_summary",
+    }
+    default_fields = ["program_name", "total_fee", "duration", "naac_grade", "ugc_status", "eligibility_summary"]
+
+    selected = [f for f in fields if f in allowed_fields and f != "slug"] or default_fields
+    columns = ["c.slug"] + [f"c.{f}" for f in selected]
+
+    rows = await pool.fetch(
+        f"""
+        SELECT {', '.join(columns)}, u.slug AS university_slug, u.name AS university_name
+        FROM courses c
+        JOIN universities u ON u.id = c.university_id
+        WHERE c.slug = ANY($1::text[])
+        """,
+        course_slugs,
+    )
+    return dict_rows(rows)
+
+
 async def insert_lead(pool, session_id: str, name: str, phone: str, email: str | None, course_interest: str | None, trigger_reason: str) -> dict[str, Any]:
     row = await pool.fetchrow(
         """
@@ -426,4 +572,3 @@ async def get_top_attack_patterns(pool, limit: int = 20) -> list[dict[str, Any]]
         limit,
     )
     return dict_rows(rows)
-
