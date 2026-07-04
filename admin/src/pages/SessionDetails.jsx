@@ -11,7 +11,9 @@ import {
   Server,
   Play,
   CheckCircle,
-  HelpCircle
+  HelpCircle,
+  ChevronDown,
+  ChevronUp
 } from "lucide-react";
 import { api } from "../services/api";
 import { Badge, LoadingState, ErrorState, EmptyState } from "../components/Common";
@@ -21,6 +23,14 @@ export default function SessionDetails() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [expandedTools, setExpandedTools] = useState({});
+
+  const toggleTool = (idx) => {
+    setExpandedTools((prev) => ({
+      ...prev,
+      [idx]: !prev[idx],
+    }));
+  };
 
   const fetchDetails = async () => {
     setLoading(true);
@@ -50,8 +60,16 @@ export default function SessionDetails() {
   // Extract all tool calls from the chat log for the execution pipeline view
   const allToolCalls = [];
   messages.forEach((msg) => {
-    if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-      msg.tool_calls.forEach((tc) => {
+    let toolCalls = msg.tool_calls;
+    if (typeof toolCalls === "string") {
+      try {
+        toolCalls = JSON.parse(toolCalls);
+      } catch (_) {
+        toolCalls = [];
+      }
+    }
+    if (toolCalls && Array.isArray(toolCalls)) {
+      toolCalls.forEach((tc) => {
         allToolCalls.push({
           ...tc,
           timestamp: msg.created_at,
@@ -181,12 +199,12 @@ export default function SessionDetails() {
       {/* Main Conversation & Tool Execution Section */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left Side: ChatGPT Chat Timeline */}
-        <div className="lg:col-span-2 bg-[#111827] border border-[#1F2937] rounded-xl p-6 space-y-6">
+        <div className="lg:col-span-2 bg-[#111827] border border-[#1F2937] rounded-xl p-6 flex flex-col h-[670px]">
           <div className="flex items-center space-x-2 mb-4">
             <MessageSquare size={16} className="text-blue-500" />
             <h3 className="text-sm font-semibold text-gray-200">Conversation Timeline</h3>
           </div>
-          <div className="space-y-6">
+          <div className="flex-1 overflow-y-auto pr-2 space-y-6">
             {messages.map((msg, index) => {
               const isUser = msg.role === "user";
               return (
@@ -198,9 +216,9 @@ export default function SessionDetails() {
                       : "bg-[#0E131F]/80 text-gray-200 border-[#1F2937]"
                     }
                   `}>
-                    <div className="flex justify-between items-center mb-1 text-[9px] font-semibold tracking-wider opacity-60">
+                    <div className="flex justify-between items-center w-full min-w-[140px] mb-1 text-[9px] font-semibold tracking-wider opacity-60">
                       <span>{isUser ? "STUDENT" : "ADVISOR"}</span>
-                      <span>{new Date(msg.created_at).toLocaleTimeString()}</span>
+                      <span className="ml-4">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                     </div>
                     <p className="text-xs whitespace-pre-wrap leading-relaxed">{msg.content}</p>
                   </div>
@@ -211,41 +229,68 @@ export default function SessionDetails() {
         </div>
 
         {/* Right Side: Tool Call Timeline */}
-        <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-6">
-          <div className="flex items-center space-x-2 mb-6">
-            <Terminal size={16} className="text-blue-500" />
-            <h3 className="text-sm font-semibold text-gray-200">Tool Calls Timeline</h3>
+        <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-6 flex flex-col h-[670px]">
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center space-x-2">
+              <Terminal size={16} className="text-blue-500" />
+              <h3 className="text-sm font-semibold text-gray-200">Tool Calls Timeline</h3>
+            </div>
+            {allToolCalls.length > 0 && (
+              <Badge variant="primary">{allToolCalls.length} executed</Badge>
+            )}
           </div>
           {allToolCalls.length === 0 ? (
-            <div className="py-16 text-center border border-[#1F2937] border-dashed rounded-xl bg-[#0E131F]/30">
-              <Code size={24} className="text-gray-600 mx-auto mb-2" />
+            <div className="py-16 text-center border border-[#1F2937] border-dashed rounded-xl bg-[#0E131F]/30 flex-1 flex flex-col justify-center items-center">
+              <Code size={24} className="text-gray-600 mb-2" />
               <span className="text-xs text-gray-500 font-medium">No tools executed during this session</span>
             </div>
           ) : (
-            <div className="space-y-6 relative before:absolute before:inset-y-0 before:left-3.5 before:w-0.5 before:bg-[#1F2937]">
-              {allToolCalls.map((tc, idx) => (
-                <div key={idx} className="flex gap-4 relative">
-                  <div className="h-7 w-7 rounded-full bg-blue-950/80 border border-blue-900/60 text-blue-400 flex items-center justify-center shrink-0 z-10">
-                    <Play size={10} />
-                  </div>
-                  <div className="flex-1 bg-[#0E131F] border border-[#1F2937] rounded-lg p-3 space-y-2">
-                    <div className="flex justify-between items-center">
-                      <span className="text-xs font-bold text-blue-400 font-mono">{tc.name}</span>
-                      <span className="text-[9px] text-gray-500">
-                        {new Date(tc.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </span>
+            <div className="flex-1 overflow-y-auto pr-2 space-y-6 relative before:absolute before:inset-y-0 before:left-3.5 before:w-0.5 before:bg-[#1F2937]">
+              {allToolCalls.map((tc, idx) => {
+                const isExpanded = !!expandedTools[idx];
+                return (
+                  <div key={idx} className="flex gap-4 relative">
+                    <div className="h-7 w-7 rounded-full bg-blue-950/80 border border-blue-900/60 text-blue-400 flex items-center justify-center shrink-0 z-10">
+                      <Play size={10} />
                     </div>
-                    <div className="text-[10px] text-gray-400 font-mono bg-[#111827] p-2 rounded border border-gray-800/50 break-all">
-                      <span className="text-gray-500">Args:</span> {JSON.stringify(tc.args)}
-                    </div>
-                    {tc.result_summary && (
-                      <div className="text-[10px] text-gray-500 font-mono bg-[#111827] p-2 rounded border border-gray-800/30 truncate">
-                        <span className="text-gray-600">Result:</span> {tc.result_summary}
+                    <div
+                      onClick={() => toggleTool(idx)}
+                      className={`
+                        flex-1 bg-[#0E131F] border rounded-lg p-3.5 space-y-2 min-w-0 cursor-pointer select-none transition-all duration-150
+                        ${isExpanded ? "border-[#2D3748] bg-[#0E131F]" : "border-[#1F2937] hover:border-[#2D3748] hover:bg-[#141A29]/40"}
+                      `}
+                    >
+                      <div className="flex justify-between items-center w-full">
+                        <span className="text-xs font-bold text-blue-400 font-mono break-all">{tc.name}</span>
+                        <div className="flex items-center space-x-2 shrink-0 ml-2">
+                          <span className="text-[9px] text-gray-500">
+                            {new Date(tc.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                          {isExpanded ? (
+                            <ChevronUp size={14} className="text-gray-400" />
+                          ) : (
+                            <ChevronDown size={14} className="text-gray-400" />
+                          )}
+                        </div>
                       </div>
-                    )}
+
+                      {/* Dropdown Section showing args and results */}
+                      {isExpanded && (
+                        <div className="space-y-2.5 pt-2.5 border-t border-[#1F2937] transition-all">
+                          <div className="text-[10px] text-gray-300 font-mono bg-[#111827] p-2.5 rounded border border-gray-800 break-all">
+                            <span className="text-gray-500 font-bold">Args:</span> {JSON.stringify(tc.args)}
+                          </div>
+                          {tc.result_summary && (
+                            <div className="text-[10px] text-gray-300 font-mono bg-[#111827] p-2.5 rounded border border-gray-800 break-all whitespace-pre-wrap">
+                              <span className="text-gray-500 font-bold">Result:</span> {tc.result_summary}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

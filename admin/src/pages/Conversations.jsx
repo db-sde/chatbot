@@ -276,6 +276,15 @@ export default function Conversations() {
               ) : (
                 activeSession.messages?.map((msg, index) => {
                   const isUser = msg.role === "user";
+                  let toolCalls = msg.tool_calls;
+                  if (typeof toolCalls === "string") {
+                    try {
+                      toolCalls = JSON.parse(toolCalls);
+                    } catch (_) {
+                      toolCalls = [];
+                    }
+                  }
+
                   return (
                     <div key={index} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
                       <div className={`
@@ -285,31 +294,33 @@ export default function Conversations() {
                           : "bg-[#111827] text-gray-200 border-[#1F2937]"
                         }
                       `}>
-                        <div className="flex justify-between items-center mb-1 text-[9px] font-semibold tracking-wider opacity-60">
+                        <div className="flex justify-between items-center w-full min-w-[140px] mb-1 text-[9px] font-semibold tracking-wider opacity-60">
                           <span>{isUser ? "STUDENT" : "ADVISOR"}</span>
-                          <span>{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                          <span className="ml-4">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                         </div>
                         <p className="text-xs whitespace-pre-wrap leading-relaxed">{msg.content}</p>
 
-                        {/* Tool Calls logs placeholder structure for future ready checks */}
-                        {msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 && (
+                        {/* Tool Calls logs */}
+                        {toolCalls && Array.isArray(toolCalls) && toolCalls.length > 0 && (
                           <div className="mt-3 pt-3 border-t border-[#1F2937]/50 space-y-2">
                             <span className="text-[9px] font-bold text-gray-400 flex items-center gap-1">
                               <Code size={10} className="text-blue-400" />
                               <span>TOOL EVENTS EXECUTED</span>
                             </span>
-                            {msg.tool_calls.map((tc, tcIdx) => (
-                              <div key={tcIdx} className="bg-[#1C2433] rounded p-2 border border-[#2D3748] space-y-1 font-mono text-[9px]">
+                            {toolCalls.map((tc, tcIdx) => (
+                              <div key={tcIdx} className="bg-[#1C2433] rounded p-2.5 border border-[#2D3748] space-y-1.5 font-mono text-[9px]">
                                 <div className="flex justify-between text-blue-400 font-bold">
                                   <span>{tc.name || "ToolCall"}</span>
                                   <span className="text-gray-500 text-[8px] font-normal">
                                     {tc.status || "success"}
                                   </span>
                                 </div>
-                                <div className="text-gray-400 truncate">Args: {JSON.stringify(tc.args)}</div>
+                                <div className="text-gray-300 break-all bg-[#111827] p-1.5 rounded border border-gray-800/40">
+                                  <span className="text-gray-500 font-bold">Args:</span> {JSON.stringify(tc.args)}
+                                </div>
                                 {tc.result_summary && (
-                                  <div className="text-gray-500 border-t border-gray-800 pt-1 mt-1 truncate">
-                                    Result: {tc.result_summary}
+                                  <div className="text-gray-300 break-all bg-[#111827] p-1.5 rounded border border-gray-800/20 whitespace-pre-wrap">
+                                    <span className="text-gray-500 font-bold">Result:</span> {tc.result_summary}
                                   </div>
                                 )}
                               </div>

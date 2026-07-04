@@ -9,3 +9,7 @@ dependencies = [
 
 [tool.uv]
 workspace = { members = ["backend"] }
+
+[tool.pyright]
+extraPaths = ["backend"]
+

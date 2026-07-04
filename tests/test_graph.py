@@ -110,6 +110,7 @@ def patch_pool(monkeypatch):
     import agent.resolve as resolve_mod
     import leads.scoring as scoring_mod
     import db.queries as queries_mod
+    import security.tool_validator as validator_mod
 
     async def _fake_pool():
         return FakePool()
@@ -118,6 +119,7 @@ def patch_pool(monkeypatch):
     monkeypatch.setattr(graph_mod, "get_pool", _fake_pool)
     monkeypatch.setattr(resolve_mod, "get_pool", _fake_pool)
     monkeypatch.setattr(scoring_mod, "get_pool", _fake_pool)
+    monkeypatch.setattr(validator_mod, "get_pool", _fake_pool)
 
 
 @pytest.fixture()

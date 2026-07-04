@@ -441,6 +441,12 @@ async def list_conversations(pool, university: str | None, date_from: str | None
 async def get_conversation(pool, session_id: str) -> dict[str, Any]:
     session = dict_row(await pool.fetchrow("SELECT * FROM sessions WHERE id = $1::uuid", session_id)) or {}
     messages = dict_rows(await pool.fetch("SELECT role, content, tool_calls, created_at FROM messages WHERE session_id = $1::uuid ORDER BY id", session_id))
+    for msg in messages:
+        if isinstance(msg.get("tool_calls"), str):
+            try:
+                msg["tool_calls"] = json.loads(msg["tool_calls"])
+            except Exception:
+                msg["tool_calls"] = []
     leads = dict_rows(await pool.fetch("SELECT * FROM leads WHERE session_id = $1::uuid ORDER BY id", session_id))
     return {"session": session, "messages": messages, "leads": leads}
 
