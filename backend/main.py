@@ -268,6 +268,17 @@ async def admin_security_attacks(
     pool = await get_pool()
     return await queries.get_top_attack_patterns(pool, limit)
 
+widget_dir = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "widget"
+)
+
+@app.get("/widget.js")
+async def serve_widget_js():
+    return FileResponse(
+        os.path.join(widget_dir, "widget.js"),
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=300, stale-while-revalidate=86400"},
+    )
 
 if __name__ == "__main__":
     import uvicorn

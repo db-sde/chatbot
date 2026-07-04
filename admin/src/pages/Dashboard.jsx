@@ -52,6 +52,13 @@ export default function Dashboard() {
 
   const leadConvRate = totalSessions > 0 ? ((totalLeads / totalSessions) * 100).toFixed(1) : "0.0";
 
+  // Dynamic maximum calculation for perfect auto-scaling
+  const maxVal = Math.max(totalSessions, totalMessages, totalLeads, totalBlocks, 1);
+  const sessionPct = (totalSessions / maxVal) * 100;
+  const messagePct = (totalMessages / maxVal) * 100;
+  const leadPct = (totalLeads / maxVal) * 100;
+  const blockPct = (totalBlocks / maxVal) * 100;
+
   // Top list mapping
   const topUniversities = data?.top_universities || [];
 
@@ -112,50 +119,74 @@ export default function Dashboard() {
             <p className="text-xs text-gray-500 mt-1">Relative distribution of sessions, leads, and messages.</p>
           </div>
           
-          <div className="my-8 h-48 flex items-end justify-between px-4 relative border-b border-[#1F2937]">
-            {/* Visual Bar representations for active counts */}
-            <div className="flex flex-col items-center w-1/4 group">
-              <span className="text-xs font-semibold text-blue-400 mb-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                {totalSessions}
-              </span>
-              <div
-                className="w-12 bg-blue-500/80 hover:bg-blue-500 rounded-t-lg transition-all duration-500"
-                style={{ height: `${Math.max(10, Math.min(100, (totalSessions / (totalMessages || 1)) * 100))}%` }}
-              ></div>
-              <span className="text-[10px] text-gray-500 font-medium mt-2">Sessions</span>
+          <div className="my-8 flex items-stretch h-56 gap-4">
+            {/* Y-axis Labels */}
+            <div className="flex flex-col justify-between text-[10px] text-gray-500 font-mono select-none h-48 py-1 pr-2 border-r border-[#1F2937]/50 text-right w-12">
+              <span>{maxVal}</span>
+              <span>{Math.round(maxVal * 0.75)}</span>
+              <span>{Math.round(maxVal * 0.5)}</span>
+              <span>{Math.round(maxVal * 0.25)}</span>
+              <span>0</span>
             </div>
 
-            <div className="flex flex-col items-center w-1/4 group">
-              <span className="text-xs font-semibold text-purple-400 mb-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                {totalMessages}
-              </span>
-              <div
-                className="w-12 bg-purple-500/80 hover:bg-purple-500 rounded-t-lg transition-all duration-500"
-                style={{ height: `${totalMessages > 0 ? 100 : 10}%` }}
-              ></div>
-              <span className="text-[10px] text-gray-500 font-medium mt-2">Messages</span>
-            </div>
+            {/* Chart Area */}
+            <div className="flex-1 h-48 relative border-b border-[#1F2937] flex items-end justify-between px-6">
+              {/* Horizontal Grid Lines */}
+              <div className="absolute inset-0 pointer-events-none flex flex-col justify-between py-1">
+                <div className="border-t border-[#1F2937]/20 w-full"></div>
+                <div className="border-t border-[#1F2937]/20 w-full"></div>
+                <div className="border-t border-[#1F2937]/20 w-full"></div>
+                <div className="border-t border-[#1F2937]/20 w-full"></div>
+                <div className="w-full"></div>
+              </div>
 
-            <div className="flex flex-col items-center w-1/4 group">
-              <span className="text-xs font-semibold text-emerald-400 mb-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                {totalLeads}
-              </span>
-              <div
-                className="w-12 bg-emerald-500/80 hover:bg-emerald-500 rounded-t-lg transition-all duration-500"
-                style={{ height: `${Math.max(10, Math.min(100, (totalLeads / (totalSessions || 1)) * 100))}%` }}
-              ></div>
-              <span className="text-[10px] text-gray-500 font-medium mt-2">Leads</span>
-            </div>
+              {/* Sessions Bar */}
+              <div className="flex flex-col items-center justify-end h-full w-1/5 group z-10">
+                <span className="text-[10px] font-bold text-blue-400 mb-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                  {totalSessions}
+                </span>
+                <div
+                  className="w-12 bg-gradient-to-t from-blue-600 to-blue-400 hover:from-blue-500 hover:to-blue-300 rounded-t-md transition-all duration-500 shadow-[0_0_12px_rgba(59,130,246,0.15)] hover:shadow-[0_0_16px_rgba(59,130,246,0.35)]"
+                  style={{ height: `${sessionPct}%` }}
+                ></div>
+                <span className="text-[10px] text-gray-500 font-semibold mt-2.5">Sessions</span>
+              </div>
 
-            <div className="flex flex-col items-center w-1/4 group">
-              <span className="text-xs font-semibold text-red-400 mb-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                {totalBlocks}
-              </span>
-              <div
-                className="w-12 bg-red-500/80 hover:bg-red-500 rounded-t-lg transition-all duration-500"
-                style={{ height: `${Math.max(10, Math.min(100, (totalBlocks / (totalSessions || 1)) * 100))}%` }}
-              ></div>
-              <span className="text-[10px] text-gray-500 font-medium mt-2">Blocks</span>
+              {/* Messages Bar */}
+              <div className="flex flex-col items-center justify-end h-full w-1/5 group z-10">
+                <span className="text-[10px] font-bold text-purple-400 mb-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                  {totalMessages}
+                </span>
+                <div
+                  className="w-12 bg-gradient-to-t from-purple-600 to-purple-400 hover:from-purple-500 hover:to-purple-300 rounded-t-md transition-all duration-500 shadow-[0_0_12px_rgba(168,85,247,0.15)] hover:shadow-[0_0_16px_rgba(168,85,247,0.35)]"
+                  style={{ height: `${messagePct}%` }}
+                ></div>
+                <span className="text-[10px] text-gray-500 font-semibold mt-2.5">Messages</span>
+              </div>
+
+              {/* Leads Bar */}
+              <div className="flex flex-col items-center justify-end h-full w-1/5 group z-10">
+                <span className="text-[10px] font-bold text-emerald-400 mb-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                  {totalLeads}
+                </span>
+                <div
+                  className="w-12 bg-gradient-to-t from-emerald-600 to-emerald-400 hover:from-emerald-500 hover:to-emerald-300 rounded-t-md transition-all duration-500 shadow-[0_0_12px_rgba(16,185,129,0.15)] hover:shadow-[0_0_16px_rgba(16,185,129,0.35)]"
+                  style={{ height: `${leadPct}%` }}
+                ></div>
+                <span className="text-[10px] text-gray-500 font-semibold mt-2.5">Leads</span>
+              </div>
+
+              {/* Blocks Bar */}
+              <div className="flex flex-col items-center justify-end h-full w-1/5 group z-10">
+                <span className="text-[10px] font-bold text-red-400 mb-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                  {totalBlocks}
+                </span>
+                <div
+                  className="w-12 bg-gradient-to-t from-red-600 to-red-400 hover:from-red-500 hover:to-red-300 rounded-t-md transition-all duration-500 shadow-[0_0_12px_rgba(239,68,68,0.15)] hover:shadow-[0_0_16px_rgba(239,68,68,0.35)]"
+                  style={{ height: `${blockPct}%` }}
+                ></div>
+                <span className="text-[10px] text-gray-500 font-semibold mt-2.5">Blocks</span>
+              </div>
             </div>
           </div>
 
