@@ -230,15 +230,24 @@ async def get_faq(pool, entity_type: str, entity_slug: str, query_text: str | No
 # ---------------------------------------------------------------------------
 
 async def get_university_overview(pool, university_slug: str) -> dict[str, Any] | None:
-    """Broad university profile for 'tell me about X' questions."""
+    """Broad university profile for 'tell me about X' questions.
+
+    num_programs is computed from the actual courses table rather than the
+    static seeded universities.num_programs text column, which is populated
+    verbatim from Micro App JSON at ingestion time and can drift out of sync
+    with what's actually in the database (e.g. a course removed later still
+    left the old count in place). The stale column is left in the schema
+    (still used by ingestion) but is no longer what this read path returns.
+    """
     return dict_row(
         await pool.fetchrow(
             """
-            SELECT slug, name, full_name, established_year, naac_grade, ugc_approved,
-                   mode_of_learning, starting_fee, num_programs, about_content,
-                   why_choose_content, placement_content, faculty_intro
-            FROM universities
-            WHERE slug = $1
+            SELECT u.slug, u.name, u.full_name, u.established_year, u.naac_grade, u.ugc_approved,
+                   u.mode_of_learning, u.starting_fee,
+                   (SELECT count(*) FROM courses c WHERE c.university_id = u.id) AS num_programs,
+                   u.about_content, u.why_choose_content, u.placement_content, u.faculty_intro
+            FROM universities u
+            WHERE u.slug = $1
             """,
             university_slug,
         )
@@ -269,12 +278,16 @@ async def get_program_details(pool, course_slug: str, university_slug: str | Non
     but when provided it acts as an extra scoping/safety check, consistent
     with how get_fee/get_eligibility always scope by university.
     """
+    # num_specializations is computed from the actual specializations table —
+    # see get_university_overview's docstring above for why the seeded text
+    # column isn't trustworthy for a read path shown to users.
     return dict_row(
         await pool.fetchrow(
             """
             SELECT c.slug, c.program_name, c.duration, c.mode, c.total_fee, c.starting_fee,
-                   c.naac_grade, c.ugc_status, c.num_specializations, c.about_content,
-                   c.eligibility_summary, c.eligibility_content, c.admission_steps,
+                   c.naac_grade, c.ugc_status,
+                   (SELECT count(*) FROM specializations s WHERE s.course_id = c.id) AS num_specializations,
+                   c.about_content, c.eligibility_summary, c.eligibility_content, c.admission_steps,
                    c.admission_fee_note, c.syllabus_content, c.placement_content,
                    c.certificate_description, c.validity, c.emi_amount,
                    u.slug AS university_slug, u.name AS university_name

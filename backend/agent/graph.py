@@ -407,17 +407,31 @@ async def _stream_text(text: str) -> AsyncIterator[str]:
         await asyncio.sleep(0)
 
 
-def _any_tool_not_found(state: dict[str, Any]) -> bool:
-    """True when any ToolMessage result carries not_found=True."""
-    for msg in state.get("messages", []):
-        if isinstance(msg, ToolMessage):
-            try:
-                result = json.loads(msg.content)
-                if isinstance(result, dict) and result.get("not_found"):
-                    return True
-            except (json.JSONDecodeError, TypeError):
-                pass
-    return False
+def _all_tool_calls_failed(state: dict[str, Any]) -> bool:
+    """
+    True only when EVERY tool call made this turn returned not_found=True.
+
+    Previously this flagged the whole turn as unanswered if ANY single tool
+    call failed, even when other tool calls in the same turn succeeded and
+    the user got a genuinely good reply (e.g. a comparison that succeeds
+    alongside one unrelated FAQ lookup that doesn't). That polluted the
+    unanswered_questions analytics — the one signal meant to show real
+    content gaps — with turns that were actually answered fine. If no tool
+    calls happened at all this turn, this returns False (nothing to judge
+    as failed); the empty-reply check at the call site still catches that
+    case separately.
+    """
+    tool_messages = [m for m in state.get("messages", []) if isinstance(m, ToolMessage)]
+    if not tool_messages:
+        return False
+    for msg in tool_messages:
+        try:
+            result = json.loads(msg.content)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not (isinstance(result, dict) and result.get("not_found")):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +474,8 @@ async def run_chat_turn(
     reply: str = final_state.get("reply", "")
     lead_ask: bool = final_state.get("lead_ask", False)
 
-    # ── Log unanswered when no data was found ──
-    if _any_tool_not_found(final_state) or not reply:
+    # ── Log unanswered only when every tool call failed, or there's no reply ──
+    if _all_tool_calls_failed(final_state) or not reply:
         await log_unanswered(session_id, message, None, None)
         reply = reply or (
             "I don't have that detail on file yet — I've logged this so the "

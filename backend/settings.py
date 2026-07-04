@@ -15,16 +15,22 @@ class Settings(BaseSettings):
     groq_api_key: str | None = None
 
     allowed_site_keys: str = '{"degreebaba_dev":["localhost","127.0.0.1"],"degreebaba_prod":["degreebaba.com","www.degreebaba.com"]}'
-    allowed_origins_raw: str = Field(default="http://localhost:2323,http://localhost:8080", alias="ALLOWED_ORIGINS")
     crm_webhook_url: str | None = None
     admin_auth_token: str = "change-me"
     rate_limit_per_minute: int = 10
     daily_message_cap_per_site: int = 2000
     postgres_password: str = "postgres"
 
+    # Comma-separated list of IPs that are trusted to set X-Forwarded-For
+    # (your reverse proxy — Nginx/Caddy — or "*" if the app is never reachable
+    # except through that proxy, e.g. behind Cloudflare Tunnel). Required for
+    # SlowAPI's get_remote_address to see the real visitor IP instead of the
+    # proxy's IP once this is deployed behind Nginx/Caddy/Cloudflare.
+    trusted_proxies_raw: str = Field(default="127.0.0.1", alias="TRUSTED_PROXIES")
+
     @property
-    def allowed_origins(self) -> list[str]:
-        return [origin.strip() for origin in self.allowed_origins_raw.split(",") if origin.strip()]
+    def trusted_proxies(self) -> list[str]:
+        return [p.strip() for p in self.trusted_proxies_raw.split(",") if p.strip()]
 
     @property
     def site_domains(self) -> dict[str, list[str]]:
@@ -39,6 +45,28 @@ class Settings(BaseSettings):
                 key, domains = item.split(":", 1)
                 pairs[key.strip()] = [d.strip().lower() for d in domains.split("|") if d.strip()]
             return pairs
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        """
+        CORS origins, derived from site_domains so there is one source of
+        truth for "which domains may talk to this API" — previously this was
+        a separately configured ALLOWED_ORIGINS env var that could silently
+        drift out of sync with allowed_site_keys (the value validate_site_request
+        actually enforces). CORS is a browser-side courtesy layer; the real
+        security boundary remains validate_site_request's Origin/Referer check.
+        """
+        origins: set[str] = set()
+        for domains in self.site_domains.values():
+            for domain in domains:
+                if domain in ("localhost", "127.0.0.1"):
+                    for port in ("", ":8080", ":3000", ":5173", ":2323"):
+                        origins.add(f"http://{domain}{port}")
+                        origins.add(f"https://{domain}{port}")
+                else:
+                    origins.add(f"https://{domain}")
+                    origins.add(f"http://{domain}")
+        return sorted(origins)
 
 
 @lru_cache

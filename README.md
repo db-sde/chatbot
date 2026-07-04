@@ -15,14 +15,19 @@ Required values:
 ```text
 DATABASE_URL=
 GROQ_API_KEY=          # get a free key at https://console.groq.com
-ALLOWED_SITE_KEYS=
-ALLOWED_ORIGINS=
+ALLOWED_SITE_KEYS=     # single source of truth for CORS + Origin/Referer validation
 CRM_WEBHOOK_URL=
 ADMIN_AUTH_TOKEN=
 RATE_LIMIT_PER_MINUTE=10
 DAILY_MESSAGE_CAP_PER_SITE=2000
 POSTGRES_PASSWORD=
+TRUSTED_PROXIES=127.0.0.1  # set to your reverse proxy's IP in production
 ```
+
+> **Deploying behind Nginx/Caddy/Cloudflare?** Set `TRUSTED_PROXIES` to the
+> IP(s) of whatever sits directly in front of this app. Without it, SlowAPI's
+> rate limiter sees the proxy's IP on every request instead of the visitor's,
+> and your per-IP limits silently become one shared limit for the whole site.
 
 ## Run With Docker
 

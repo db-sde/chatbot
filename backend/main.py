@@ -13,6 +13,7 @@ from pydantic import BaseModel, EmailStr, Field
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from agent.graph import run_chat_turn
 from agent.tools import capture_lead
@@ -46,6 +47,13 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+# Added last so it is the OUTERMOST middleware (Starlette wraps in reverse
+# add-order) — it must rewrite request.client.host from X-Forwarded-For
+# BEFORE CORS/SlowAPI run, or get_remote_address() sees the proxy's IP for
+# every request instead of the real visitor IP. trusted_hosts must be the
+# proxy's own IP (or "*" only if this app is never reachable except through
+# that proxy) — see settings.trusted_proxies / TRUSTED_PROXIES env var.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxies)
 
 
 class ChatRequest(BaseModel):

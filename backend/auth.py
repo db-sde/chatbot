@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from urllib.parse import urlparse
 
 from fastapi import Header, HTTPException
@@ -27,5 +28,5 @@ def validate_site_request(site_key: str, origin: str | None, referer: str | None
 
 async def check_admin_auth(authorization: str | None = Header(default=None)) -> None:
     expected = f"Bearer {settings.admin_auth_token}"
-    if not authorization or authorization != expected:
+    if not authorization or not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Admin token required")
