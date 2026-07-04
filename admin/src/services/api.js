@@ -122,7 +122,18 @@ export const api = {
     return request("/analytics/funnel");
   },
 
-  async getAnalyticsLeads() {
-    return request("/analytics/leads");
+  async getWidgetSettings(siteId) {
+    return request(`/widget-settings/${encodeURIComponent(siteId)}`);
+  },
+
+  async updateWidgetSettings(siteId, settings) {
+    return request(`/widget-settings/${encodeURIComponent(siteId)}`, {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    });
+  },
+
+  async listWidgetSettings() {
+    return request("/widget-settings");
   },
 };

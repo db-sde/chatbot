@@ -28,8 +28,12 @@ from settings import settings
 logger = logging.getLogger(__name__)
 
 
+from db.migrate import run_migrations
+
+
 @asynccontextmanager
 async def lifespan(app_: FastAPI):  # noqa: ARG001
+    await run_migrations()
     await init_pool()
     yield
     await close_pool()
@@ -87,6 +91,42 @@ class LeadRequest(BaseModel):
     phone: str = Field(min_length=7, max_length=30)
     email: EmailStr | None = None
     course_interest: str | None = None
+
+
+class WidgetSettingsRequest(BaseModel):
+    show_estimated_wait_time: bool = True
+    sound_notifications: bool = True
+    desktop_notifications: bool = True
+    mobile_message_preview: bool = True
+    agent_typing_indicator: bool = True
+    visitor_typing_indicator: bool = True
+    browser_tab_notifications: bool = True
+    hide_when_offline: bool = False
+    hide_on_desktop: bool = False
+    hide_on_mobile: bool = False
+    offline_if_no_agents: bool = False
+    emoji_picker_enabled: bool = True
+    file_upload_enabled: bool = True
+    chat_rating_enabled: bool = True
+    email_transcript_enabled: bool = True
+
+
+class WidgetSettingsUpdate(BaseModel):
+    show_estimated_wait_time: bool | None = None
+    sound_notifications: bool | None = None
+    desktop_notifications: bool | None = None
+    mobile_message_preview: bool | None = None
+    agent_typing_indicator: bool | None = None
+    visitor_typing_indicator: bool | None = None
+    browser_tab_notifications: bool | None = None
+    hide_when_offline: bool | None = None
+    hide_on_desktop: bool | None = None
+    hide_on_mobile: bool | None = None
+    offline_if_no_agents: bool | None = None
+    emoji_picker_enabled: bool | None = None
+    file_upload_enabled: bool | None = None
+    chat_rating_enabled: bool | None = None
+    email_transcript_enabled: bool | None = None
 
 
 
@@ -363,6 +403,72 @@ async def admin_security_attacks(
     """Top attack patterns — most frequent blocked messages grouped by reason."""
     pool = await get_pool()
     return await queries.get_top_attack_patterns(pool, limit)
+
+@app.get("/api/admin/settings/site-domains")
+async def admin_site_domains(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Return configured site keys and their allowed domains."""
+    return {"site_domains": settings.site_domains}
+
+
+@app.get("/api/admin/widget-settings")
+async def admin_list_widget_settings(_: Annotated[None, Depends(check_admin_auth)]) -> list[dict]:
+    """List widget settings for all configured sites."""
+    pool = await get_pool()
+    return await queries.list_widget_settings(pool)
+
+
+@app.get("/api/admin/widget-settings/{site_id}")
+async def admin_get_widget_settings(site_id: str, _: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Get widget settings for a specific site."""
+    pool = await get_pool()
+    return await queries.get_widget_settings(pool, site_id)
+
+
+@app.put("/api/admin/widget-settings/{site_id}")
+async def admin_update_widget_settings(
+    site_id: str,
+    body: WidgetSettingsUpdate = Body(...),
+    _: Annotated[None, Depends(check_admin_auth)] = None,
+) -> dict:
+    """Update widget settings for a specific site."""
+    pool = await get_pool()
+    update = {k: v for k, v in body.model_dump().items() if v is not None}
+    return await queries.upsert_widget_settings(pool, site_id, update)
+
+
+@app.get("/public/widget-settings")
+@limiter.limit("60/minute")
+async def public_widget_settings(request: Request, site_key: str) -> dict:
+    """Public endpoint for the widget to fetch its runtime configuration.
+
+    Only safe, widget-facing settings are exposed.  site_key is validated
+    against allowed origins just like /chat.
+    """
+    validate_site_request(site_key, request.headers.get("origin"), request.headers.get("referer"))
+    pool = await get_pool()
+    row = await queries.get_widget_settings(pool, site_key)
+
+    # Strip internal/admin-only fields before returning to the browser.
+    safe_keys = [
+        "site_id",
+        "show_estimated_wait_time",
+        "sound_notifications",
+        "desktop_notifications",
+        "mobile_message_preview",
+        "agent_typing_indicator",
+        "visitor_typing_indicator",
+        "browser_tab_notifications",
+        "hide_when_offline",
+        "hide_on_desktop",
+        "hide_on_mobile",
+        "offline_if_no_agents",
+        "emoji_picker_enabled",
+        "file_upload_enabled",
+        "chat_rating_enabled",
+        "email_transcript_enabled",
+    ]
+    return {k: row.get(k) for k in safe_keys}
+
 
 widget_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "widget"

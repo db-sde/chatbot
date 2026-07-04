@@ -11,7 +11,8 @@ import {
   LogOut,
   Menu,
   X,
-  UserCheck
+  UserCheck,
+  Puzzle
 } from "lucide-react";
 import { api } from "../services/api";
 
@@ -23,6 +24,7 @@ const navigation = [
   { name: "Security", href: "/admin/security", icon: Shield },
   { name: "Unanswered", href: "/admin/unanswered", icon: HelpCircle },
   { name: "Settings", href: "/admin/settings", icon: Settings },
+  { name: "Widget", href: "/admin/widget-settings", icon: Puzzle },
 ];
 
 export default function Layout({ children }) {
