@@ -13,7 +13,6 @@ import Analytics from "./pages/Analytics";
 import Security from "./pages/Security";
 import Unanswered from "./pages/Unanswered";
 import Settings from "./pages/Settings";
-import WidgetSettings from "./pages/WidgetSettings";
 
 function LoginScreen({ onLogin }) {
   const [tokenInput, setTokenInput] = useState("");
@@ -99,7 +98,6 @@ export default function App() {
           <Route path="/admin/security" element={<Security />} />
           <Route path="/admin/unanswered" element={<Unanswered />} />
           <Route path="/admin/settings" element={<Settings />} />
-          <Route path="/admin/widget-settings" element={<WidgetSettings />} />
           {/* Redirect matching default pathing */}
           <Route path="*" element={<Navigate to="/admin" replace />} />
         </Routes>

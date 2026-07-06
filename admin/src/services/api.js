@@ -126,6 +126,10 @@ export const api = {
     return request("/analytics/leads");
   },
 
+  async getSystemStatus() {
+    return request("/settings/status");
+  },
+
   async getWidgetSettings(siteId) {
     return request(`/widget-settings/${encodeURIComponent(siteId)}`);
   },

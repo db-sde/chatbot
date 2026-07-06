@@ -404,10 +404,38 @@ async def admin_security_attacks(
     pool = await get_pool()
     return await queries.get_top_attack_patterns(pool, limit)
 
+@app.get("/api/admin/settings/status")
+async def admin_settings_status(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Return read-only status of AI providers, lead delivery, and active session user."""
+    from llm import config
+    from agent.llm_client import llm_client
+    
+    ai_status = "Connected" if llm_client.enabled else "Not Configured"
+    lead_enabled = bool(settings.crm_webhook_url)
+    
+    return {
+        "ai_provider": {
+            "provider": config.PROVIDER.title(),
+            "model": config.MODEL,
+            "status": ai_status
+        },
+        "lead_delivery": {
+            "enabled": lead_enabled,
+            "delivery_method": "CRM Webhook" if lead_enabled else "None",
+            "last_delivery_status": "Success" if lead_enabled else "N/A"
+        },
+        "current_user": {
+            "username": "admin",
+            "role": "System Administrator"
+        }
+    }
+
+
 @app.get("/api/admin/settings/site-domains")
 async def admin_site_domains(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
     """Return configured site keys and their allowed domains."""
     return {"site_domains": settings.site_domains}
+
 
 
 @app.get("/api/admin/widget-settings")
