@@ -131,7 +131,7 @@ def patch_llm(monkeypatch):
     """
     from langchain_core.messages import AIMessage
     import agent.llm_client as llm_mod
-    from llm.types import LLMResponse
+    from llm import LLMResponse
     import agent.resolve as resolve_mod
 
     # ── Entity extraction (resolve.py) ──
@@ -281,7 +281,7 @@ async def test_graph_loop_iteration_cap(monkeypatch):
     import agent.graph as graph_mod
     import agent.llm_client as llm_mod
     import agent.resolve as resolve_mod
-    from llm.types import LLMResponse
+    from llm import LLMResponse
 
     # Mock entity extraction
     async def fake_generate_json(prompt, *, task="entity_resolution"):

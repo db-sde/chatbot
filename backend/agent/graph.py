@@ -43,8 +43,7 @@ from observability import (
     mark_first_token,
     record_llm_call_duration,
 )
-from llm.adapters.base import langchain_tools_to_specs, llm_response_to_ai_message
-from llm.types import LLMResponse
+from llm import LLMResponse, langchain_tools_to_specs, llm_response_to_ai_message
 
 logger = logging.getLogger(__name__)
 

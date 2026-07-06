@@ -1,76 +1,34 @@
-"""Unit tests for the unified LLM layer introduced in Phase B.
+"""Unit tests for the simplified LLM provider layer.
 
-These tests do not require real provider API keys; they exercise the registry,
-adapter conversion helpers, and the LLMManager fallback logic with fake adapters.
+These tests exercise the utility helpers in llm.provider without making
+any real API calls.  Provider-level generate/stream are not tested here
+because they require live keys — smoke-tested manually instead.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, AsyncIterator
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from langchain_core.messages import AIMessage, HumanMessage
-
-from llm import LLMManager, ModelRegistry, ProviderCapability
-from llm.adapters.base import (
+from llm.provider import (
+    LLMResponse,
+    ToolSpec,
+    append_json_system_message,
+    clean_messages,
     langchain_tools_to_specs,
     llm_response_to_ai_message,
     safe_parse_json,
+    to_langchain_messages,
     tool_specs_to_openai_schema,
 )
-from llm.config import build_task_registry
-from llm.types import LLMResponse, TaskConfig, ToolSpec
-
-
-class FakeAdapter:
-    """In-memory provider adapter for testing."""
-
-    name = "fake"
-    capabilities = ProviderCapability.TEXT | ProviderCapability.JSON | ProviderCapability.TOOLS
-
-    def __init__(self, response: LLMResponse | Exception | None = None) -> None:
-        self.response = response or LLMResponse(content="hello")
-        self.calls: list[dict[str, Any]] = []
-
-    async def generate(self, *, messages, tools=None, **kwargs) -> LLMResponse:
-        self.calls.append({"messages": messages, "tools": tools, "kwargs": kwargs})
-        if isinstance(self.response, Exception):
-            raise self.response
-        return self.response
-
-    async def stream(self, *, messages, tools=None, **kwargs) -> AsyncIterator[str]:
-        self.calls.append({"messages": messages, "tools": tools, "kwargs": kwargs})
-        if isinstance(self.response, Exception):
-            raise self.response
-        for token in self.response.content.split():
-            yield token + " "
-
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        return [[0.1, 0.2, 0.3] for _ in texts]
-
-    def get_chat_model(self):
-        return self
-
-
-class FakeEmbeddingAdapter(FakeAdapter):
-    name = "fake-embedding"
-    capabilities = ProviderCapability.EMBEDDINGS
-
-
-class AlwaysFailAdapter(FakeAdapter):
-    name = "fail"
-    capabilities = ProviderCapability.TEXT
-
-    async def generate(self, *, messages, tools=None, **kwargs) -> LLMResponse:
-        raise RuntimeError("always fails")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# safe_parse_json
 # ---------------------------------------------------------------------------
 
 def test_safe_parse_json_strips_fences():
@@ -78,6 +36,14 @@ def test_safe_parse_json_strips_fences():
     assert safe_parse_json('{"b": 2}') == {"b": 2}
     assert safe_parse_json("not json") == {}
 
+
+def test_safe_parse_json_empty_string():
+    assert safe_parse_json("") == {}
+
+
+# ---------------------------------------------------------------------------
+# tool_specs_to_openai_schema
+# ---------------------------------------------------------------------------
 
 def test_tool_specs_to_openai_schema():
     specs = [
@@ -89,17 +55,33 @@ def test_tool_specs_to_openai_schema():
         )
     ]
     schemas = tool_specs_to_openai_schema(specs)
+    assert len(schemas) == 1
     assert schemas[0]["type"] == "function"
     assert schemas[0]["function"]["name"] == "get_fee"
+    assert schemas[0]["function"]["parameters"]["required"] == ["university_slug"]
 
 
-def test_llm_response_to_ai_message():
-    response = LLMResponse(content="hi", tool_calls=[{"name": "t", "args": {}, "id": "tc1"}])
+# ---------------------------------------------------------------------------
+# llm_response_to_ai_message
+# ---------------------------------------------------------------------------
+
+def test_llm_response_to_ai_message_plain():
+    response = LLMResponse(content="hi")
     msg = llm_response_to_ai_message(response)
     assert isinstance(msg, AIMessage)
     assert msg.content == "hi"
+
+
+def test_llm_response_to_ai_message_with_tool_calls():
+    response = LLMResponse(content="hi", tool_calls=[{"name": "t", "args": {}, "id": "tc1"}])
+    msg = llm_response_to_ai_message(response)
+    assert isinstance(msg, AIMessage)
     assert len(msg.tool_calls) == 1
 
+
+# ---------------------------------------------------------------------------
+# langchain_tools_to_specs
+# ---------------------------------------------------------------------------
 
 def test_langchain_tools_to_specs():
     from langchain_core.tools import tool
@@ -115,101 +97,64 @@ def test_langchain_tools_to_specs():
 
 
 # ---------------------------------------------------------------------------
-# Registry
+# to_langchain_messages
 # ---------------------------------------------------------------------------
 
-def test_default_registry_tasks():
-    registry = ModelRegistry()
-    assert set(registry.list_tasks()) == {
-        "entity_resolution",
-        "agent_decide",
-        "synthesize",
-        "lead_intent",
-    }
+def test_to_langchain_messages_from_string():
+    msgs = to_langchain_messages("hello")
+    assert len(msgs) == 1
+    assert isinstance(msgs[0], HumanMessage)
+    assert msgs[0].content == "hello"
 
 
-def test_custom_registry_override():
-    registry = ModelRegistry('{"synthesize": {"provider": "openai", "model": "gpt-4o"}}')
-    cfg = registry.get_task_config("synthesize")
-    assert cfg.provider == "openai"
-    assert cfg.model == "gpt-4o"
-
-
-def test_capability_parsing():
-    cfg = build_task_registry('{"t": {"provider": "openai", "model": "gpt-4o", "capabilities_required": "text,tools,stream"}}')
-    assert cfg["t"].capabilities_required == (ProviderCapability.TEXT | ProviderCapability.TOOLS | ProviderCapability.STREAM)
+def test_to_langchain_messages_from_list():
+    original = [HumanMessage(content="hi")]
+    msgs = to_langchain_messages(original)
+    assert msgs == original
 
 
 # ---------------------------------------------------------------------------
-# Manager fallback chain
+# append_json_system_message
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def patch_factory(monkeypatch):
-    """Allow tests to inject fake adapters by provider name."""
-    adapters: dict[str, Any] = {}
-
-    def fake_create_adapter(provider, model, **extra):
-        return adapters.get(provider)
-
-    import llm.registry as registry_mod
-    monkeypatch.setattr(registry_mod, "create_adapter", fake_create_adapter)
-    return adapters
+def test_append_json_system_message_adds_instruction():
+    msgs = [HumanMessage(content="extract")]
+    result = append_json_system_message(msgs)
+    assert isinstance(result[0], SystemMessage)
+    assert "JSON" in result[0].content
 
 
-def _make_registry():
-    primary = TaskConfig(provider="fake-primary", model="m1")
-    fallback = TaskConfig(provider="fake-fallback", model="m2")
-    registry = ModelRegistry.__new__(ModelRegistry)
-    registry.tasks = {"test_task": primary}
-    primary.fallback = [fallback]
-    return registry
+def test_append_json_system_message_extends_existing_system():
+    msgs = [SystemMessage(content="You are helpful."), HumanMessage(content="go")]
+    result = append_json_system_message(msgs)
+    assert isinstance(result[0], SystemMessage)
+    assert "You are helpful." in result[0].content
+    assert "JSON" in result[0].content
 
 
-@pytest.mark.asyncio
-async def test_manager_uses_primary_when_successful(patch_factory):
-    adapters = patch_factory
-    adapters["fake-primary"] = FakeAdapter(LLMResponse(content="primary"))
-    adapters["fake-fallback"] = FakeAdapter(LLMResponse(content="fallback"))
-
-    manager = LLMManager(_make_registry())
-    response = await manager.generate("test_task", "hello")
-    assert response.content == "primary"
-    assert adapters["fake-primary"].calls
-    assert not adapters["fake-fallback"].calls
+def test_append_json_system_message_no_duplicate():
+    instruction = (
+        "You must respond with a single valid JSON object. "
+        "Do not wrap the JSON in markdown code fences and do not add explanatory text."
+    )
+    msgs = [SystemMessage(content=f"pre\n\n{instruction}"), HumanMessage(content="q")]
+    result = append_json_system_message(msgs)
+    # Should not duplicate the instruction
+    assert result[0].content.count("JSON object") == 1
 
 
-@pytest.mark.asyncio
-async def test_manager_falls_back_on_failure(patch_factory):
-    adapters = patch_factory
-    adapters["fake-primary"] = FakeAdapter(RuntimeError("primary failed"))
-    adapters["fake-fallback"] = FakeAdapter(LLMResponse(content="fallback"))
+# ---------------------------------------------------------------------------
+# clean_messages
+# ---------------------------------------------------------------------------
 
-    manager = LLMManager(_make_registry())
-    response = await manager.generate("test_task", "hello")
-    assert response.content == "fallback"
-    assert adapters["fake-primary"].calls
-    assert adapters["fake-fallback"].calls
+def test_clean_messages_stringifies_tool_message_content():
+    msg = ToolMessage(content={"key": "value"}, tool_call_id="tc1")
+    cleaned = clean_messages([msg])
+    assert isinstance(cleaned[0].content, str)
+    assert "key" in cleaned[0].content
 
 
-@pytest.mark.asyncio
-async def test_manager_generate_json(patch_factory):
-    adapters = patch_factory
-    adapters["fake-primary"] = FakeAdapter(LLMResponse(content='{"ok": true}'))
-
-    manager = LLMManager(_make_registry())
-    result = await manager.generate_json("test_task", "extract")
-    assert result == {"ok": True}
-
-
-
-@pytest.mark.asyncio
-async def test_manager_stream(patch_factory):
-    adapters = patch_factory
-    adapters["fake-primary"] = FakeAdapter(LLMResponse(content="hello world"))
-
-    manager = LLMManager(_make_registry())
-    chunks = []
-    async for chunk in await manager.generate("test_task", "hi", stream=True):
-        chunks.append(chunk)
-    assert "".join(chunks).strip() == "hello world"
+def test_clean_messages_passthrough_human():
+    msg = HumanMessage(content="hello")
+    cleaned = clean_messages([msg])
+    assert cleaned[0] is msg

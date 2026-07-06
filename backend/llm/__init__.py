@@ -1,28 +1,24 @@
-"""Unified LLM layer for DegreeBaba.
-
-Public exports:
-    LLMManager          — high-level task-based interface
-    ModelRegistry       — task registry with fallback chains
-    LLMProvider         — provider adapter protocol
-    ProviderCapability  — capability flags
-    TaskConfig          — per-task configuration
-    ToolSpec            — provider-agnostic tool schema
-    LLMResponse         — normalized response
-"""
+"""LLM layer — re-exports from the simplified provider module."""
 from __future__ import annotations
 
-from llm.adapters.base import safe_parse_json
-from llm.manager import LLMManager
-from llm.registry import ModelRegistry
-from llm.types import LLMProvider, LLMResponse, ProviderCapability, TaskConfig, ToolSpec
+from llm.provider import (
+    LLMResponse,
+    ToolSpec,
+    generate,
+    generate_json,
+    langchain_tools_to_specs,
+    llm_response_to_ai_message,
+    safe_parse_json,
+    stream,
+)
 
 __all__ = [
-    "LLMManager",
-    "ModelRegistry",
-    "LLMProvider",
     "LLMResponse",
-    "ProviderCapability",
-    "TaskConfig",
     "ToolSpec",
+    "generate",
+    "generate_json",
+    "langchain_tools_to_specs",
+    "llm_response_to_ai_message",
     "safe_parse_json",
+    "stream",
 ]
