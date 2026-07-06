@@ -14,8 +14,8 @@ MODEL_PRICING = {
     },
     # Llama 3.3 70B Versatile on Groq
     "llama-3.3-70b-versatile": {
-        "input_per_million": 0.59,
-        "output_per_million": 0.79
+        "input_per_million": 0.0,
+        "output_per_million": 0.0
     },
     # OpenAI GPT-4o mini
     "gpt-4o-mini": {

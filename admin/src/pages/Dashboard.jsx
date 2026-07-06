@@ -8,7 +8,8 @@ import {
   Activity,
   Clock,
   DollarSign,
-  BarChart3
+  BarChart3,
+  RefreshCw,
 } from "lucide-react";
 import { api } from "../services/api";
 import StatsCard from "../components/StatsCard";
@@ -18,9 +19,9 @@ export default function Dashboard() {
   const [data, setData] = useState(null);
   const [security, setSecurity] = useState(null);
   const [overview, setOverview] = useState(null);
+  const [systemStatus, setSystemStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-
   const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
@@ -29,15 +30,17 @@ export default function Dashboard() {
       setLoading(true);
       setError(null);
       try {
-        const [analyticsData, securityData, overviewData] = await Promise.all([
+        const [analyticsData, securityData, overviewData, statusData] = await Promise.all([
           api.getAnalytics(),
           api.getSecuritySummary(),
           api.getAnalyticsOverview(),
+          api.getSystemStatus(),
         ]);
         if (cancelled) return;
         setData(analyticsData);
         setSecurity(securityData);
         setOverview(overviewData);
+        setSystemStatus(statusData);
       } catch (err) {
         if (cancelled) return;
         setError(err.message || "Failed to load dashboard metrics.");
@@ -48,7 +51,9 @@ export default function Dashboard() {
       }
     }
     run();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [refresh]);
 
   if (loading) return <LoadingState message="Connecting to analytics pipeline..." />;
@@ -58,7 +63,7 @@ export default function Dashboard() {
   const totalSessions = data?.conversation_count || 0;
   const totalMessages = data?.message_count || 0;
   const totalLeads = data?.lead_count || 0;
-  const totalBlocks = security?.total_blocks || 0;
+  const totalBlocks = security?.total_events || security?.total_blocks || 0;
   const unansweredCount = data?.unanswered_count || 0;
 
   const leadConvRate = totalSessions > 0 ? ((totalLeads / totalSessions) * 100).toFixed(1) : "0.0";
@@ -74,86 +79,181 @@ export default function Dashboard() {
   const topUniversities = data?.top_universities || [];
 
   return (
-    <div className="space-y-8">
-      {/* Overview Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-        <StatsCard
-          title="Total Sessions"
-          value={totalSessions.toLocaleString()}
-          subtext="Total unique user chats initialized"
-          icon={Activity}
-        />
-        <StatsCard
-          title="Avg Response Time"
-          value={`${((overview?.avg_response_time_ms || 0) / 1000).toFixed(2)}s`}
-          subtext="E2E message generation latency"
-          icon={Clock}
-        />
-        <StatsCard
-          title="Avg TTFT"
-          value={`${(overview?.avg_ttft_ms || 0).toFixed(0)}ms`}
-          subtext="First token/decision latency"
-          icon={Activity}
-        />
-        <StatsCard
-          title="Tokens Today"
-          value={(overview?.total_tokens_today || 0).toLocaleString()}
-          subtext="Prompt + completion tokens today"
-          icon={BarChart3}
-        />
-        <StatsCard
-          title="Cost Today"
-          value={`$${(overview?.total_cost_today || 0).toFixed(4)}`}
-          subtext="Estimated running model cost today"
-          icon={DollarSign}
-        />
-        <StatsCard
-          title="Total Leads"
-          value={totalLeads.toLocaleString()}
-          subtext="Captured forms matching query intent"
-          icon={Users}
-        />
-        <StatsCard
-          title="Lead Conversion Rate"
-          value={`${leadConvRate}%`}
-          subtext="Percentage of sessions turned into leads"
-          icon={TrendingUp}
-          trend={totalSessions > 0 ? "Active" : null}
-          trendType={totalSessions > 0 ? "positive" : "neutral"}
-        />
-        <StatsCard
-          title="Cost Per Lead"
-          value={`$${(overview?.cost_per_lead || 0).toFixed(4)}`}
-          subtext="Model cost divided by leads count"
-          icon={TrendingUp}
-        />
-        <StatsCard
-          title="Threats Blocked"
-          value={totalBlocks.toLocaleString()}
-          subtext="Jailbreak & prompt injection threats"
-          icon={AlertOctagon}
-          trend={totalBlocks > 0 ? "Flagged" : "Clean"}
-          trendType={totalBlocks > 0 ? "negative" : "positive"}
-        />
-        <StatsCard
-          title="Unanswered Questions"
-          value={unansweredCount.toLocaleString()}
-          subtext="Missed queries recorded for resolution"
-          icon={HelpCircle}
-          trend={unansweredCount > 0 ? "Review Required" : "Zero Gaps"}
-          trendType={unansweredCount > 0 ? "negative" : "positive"}
-        />
+    <div className="space-y-12 text-left">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-bold text-gray-100 tracking-tight">Performance Overview</h2>
+          <p className="text-xs text-gray-500 mt-0.5 font-medium">Real-time business and system analytics</p>
+        </div>
+        <button
+          onClick={() => setRefresh((r) => r + 1)}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#1F2937] text-xs text-gray-400 hover:text-gray-200 hover:border-gray-600 transition-all self-start sm:self-center"
+        >
+          <RefreshCw size={12} />
+          Refresh Metrics
+        </button>
+      </div>
+
+      {/* SECTION 1 — BUSINESS METRICS */}
+      <div className="space-y-4">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-gray-500">Business Metrics</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+          <StatsCard
+            title="Total Conversations"
+            value={totalSessions.toLocaleString()}
+            subtext="Total unique user chats initialized"
+            icon={Activity}
+          />
+          <StatsCard
+            title="Total Leads"
+            value={totalLeads.toLocaleString()}
+            subtext="Captured forms matching query intent"
+            icon={Users}
+          />
+          <StatsCard
+            title="Lead Conversion Rate"
+            value={`${leadConvRate}%`}
+            subtext="Percentage of sessions turned into leads"
+            icon={TrendingUp}
+            trend={totalSessions > 0 ? "Active" : null}
+            trendType={totalSessions > 0 ? "positive" : "neutral"}
+          />
+        </div>
+      </div>
+
+      {/* SECTION 2 — AI PERFORMANCE */}
+      <div className="space-y-4">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-gray-500">AI Performance</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+          <StatsCard
+            title="Average Response Time"
+            value={`${((overview?.avg_response_time_ms || 0) / 1000).toFixed(2)}s`}
+            subtext="E2E message generation latency"
+            icon={Clock}
+          />
+          <StatsCard
+            title="Average TTFT"
+            value={`${(overview?.avg_ttft_ms || 0).toFixed(0)}ms`}
+            subtext="First token/decision latency"
+            icon={Activity}
+          />
+          {/* Current Model Card */}
+          <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-6 transition-all hover:border-[#2D3748] shadow-sm flex flex-col justify-between min-h-[140px]">
+            <div className="flex justify-between items-start">
+              <h3 className="text-sm font-medium text-gray-400">Current Model</h3>
+              <div className="p-2 bg-[#1F2937] rounded-lg text-gray-300 border border-[#2D3748]">
+                <School size={18} />
+              </div>
+            </div>
+            <div className="mt-4 space-y-1.5">
+              <div className="flex justify-between text-xs">
+                <span className="text-gray-500 font-medium">Provider</span>
+                <span className="text-gray-200 font-bold">{systemStatus?.ai_provider?.provider || "N/A"}</span>
+              </div>
+              <div className="flex justify-between text-xs">
+                <span className="text-gray-500 font-medium">Model</span>
+                <span className="text-gray-200 font-mono text-[10px] truncate max-w-[170px]" title={systemStatus?.ai_provider?.model}>
+                  {systemStatus?.ai_provider?.model || "N/A"}
+                </span>
+              </div>
+              <div className="flex justify-between text-xs items-center">
+                <span className="text-gray-500 font-medium">Status</span>
+                <span className="flex items-center gap-1">
+                  <span className={`w-2 h-2 rounded-full ${systemStatus?.ai_provider?.status === "Connected" ? "bg-emerald-500 animate-pulse" : "bg-red-500"}`}></span>
+                  <span className="text-gray-200 font-bold">{systemStatus?.ai_provider?.status || "N/A"}</span>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* SECTION 3 — OPERATIONS */}
+      <div className="space-y-4">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-gray-500">Operations</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+          <StatsCard
+            title="Tokens Today"
+            value={(overview?.total_tokens_today || 0).toLocaleString()}
+            subtext="Prompt + completion tokens today"
+            icon={BarChart3}
+          />
+          <StatsCard
+            title="Cost Today"
+            value={`$${(overview?.total_cost_today || 0).toFixed(4)}`}
+            subtext="Estimated running model cost today"
+            icon={DollarSign}
+          />
+          <StatsCard
+            title="Cost Per Lead"
+            value={`$${(overview?.cost_per_lead || 0).toFixed(4)}`}
+            subtext="Model cost divided by leads count"
+            icon={DollarSign}
+          />
+        </div>
+      </div>
+
+      {/* SECTION 4 — SYSTEM HEALTH */}
+      <div className="space-y-4">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-gray-500">System Health</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+          <StatsCard
+            title="Security Events"
+            value={totalBlocks.toLocaleString()}
+            subtext="Recorded threats and violations"
+            icon={AlertOctagon}
+          />
+          <StatsCard
+            title="Unanswered Questions"
+            value={unansweredCount.toLocaleString()}
+            subtext="Queries flagged for review"
+            icon={HelpCircle}
+          />
+          {/* System Status Card */}
+          <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-6 transition-all hover:border-[#2D3748] shadow-sm flex flex-col justify-between min-h-[140px]">
+            <div className="flex justify-between items-start">
+              <h3 className="text-sm font-medium text-gray-400">System Status</h3>
+              <div className="p-2 bg-[#1F2937] rounded-lg text-gray-300 border border-[#2D3748]">
+                <Activity size={18} />
+              </div>
+            </div>
+            <div className="mt-4 space-y-1.5">
+              <div className="flex justify-between text-xs items-center">
+                <span className="text-gray-500 font-medium">API Gateway</span>
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                  <span className="text-gray-200 font-bold">{systemStatus?.api_gateway?.status || "Connected"}</span>
+                </span>
+              </div>
+              <div className="flex justify-between text-xs items-center">
+                <span className="text-gray-500 font-medium">Database</span>
+                <span className="flex items-center gap-1">
+                  <span className={`w-2 h-2 rounded-full ${systemStatus?.database?.status === "Connected" ? "bg-emerald-500" : "bg-red-500 animate-pulse"}`}></span>
+                  <span className="text-gray-200 font-bold">{systemStatus?.database?.status || "N/A"}</span>
+                </span>
+              </div>
+              <div className="flex justify-between text-xs items-center">
+                <span className="text-gray-500 font-medium">LLM Provider</span>
+                <span className="flex items-center gap-1">
+                  <span className={`w-2 h-2 rounded-full ${systemStatus?.ai_provider?.status === "Connected" ? "bg-emerald-500" : "bg-red-500 animate-pulse"}`}></span>
+                  <span className="text-gray-200 font-bold">{systemStatus?.ai_provider?.status || "N/A"}</span>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Visual Trends & Insights */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 pt-4">
         {/* Simple SVG Chart / Trend */}
         <div className="lg:col-span-2 bg-[#111827] border border-[#1F2937] rounded-xl p-6 flex flex-col justify-between">
           <div>
             <h3 className="text-sm font-semibold text-gray-200">Volume & Traffic Trend</h3>
             <p className="text-xs text-gray-500 mt-1">Relative distribution of sessions, leads, and messages.</p>
           </div>
-          
+
           <div className="my-8 flex items-stretch h-56 gap-4">
             {/* Y-axis Labels */}
             <div className="flex flex-col justify-between text-[10px] text-gray-500 font-mono select-none h-48 py-1 pr-2 border-r border-[#1F2937]/50 text-right w-12">
@@ -220,7 +320,7 @@ export default function Dashboard() {
                   className="w-12 bg-gradient-to-t from-red-600 to-red-400 hover:from-red-500 hover:to-red-300 rounded-t-md transition-all duration-500 shadow-[0_0_12px_rgba(239,68,68,0.15)] hover:shadow-[0_0_16px_rgba(239,68,68,0.35)]"
                   style={{ height: `${blockPct}%` }}
                 ></div>
-                <span className="text-[10px] text-gray-500 font-semibold mt-2.5">Blocks</span>
+                <span className="text-[10px] text-gray-500 font-semibold mt-2.5">Events</span>
               </div>
             </div>
           </div>
