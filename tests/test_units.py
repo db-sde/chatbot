@@ -103,6 +103,19 @@ def test_validate_site_request_success(monkeypatch):
     assert exc.value.status_code == 403
 
 
+def test_wildcard_domain_validation(monkeypatch):
+    monkeypatch.setattr(auth.settings, "allowed_site_keys", '{"demo_key":["*.onrender.com"]}')
+    # Match wildcard suffix exactly
+    auth.validate_site_request("demo_key", "https://subdomain.onrender.com", None)
+    # Match root domain
+    auth.validate_site_request("demo_key", "https://onrender.com", None)
+    
+    # Must raise 403 on mismatched domains
+    with pytest.raises(HTTPException) as exc:
+        auth.validate_site_request("demo_key", "https://notrender.com", None)
+    assert exc.value.status_code == 403
+
+
 @pytest.mark.asyncio
 async def test_check_admin_auth(monkeypatch):
     monkeypatch.setattr(auth.settings, "admin_auth_token", "supersecret")

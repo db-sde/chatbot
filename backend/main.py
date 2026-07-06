@@ -121,6 +121,14 @@ async def health() -> dict[str, str]:
     return {"ok": "true"}
 
 
+@app.get("/")
+@app.get("/demo")
+async def serve_demo() -> FileResponse:
+    static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    return FileResponse(os.path.join(static_dir, "demo.html"))
+
+
+
 @app.post("/chat")
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
 async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResponse:
@@ -623,16 +631,10 @@ async def get_widget_config(request: Request) -> dict:
     referer = request.headers.get("referer")
     
     # Validate origin/referer against allowed site domains
-    from auth import _host
+    from auth import _host, is_domain_allowed
     host = _host(origin) or _host(referer)
-    if host is not None:
-        allowed = False
-        for domains in settings.site_domains.values():
-            if any(host == domain or host.endswith(f".{domain}") for domain in domains):
-                allowed = True
-                break
-        if not allowed:
-            raise HTTPException(status_code=403, detail="Origin not allowed")
+    if host is not None and not is_domain_allowed(host):
+        raise HTTPException(status_code=403, detail="Origin not allowed")
 
     pool = await get_pool()
     row = await queries.get_widget_settings(pool)

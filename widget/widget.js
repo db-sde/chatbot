@@ -3,6 +3,7 @@
   const scriptSrc = script ? script.src : "";
   const apiBase = (script && script.dataset.apiBase) || (scriptSrc && scriptSrc.startsWith("http") ? new URL(scriptSrc).origin : window.location.origin);
   const pageSlug = (script && script.dataset.universitySlug) || location.pathname.split("/").filter(Boolean).pop() || null;
+  const siteKey = (script && script.dataset.siteKey) || "default";
   const storageKey = "degreebaba_ai_session_id";
   const sessionId = localStorage.getItem(storageKey) || crypto.randomUUID();
   localStorage.setItem(storageKey, sessionId);
@@ -206,7 +207,7 @@
       const url =
         `${apiBase}/api/session/history` +
         `?session_id=${encodeURIComponent(sessionId)}` +
-        `&site_key=default` +
+        `&site_key=${encodeURIComponent(siteKey)}` +
         `&limit=20`;
       const res = await fetch(url);
       if (!res.ok) return;
@@ -241,7 +242,7 @@
       const url =
         `${apiBase}/api/session/history` +
         `?session_id=${encodeURIComponent(sessionId)}` +
-        `&site_key=default` +
+        `&site_key=${encodeURIComponent(siteKey)}` +
         `&limit=20` +
         `&before_id=${oldestLoadedId}`;
       const res = await fetch(url);
@@ -290,7 +291,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: sessionId,
-          site_key: "default",
+          site_key: siteKey,
           course_interest: courseInterest || "",
           name: data.name || "Anonymous",
           phone: data.phone || "0000000000",
@@ -319,7 +320,7 @@
       const response = await fetch(`${apiBase}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, site_key: "default", message, page_university_slug: pageSlug })
+        body: JSON.stringify({ session_id: sessionId, site_key: siteKey, message, page_university_slug: pageSlug })
       });
       if (!response.ok) {
         bot.style.display = "";

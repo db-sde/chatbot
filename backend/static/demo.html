@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>DegreeBaba AI Assistant</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+<style>
+:root{
+  --primary:#135d66;
+  --primary-light:#1f8b98;
+  --bg:#050816;
+  --card-bg:rgba(17,24,39,.65);
+  --border:rgba(255,255,255,.08);
+  --text:#fff;
+  --muted:#a7b0c0;
+}
+
+*{
+  margin:0;
+  padding:0;
+  box-sizing:border-box;
+}
+
+body{
+  font-family:'Plus Jakarta Sans',sans-serif;
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:20px;
+  overflow:hidden;
+  background:
+    radial-gradient(circle at top left,#135d6630,transparent 35%),
+    radial-gradient(circle at bottom right,#4f46e530,transparent 40%),
+    linear-gradient(135deg,#060914,#0d1325);
+  color:var(--text);
+}
+
+/* Animated background */
+body::before,
+body::after{
+  content:"";
+  position:absolute;
+  border-radius:50%;
+  filter:blur(80px);
+  z-index:0;
+}
+
+body::before{
+  width:300px;
+  height:300px;
+  background:#135d6650;
+  top:-80px;
+  left:-80px;
+  animation:float1 8s ease-in-out infinite;
+}
+
+body::after{
+  width:350px;
+  height:350px;
+  background:#6366f130;
+  bottom:-120px;
+  right:-120px;
+  animation:float2 10s ease-in-out infinite;
+}
+
+@keyframes float1{
+  50%{transform:translate(40px,30px);}
+}
+
+@keyframes float2{
+  50%{transform:translate(-40px,-30px);}
+}
+
+.container{
+  position:relative;
+  z-index:2;
+  width:100%;
+  max-width:520px;
+}
+
+.card{
+  backdrop-filter:blur(18px);
+  background:var(--card-bg);
+  border:1px solid var(--border);
+  border-radius:30px;
+  padding:40px 32px;
+  box-shadow:
+    0 25px 50px rgba(0,0,0,.45),
+    inset 0 1px 0 rgba(255,255,255,.05);
+  text-align:center;
+}
+
+.badge{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  padding:8px 14px;
+  border-radius:999px;
+  background:rgba(19,93,102,.15);
+  border:1px solid rgba(19,93,102,.4);
+  color:#7ce7f3;
+  font-size:12px;
+  font-weight:700;
+  margin-bottom:22px;
+}
+
+.logo{
+  width:90px;
+  height:90px;
+  margin:0 auto 20px;
+  border-radius:26px;
+  background:linear-gradient(
+    135deg,
+    var(--primary),
+    var(--primary-light)
+  );
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:42px;
+  box-shadow:
+    0 15px 35px rgba(19,93,102,.45);
+  animation:pulse 3s infinite;
+}
+
+@keyframes pulse{
+  50%{
+    transform:scale(1.05);
+  }
+}
+
+h1{
+  font-size:32px;
+  font-weight:800;
+  margin-bottom:10px;
+  letter-spacing:-1px;
+}
+
+.subtitle{
+  color:var(--muted);
+  font-size:15px;
+  line-height:1.7;
+  margin-bottom:30px;
+}
+
+.features{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:14px;
+  margin-bottom:28px;
+}
+
+.feature{
+  padding:16px;
+  border-radius:18px;
+  background:rgba(255,255,255,.04);
+  border:1px solid rgba(255,255,255,.05);
+  text-align:left;
+  transition:.25s;
+}
+
+.feature:hover{
+  transform:translateY(-4px);
+  border-color:rgba(19,93,102,.4);
+}
+
+.feature span{
+  display:block;
+  font-size:22px;
+  margin-bottom:8px;
+}
+
+.feature p{
+  font-size:13px;
+  color:#d7dce5;
+  font-weight:600;
+  line-height:1.4;
+}
+
+.start-btn{
+  width:100%;
+  border:none;
+  border-radius:16px;
+  padding:18px;
+  cursor:pointer;
+  font-size:16px;
+  font-weight:800;
+  color:#fff;
+  background:linear-gradient(
+    135deg,
+    var(--primary),
+    var(--primary-light)
+  );
+  box-shadow:0 12px 30px rgba(19,93,102,.4);
+  transition:.25s;
+}
+
+.start-btn:hover{
+  transform:translateY(-3px);
+  box-shadow:0 18px 40px rgba(19,93,102,.55);
+}
+
+.footer{
+  margin-top:24px;
+  color:#748092;
+  font-size:11px;
+  letter-spacing:1px;
+  text-transform:uppercase;
+  font-weight:700;
+}
+
+@media(max-width:540px){
+
+  .card{
+    padding:30px 20px;
+  }
+
+  h1{
+    font-size:26px;
+  }
+
+  .features{
+    grid-template-columns:1fr;
+  }
+
+  .logo{
+    width:80px;
+    height:80px;
+    font-size:36px;
+  }
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+  <div class="card">
+
+    <div class="badge">
+      ✨ AI Powered Career Guidance
+    </div>
+
+    <div class="logo">
+      🎓
+    </div>
+
+    <h1>DegreeBaba AI Assistant</h1>
+
+    <p class="subtitle">
+      Get instant answers about universities, online degrees,
+      admissions, scholarships, placements and career opportunities.
+    </p>
+
+    <div class="features">
+      <div class="feature">
+        <span>🎓</span>
+        <p>Online MBA Programs</p>
+      </div>
+
+      <div class="feature">
+        <span>🏛️</span>
+        <p>University Comparison</p>
+      </div>
+
+      <div class="feature">
+        <span>💰</span>
+        <p>Fees & Scholarships</p>
+      </div>
+
+      <div class="feature">
+        <span>📋</span>
+        <p>Eligibility Criteria</p>
+      </div>
+
+      <div class="feature">
+        <span>📝</span>
+        <p>Admission Process</p>
+      </div>
+
+      <div class="feature">
+        <span>🚀</span>
+        <p>Placement Support</p>
+      </div>
+    </div>
+
+
+    <div class="footer">
+      Powered by DegreeBaba AI
+    </div>
+
+  </div>
+</div>
+
+<!-- KEEP YOUR EXISTING SCRIPT TAGS EXACTLY AS THEY ARE -->
+</script>
+<!-- Include the simplified widget with the demo site key -->
+<script src="/widget.js" data-site-key="degreebaba_demo" defer></script>
+</body>
+</html>

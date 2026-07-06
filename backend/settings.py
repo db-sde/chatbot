@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     deepseek_base_url: str | None = "https://api.deepseek.com"
 
 
-    allowed_site_keys: str = '{"degreebaba_dev":["localhost","127.0.0.1"],"degreebaba_prod":["degreebaba.com","www.degreebaba.com"]}'
+    allowed_site_keys: str = '{"degreebaba_dev":["localhost","127.0.0.1"],"degreebaba_prod":["degreebaba.com","www.degreebaba.com"],"degreebaba_demo":["*.onrender.com"]}'
     crm_webhook_url: str | None = None
     admin_auth_token: str = "change-me"
     rate_limit_per_minute: int = 10

@@ -15,17 +15,23 @@ def _host(value: str | None) -> str | None:
     return (parsed.hostname or value).lower()
 
 
+def is_domain_allowed(host: str | None) -> bool:
+    if host is None:
+        return True
+    for domains in settings.site_domains.values():
+        for domain in domains:
+            if domain.startswith("*."):
+                suffix = domain[1:]  # e.g. ".onrender.com"
+                if host.endswith(suffix) or host == domain[2:]:
+                    return True
+            elif host == domain or host.endswith(f".{domain}"):
+                return True
+    return False
+
+
 def validate_site_request(site_key: str, origin: str | None, referer: str | None) -> None:
     host = _host(origin) or _host(referer)
-    if host is None:
-        # Allow requests without origin/referer for development/testing
-        return
-    allowed = False
-    for domains in settings.site_domains.values():
-        if any(host == domain or host.endswith(f".{domain}") for domain in domains):
-            allowed = True
-            break
-    if not allowed:
+    if host is not None and not is_domain_allowed(host):
         raise HTTPException(status_code=403, detail="Origin not allowed")
 
 
