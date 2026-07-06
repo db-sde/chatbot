@@ -399,3 +399,47 @@ CREATE INDEX IF NOT EXISTS idx_security_events_blocked ON security_events(blocke
 CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip_address ON blocked_ips(ip_address);
 CREATE INDEX IF NOT EXISTS idx_blocked_ips_is_active ON blocked_ips(is_active);
 CREATE INDEX IF NOT EXISTS idx_blocked_ips_expires_at ON blocked_ips(expires_at);
+
+
+-- ── Schema Delta Updates for Existing Databases ──
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ip_address INET;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_agent TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_intent_detected BOOLEAN DEFAULT FALSE;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_intent_type TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_intent_confidence NUMERIC(4,3);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_intent_reasoning TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_ask_triggered_by TEXT;
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS response_time_ms INTEGER;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS ttft_ms INTEGER;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS model_name TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS input_tokens INTEGER;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS output_tokens INTEGER;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS total_tokens INTEGER;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS estimated_cost_usd NUMERIC(12,8);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_execution_time_ms INTEGER;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+ALTER TABLE unanswered_questions ADD COLUMN IF NOT EXISTS reason TEXT;
+
+ALTER TABLE flagged_messages ADD COLUMN IF NOT EXISTS layer TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE flagged_messages ADD COLUMN IF NOT EXISTS risk_score NUMERIC(5,4) NOT NULL DEFAULT 0.0;
+
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS primary_color TEXT DEFAULT '#135d66';
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS widget_title TEXT DEFAULT 'DegreeBaba Assistant';
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS bot_name TEXT DEFAULT 'DegreeBaba Assistant';
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS welcome_message TEXT DEFAULT 'Hello! Ask me about colleges, courses, admissions and fees.';
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS logo_url TEXT;
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS show_on_mobile BOOLEAN DEFAULT true;
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS show_on_desktop BOOLEAN DEFAULT true;
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS lead_capture_enabled BOOLEAN DEFAULT true;
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS capture_name BOOLEAN DEFAULT true;
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS capture_email BOOLEAN DEFAULT true;
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS capture_phone BOOLEAN DEFAULT true;
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS lead_trigger TEXT DEFAULT 'during_chat';
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS lead_form_title TEXT DEFAULT 'Request callback';
+ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS lead_form_description TEXT DEFAULT 'A counsellor can follow up with you.';
+
+ALTER TABLE security_events ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT 'India';
+
