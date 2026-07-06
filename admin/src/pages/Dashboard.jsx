@@ -128,7 +128,7 @@ export default function Dashboard() {
           icon={TrendingUp}
         />
         <StatsCard
-          title="Blocked Attacks"
+          title="Threats Blocked"
           value={totalBlocks.toLocaleString()}
           subtext="Jailbreak & prompt injection threats"
           icon={AlertOctagon}

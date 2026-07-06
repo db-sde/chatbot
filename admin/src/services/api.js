@@ -98,6 +98,40 @@ export const api = {
     return request(`/security/attacks?limit=${limit}`);
   },
 
+  async getSecurityEvents({ limit = 100, offset = 0, event_type, severity, ip_address } = {}) {
+    const p = new URLSearchParams({ limit, offset });
+    if (event_type) p.append("event_type", event_type);
+    if (severity) p.append("severity", severity);
+    if (ip_address) p.append("ip_address", ip_address);
+    return request(`/security/events?${p.toString()}`);
+  },
+
+  async getSecurityTimeline(hours = 24) {
+    return request(`/security/timeline?hours=${hours}`);
+  },
+
+  async getTopAttackingIps(limit = 20) {
+    return request(`/security/top-ips?limit=${limit}`);
+  },
+
+  async getBlockedIps(include_inactive = false) {
+    return request(`/security/blocked-ips?include_inactive=${include_inactive}`);
+  },
+
+  async blockIp(ip_address, reason, block_type = "temporary", expires_hours = 24) {
+    return request("/security/blocked-ips", {
+      method: "POST",
+      body: JSON.stringify({ ip_address, reason, block_type, expires_hours }),
+    });
+  },
+
+  async unblockIp(ip_address) {
+    return request(`/security/blocked-ips/${encodeURIComponent(ip_address)}`, {
+      method: "DELETE",
+    });
+  },
+
+
   async getAnalyticsOverview() {
     return request("/analytics/overview");
   },

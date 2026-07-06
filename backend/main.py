@@ -124,14 +124,33 @@ async def health() -> dict[str, str]:
 @app.post("/chat")
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
 async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResponse:
+    # Extract visitor metadata from the HTTP layer (server-side; not from the client body)
+    client_ip: str | None = request.client.host if request.client else None
+    client_ua: str | None = request.headers.get("user-agent")
+
+    # ── IP Block Check ──
+    if client_ip:
+        pool = await get_pool()
+        if await queries.is_ip_blocked(pool, client_ip):
+            logger.warning("Blocked IP attempted chat: %s session=%s", client_ip, body.session_id)
+            await queries.insert_security_event(
+                pool,
+                ip_address=client_ip,
+                user_agent=client_ua,
+                session_id=body.session_id,
+                event_type="blocked_ip_access",
+                severity="high",
+                payload=body.message[:500],
+                source="system",
+                action_taken="blocked",
+                blocked=True,
+            )
+            raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
+
     validate_site_request(body.site_key, request.headers.get("origin"), request.headers.get("referer"))
     pool = await get_pool()
     if await queries.count_site_messages_today(pool, body.site_key) >= settings.daily_message_cap_per_site:
         raise HTTPException(status_code=429, detail="Daily site message cap exceeded")
-
-    # Extract visitor metadata from the HTTP layer (server-side; not from the client body)
-    client_ip: str | None = request.client.host if request.client else None
-    client_ua: str | None = request.headers.get("user-agent")
 
     _PROMPT_GUARD_BLOCKED = (
         "I'm not able to process that message. "
@@ -156,6 +175,19 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                     risk_score=safety["risk_score"],
                     reason=safety["reason"] or "injection",
                 )
+                await queries.insert_security_event(
+                    pool,
+                    ip_address=client_ip,
+                    user_agent=client_ua,
+                    session_id=body.session_id,
+                    event_type="prompt_injection",
+                    severity="high" if safety["risk_score"] >= 0.9 else "medium",
+                    payload=body.message[:500],
+                    source=source,
+                    action_taken="blocked",
+                    blocked=True,
+                    metadata={"risk_score": safety["risk_score"], "reason": safety["reason"]},
+                )
                 yield f"event: token\ndata: {json.dumps({'text': _PROMPT_GUARD_BLOCKED})}\n\n"
                 yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
                 return
@@ -177,6 +209,19 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                     layer="policy",
                     risk_score=0.9,
                     reason=policy["rule"] or "policy_violation",
+                )
+                await queries.insert_security_event(
+                    pool,
+                    ip_address=client_ip,
+                    user_agent=client_ua,
+                    session_id=body.session_id,
+                    event_type="policy_violation",
+                    severity="medium",
+                    payload=body.message[:500],
+                    source="policy",
+                    action_taken="blocked",
+                    blocked=True,
+                    metadata={"rule": policy["rule"]},
                 )
                 yield f"event: token\ndata: {json.dumps({'text': _POLICY_BLOCKED})}\n\n"
                 yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
@@ -209,6 +254,12 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
 @app.post("/webhook/lead")
 @limiter.limit("3/minute")
 async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[str, bool]:
+    client_ip: str | None = request.client.host if request.client else None
+    if client_ip:
+        pool = await get_pool()
+        if await queries.is_ip_blocked(pool, client_ip):
+            raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
+
     validate_site_request(body.site_key, request.headers.get("origin"), request.headers.get("referer"))
     await capture_lead(
         body.session_id,
@@ -376,9 +427,9 @@ async def admin_analytics_leads(_: Annotated[None, Depends(check_admin_auth)]) -
 
 @app.get("/api/admin/security/summary")
 async def admin_security_summary(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
-    """Security block summary: total, by layer, by reason, last 24h."""
+    """Extended security summary: event counts, blocked IPs, by-layer breakdown."""
     pool = await get_pool()
-    return await queries.get_security_summary(pool)
+    return await queries.get_security_events_summary(pool)
 
 
 @app.get("/api/admin/security/attacks")
@@ -389,6 +440,110 @@ async def admin_security_attacks(
     """Top attack patterns — most frequent blocked messages grouped by reason."""
     pool = await get_pool()
     return await queries.get_top_attack_patterns(pool, limit)
+
+
+@app.get("/api/admin/security/events")
+async def admin_security_events(
+    _: Annotated[None, Depends(check_admin_auth)],
+    limit: int = 100,
+    offset: int = 0,
+    event_type: str | None = None,
+    severity: str | None = None,
+    ip_address: str | None = None,
+) -> list[dict]:
+    """Paginated security event log with optional filters."""
+    pool = await get_pool()
+    return await queries.get_security_events(pool, limit=limit, offset=offset,
+                                             event_type=event_type, severity=severity,
+                                             ip_address=ip_address)
+
+
+@app.get("/api/admin/security/timeline")
+async def admin_security_timeline(
+    _: Annotated[None, Depends(check_admin_auth)],
+    hours: int = 24,
+) -> list[dict]:
+    """Hourly security event counts for the last N hours."""
+    pool = await get_pool()
+    return await queries.get_security_timeline(pool, hours=hours)
+
+
+@app.get("/api/admin/security/top-ips")
+async def admin_top_attacking_ips(
+    _: Annotated[None, Depends(check_admin_auth)],
+    limit: int = 20,
+) -> list[dict]:
+    """Top attacking IPs with attack count and block status."""
+    pool = await get_pool()
+    return await queries.get_top_attacking_ips(pool, limit)
+
+
+# ── Blocked IPs management ──
+
+class BlockIpRequest(BaseModel):
+    ip_address: str
+    reason: str | None = None
+    block_type: str = "temporary"   # temporary | permanent
+    expires_hours: int | None = 24  # Only used for temporary blocks
+
+
+@app.get("/api/admin/security/blocked-ips")
+async def admin_list_blocked_ips(
+    _: Annotated[None, Depends(check_admin_auth)],
+    include_inactive: bool = False,
+) -> list[dict]:
+    """List all blocked IPs."""
+    pool = await get_pool()
+    return await queries.list_blocked_ips(pool, include_inactive=include_inactive)
+
+
+@app.post("/api/admin/security/blocked-ips")
+async def admin_block_ip(
+    body: BlockIpRequest,
+    _: Annotated[None, Depends(check_admin_auth)] = None,
+) -> dict:
+    """Manually block an IP address."""
+    from datetime import datetime, timezone, timedelta
+    pool = await get_pool()
+    expires_at = None
+    if body.block_type == "temporary" and body.expires_hours:
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=body.expires_hours)
+    result = await queries.upsert_blocked_ip(
+        pool,
+        ip_address=body.ip_address,
+        reason=body.reason or "Manually blocked by admin",
+        blocked_by="admin",
+        block_type=body.block_type,
+        expires_at=expires_at,
+    )
+    # Record admin action in security events
+    await queries.insert_security_event(
+        pool,
+        ip_address=body.ip_address,
+        user_agent=None,
+        session_id=None,
+        event_type="suspicious_activity",
+        severity="high",
+        payload=None,
+        source="admin",
+        action_taken="auto_banned",
+        blocked=True,
+        metadata={"reason": body.reason, "block_type": body.block_type, "blocked_by": "admin"},
+    )
+    return result
+
+
+@app.delete("/api/admin/security/blocked-ips/{ip_address}")
+async def admin_unblock_ip(
+    ip_address: str,
+    _: Annotated[None, Depends(check_admin_auth)] = None,
+) -> dict:
+    """Unblock an IP address."""
+    pool = await get_pool()
+    cleared = await queries.unblock_ip(pool, ip_address)
+    if not cleared:
+        raise HTTPException(status_code=404, detail="No active block found for this IP")
+    return {"ok": True, "ip_address": ip_address, "unblocked": True}
 
 @app.get("/api/admin/settings/status")
 async def admin_settings_status(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
@@ -458,6 +613,12 @@ async def get_widget_config(request: Request) -> dict:
     Validates that the Origin/Referer header matches configured site domains.
     Returns nested branding, behavior, and lead capture settings.
     """
+    client_ip: str | None = request.client.host if request.client else None
+    if client_ip:
+        pool = await get_pool()
+        if await queries.is_ip_blocked(pool, client_ip):
+            raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
+
     origin = request.headers.get("origin")
     referer = request.headers.get("referer")
     

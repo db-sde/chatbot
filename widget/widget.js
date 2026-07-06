@@ -321,6 +321,18 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, site_key: "default", message, page_university_slug: pageSlug })
       });
+      if (!response.ok) {
+        bot.style.display = "";
+        if (response.status === 403) {
+          bot.textContent = "Your access has been restricted due to suspicious activity.";
+        } else if (response.status === 429) {
+          bot.textContent = "Too many requests. Please slow down and try again in a moment.";
+        } else {
+          bot.textContent = "I'm temporarily unavailable. Please try again.";
+        }
+        msgs.scrollTop = msgs.scrollHeight;
+        return;
+      }
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";

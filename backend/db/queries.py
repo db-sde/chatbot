@@ -1038,3 +1038,341 @@ async def list_widget_settings(pool) -> list[dict[str, Any]]:
     """Return the global widget settings as a list with a single element for compatibility."""
     row = await get_widget_settings(pool)
     return [row]
+
+
+# ---------------------------------------------------------------------------
+# Security Events — new persistent event log
+# ---------------------------------------------------------------------------
+
+# Auto-ban thresholds (configurable constants)
+_AUTO_BAN_TEMP_THRESHOLD = 3    # violations within 1 hour → 24h temp ban
+_AUTO_BAN_PERM_THRESHOLD = 10   # total violations → permanent ban
+_AUTO_BAN_WINDOW_HOURS   = 1    # rolling window for temp-ban counter
+
+
+async def get_ip_country(ip: str) -> str:
+    if not ip or ip in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return "Local Network"
+    # Check common private IP subnets
+    if ip.startswith(("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")):
+        return "Private IP"
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            resp = await client.get(f"http://ip-api.com/json/{ip}")
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "success":
+                    return data.get("country") or "India"
+    except Exception:
+        pass
+    return "India"
+
+
+async def insert_security_event(
+    pool,
+    *,
+    ip_address: str | None,
+    user_agent: str | None,
+    session_id: str | None,
+    event_type: str,
+    severity: str = "medium",
+    payload: str | None = None,
+    source: str | None = None,
+    action_taken: str | None = None,
+    blocked: bool = False,
+    metadata: dict | None = None,
+) -> dict[str, Any]:
+    """Persist a security event and trigger auto-ban logic if thresholds are hit."""
+    country = "Local Network"
+    if ip_address:
+        country = await get_ip_country(ip_address)
+
+    row = await pool.fetchrow(
+        """
+        INSERT INTO security_events
+            (ip_address, user_agent, session_id, event_type, severity,
+             payload, source, action_taken, blocked, metadata_json, country)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING *
+        """,
+        ip_address,
+        user_agent,
+        session_id,
+        event_type,
+        severity,
+        (payload[:2000] if payload else None),
+        source,
+        action_taken,
+        blocked,
+        json.dumps(metadata) if metadata else None,
+        country,
+    )
+    result = dict_row(row) or {}
+
+    # Auto-ban logic — only for IPs we can identify
+    if ip_address and blocked:
+        await _maybe_auto_ban(pool, ip_address)
+
+    return result
+
+
+async def _maybe_auto_ban(pool, ip_address: str) -> None:
+    """Check violation counts and issue automatic bans when thresholds are exceeded."""
+    # Total all-time blocked events for this IP
+    total = int(
+        await pool.fetchval(
+            "SELECT count(*) FROM security_events WHERE ip_address = $1 AND blocked = TRUE",
+            ip_address,
+        ) or 0
+    )
+
+    # Recent violations within rolling window
+    recent = int(
+        await pool.fetchval(
+            """
+            SELECT count(*) FROM security_events
+            WHERE ip_address = $1 AND blocked = TRUE
+              AND created_at >= now() - interval '1 hour'
+            """,
+            ip_address,
+        ) or 0
+    )
+
+    # Check if already actively blocked
+    already_blocked = await pool.fetchval(
+        """
+        SELECT id FROM blocked_ips
+        WHERE ip_address = $1 AND is_active = TRUE
+          AND (expires_at IS NULL OR expires_at > now())
+        """,
+        ip_address,
+    )
+    if already_blocked:
+        return
+
+    if total >= _AUTO_BAN_PERM_THRESHOLD:
+        await upsert_blocked_ip(
+            pool,
+            ip_address=ip_address,
+            reason=f"Auto-banned: {total} total violations",
+            blocked_by="system",
+            block_type="permanent",
+            expires_at=None,
+        )
+    elif recent >= _AUTO_BAN_TEMP_THRESHOLD:
+        from datetime import datetime, timezone, timedelta
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        await upsert_blocked_ip(
+            pool,
+            ip_address=ip_address,
+            reason=f"Auto-banned: {recent} violations in 1 hour",
+            blocked_by="system",
+            block_type="temporary",
+            expires_at=expires,
+        )
+
+
+async def get_security_events(
+    pool,
+    limit: int = 100,
+    offset: int = 0,
+    event_type: str | None = None,
+    severity: str | None = None,
+    ip_address: str | None = None,
+) -> list[dict[str, Any]]:
+    """Paginated security event history with optional filters."""
+    conditions = []
+    params: list[Any] = []
+
+    if event_type:
+        params.append(event_type)
+        conditions.append(f"event_type = ${len(params)}")
+    if severity:
+        params.append(severity)
+        conditions.append(f"severity = ${len(params)}")
+    if ip_address:
+        params.append(ip_address)
+        conditions.append(f"ip_address = ${len(params)}")
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.extend([limit, offset])
+
+    rows = await pool.fetch(
+        f"""
+        SELECT * FROM security_events
+        {where}
+        ORDER BY created_at DESC
+        LIMIT ${len(params) - 1} OFFSET ${len(params)}
+        """,
+        *params,
+    )
+    return dict_rows(rows)
+
+
+async def get_security_events_summary(pool) -> dict[str, Any]:
+    """Extended security summary based entirely on the security_events and blocked_ips tables."""
+    total_events = int(await pool.fetchval("SELECT count(*) FROM security_events") or 0)
+    last_24h_events = int(await pool.fetchval(
+        "SELECT count(*) FROM security_events WHERE created_at >= now() - interval '24 hours'"
+    ) or 0)
+
+    prompt_guard_detections = int(await pool.fetchval(
+        "SELECT count(*) FROM security_events WHERE event_type = 'prompt_injection'"
+    ) or 0)
+    policy_violations = int(await pool.fetchval(
+        "SELECT count(*) FROM security_events WHERE event_type = 'policy_violation'"
+    ) or 0)
+
+    by_type = await pool.fetch(
+        "SELECT event_type, count(*) AS count FROM security_events GROUP BY event_type ORDER BY count DESC"
+    )
+    by_severity = await pool.fetch(
+        "SELECT severity, count(*) AS count FROM security_events GROUP BY severity ORDER BY count DESC"
+    )
+
+    # Active bans count only records from blocked_ips table
+    total_blocked_ips = int(await pool.fetchval(
+        "SELECT count(*) FROM blocked_ips WHERE is_active = TRUE AND (expires_at IS NULL OR expires_at > now())"
+    ) or 0)
+    temp_bans = int(await pool.fetchval(
+        "SELECT count(*) FROM blocked_ips WHERE is_active = TRUE AND block_type = 'temporary' AND (expires_at IS NULL OR expires_at > now())"
+    ) or 0)
+    perm_bans = int(await pool.fetchval(
+        "SELECT count(*) FROM blocked_ips WHERE is_active = TRUE AND block_type = 'permanent'"
+    ) or 0)
+
+    return {
+        # Keep old keys for safety, but point them to the correct metrics if needed
+        "total_blocks": total_events,
+        "last_24h_blocks": last_24h_events,
+        "prompt_guard_blocks": prompt_guard_detections,
+        "policy_blocks": policy_violations,
+        "output_scan_blocks": 0,
+        
+        # New keys
+        "total_events": total_events,
+        "last_24h_events": last_24h_events,
+        "prompt_guard_detections": prompt_guard_detections,
+        "policy_violations": policy_violations,
+        "events_by_type": dict_rows(by_type),
+        "events_by_severity": dict_rows(by_severity),
+        "total_blocked_ips": total_blocked_ips,
+        "temp_bans": temp_bans,
+        "perm_bans": perm_bans,
+    }
+
+
+async def get_top_attacking_ips(pool, limit: int = 20) -> list[dict[str, Any]]:
+    """IPs with the most security events, including their block status."""
+    rows = await pool.fetch(
+        """
+        SELECT
+            se.ip_address,
+            count(*) AS attack_count,
+            count(*) FILTER (WHERE se.blocked = TRUE) AS blocked_count,
+            max(se.created_at) AS last_seen,
+            bool_or(bi.is_active AND (bi.expires_at IS NULL OR bi.expires_at > now())) AS is_blocked,
+            max(bi.block_type) AS block_type
+        FROM security_events se
+        LEFT JOIN blocked_ips bi ON bi.ip_address = se.ip_address
+        WHERE se.ip_address IS NOT NULL
+        GROUP BY se.ip_address
+        ORDER BY attack_count DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    return dict_rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Blocked IPs
+# ---------------------------------------------------------------------------
+
+async def is_ip_blocked(pool, ip_address: str) -> bool:
+    """Return True if the IP has an active block (temporary or permanent)."""
+    if not ip_address:
+        return False
+    row = await pool.fetchrow(
+        """
+        SELECT id FROM blocked_ips
+        WHERE ip_address = $1
+          AND is_active = TRUE
+          AND (expires_at IS NULL OR expires_at > now())
+        """,
+        ip_address,
+    )
+    return row is not None
+
+
+async def upsert_blocked_ip(
+    pool,
+    *,
+    ip_address: str,
+    reason: str | None,
+    blocked_by: str = "admin",
+    block_type: str = "temporary",
+    expires_at=None,
+) -> dict[str, Any]:
+    """Insert or update a blocked IP entry."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO blocked_ips (ip_address, reason, blocked_by, block_type, expires_at, is_active)
+        VALUES ($1, $2, $3, $4, $5, TRUE)
+        ON CONFLICT (ip_address) DO UPDATE SET
+            reason     = EXCLUDED.reason,
+            blocked_by = EXCLUDED.blocked_by,
+            block_type = EXCLUDED.block_type,
+            expires_at = EXCLUDED.expires_at,
+            is_active  = TRUE,
+            created_at = now()
+        RETURNING *
+        """,
+        ip_address,
+        reason,
+        blocked_by,
+        block_type,
+        expires_at,
+    )
+    return dict_row(row) or {}
+
+
+async def unblock_ip(pool, ip_address: str) -> bool:
+    """Deactivate a blocked IP. Returns True if an active block was found and cleared."""
+    result = await pool.execute(
+        """
+        UPDATE blocked_ips
+        SET is_active = FALSE
+        WHERE ip_address = $1 AND is_active = TRUE
+        """,
+        ip_address,
+    )
+    return result != "UPDATE 0"
+
+
+async def list_blocked_ips(pool, include_inactive: bool = False) -> list[dict[str, Any]]:
+    """List all blocked IPs optionally including expired/inactive ones."""
+    where = "" if include_inactive else "WHERE is_active = TRUE AND (expires_at IS NULL OR expires_at > now())"
+    rows = await pool.fetch(
+        f"SELECT * FROM blocked_ips {where} ORDER BY created_at DESC"
+    )
+    return dict_rows(rows)
+
+
+async def get_security_timeline(pool, hours: int = 24) -> list[dict[str, Any]]:
+    """Event counts per hour over the last N hours for chart display."""
+    rows = await pool.fetch(
+        """
+        SELECT
+            date_trunc('hour', created_at) AS hour,
+            count(*) AS total,
+            count(*) FILTER (WHERE blocked = TRUE) AS blocked_count
+        FROM security_events
+        WHERE created_at >= now() - ($1 || ' hours')::interval
+        GROUP BY 1
+        ORDER BY 1
+        """,
+        str(hours),
+    )
+    return dict_rows(rows)
