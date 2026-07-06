@@ -554,14 +554,6 @@ async def admin_settings_status(_: Annotated[None, Depends(check_admin_auth)]) -
     ai_status = "Connected" if llm_client.enabled else "Not Configured"
     lead_enabled = bool(settings.crm_webhook_url)
     
-    # Dynamic DB connection status check
-    db_status = "Connected"
-    try:
-        pool = await get_pool()
-        await pool.execute("SELECT 1")
-    except Exception:
-        db_status = "Disconnected"
-    
     return {
         "ai_provider": {
             "provider": config.PROVIDER.title(),
@@ -576,12 +568,6 @@ async def admin_settings_status(_: Annotated[None, Depends(check_admin_auth)]) -
         "current_user": {
             "username": "admin",
             "role": "System Administrator"
-        },
-        "database": {
-            "status": db_status
-        },
-        "api_gateway": {
-            "status": "Connected"
         }
     }
 
