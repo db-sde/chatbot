@@ -12,16 +12,10 @@ from typing import Any
 from llm.types import ProviderCapability, TaskConfig
 
 
-# Reproduce pre-Phase-B defaults: Groq for chat/tool tasks, Gemini for JSON + embeddings.
 DEFAULT_TASKS: dict[str, dict[str, Any]] = {
-    "embedding": {
-        "provider": "gemini",
-        "model": "models/text-embedding-004",
-        "capabilities_required": ["embeddings"],
-    },
     "entity_resolution": {
-        "provider": "gemini",
-        "model": "gemini-2.5-flash",
+        "provider": "groq",
+        "model": "llama-3.3-70b-versatile",
         "json_mode": True,
         "capabilities_required": ["text", "json"],
     },
@@ -50,8 +44,8 @@ DEFAULT_TASKS: dict[str, dict[str, Any]] = {
         ],
     },
     "lead_intent": {
-        "provider": "gemini",
-        "model": "gemini-2.5-flash",
+        "provider": "groq",
+        "model": "llama-3.3-70b-versatile",
         "json_mode": True,
         "capabilities_required": ["text", "json"],
     },

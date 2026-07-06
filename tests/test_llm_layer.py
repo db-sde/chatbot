@@ -121,7 +121,6 @@ def test_langchain_tools_to_specs():
 def test_default_registry_tasks():
     registry = ModelRegistry()
     assert set(registry.list_tasks()) == {
-        "embedding",
         "entity_resolution",
         "agent_decide",
         "synthesize",
@@ -202,24 +201,6 @@ async def test_manager_generate_json(patch_factory):
     result = await manager.generate_json("test_task", "extract")
     assert result == {"ok": True}
 
-
-@pytest.mark.asyncio
-async def test_manager_embed_uses_embedding_capable_provider(patch_factory):
-    adapters = patch_factory
-    adapters["fake-embedding"] = FakeEmbeddingAdapter()
-
-    registry = ModelRegistry.__new__(ModelRegistry)
-    registry.tasks = {
-        "embed_task": TaskConfig(
-            provider="fake-embedding",
-            model="e1",
-            capabilities_required=ProviderCapability.EMBEDDINGS,
-        )
-    }
-
-    manager = LLMManager(registry)
-    vec = await manager.embed("embed_task", "text")
-    assert vec == [0.1, 0.2, 0.3]
 
 
 @pytest.mark.asyncio

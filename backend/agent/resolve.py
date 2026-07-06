@@ -87,10 +87,6 @@ Return ONLY a JSON object with the following keys. Do not explain, do not add ma
     return extracted
 
 
-async def _get_embedding(text: str) -> list[float] | None:
-    return await llm_client.embed(text)
-
-
 async def _snap(entity_type: str, name: str | None) -> str | None:
     if not name:
         return None
@@ -114,23 +110,6 @@ async def _snap(entity_type: str, name: str | None) -> str | None:
     threshold = 85 if len(name) < 5 else 80
     if best_row and best_score >= threshold:
         return await queries.slug_for_entity_id(pool, entity_type, best_row["entity_id"])
-
-    # Fallback: Embedding similarity
-    embedding = await _get_embedding(name)
-    if embedding:
-        row = await pool.fetchrow(
-            """
-            SELECT entity_id, embedding <=> $2::vector AS distance
-            FROM entity_search
-            WHERE entity_type = $1 AND embedding IS NOT NULL
-            ORDER BY distance ASC
-            LIMIT 1
-            """,
-            entity_type,
-            embedding,
-        )
-        if row and row["distance"] < 0.4:
-            return await queries.slug_for_entity_id(pool, entity_type, row["entity_id"])
 
     return None
 

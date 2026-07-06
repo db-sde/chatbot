@@ -183,23 +183,6 @@ class LLMManager:
             return safe_parse_json(text)
         return safe_parse_json(response.content)
 
-    async def embed(self, task_name: str, text: str) -> list[float]:
-        """Generate embeddings for a single text."""
-        chain = self.registry.resolve_chain(task_name)
-        if not chain:
-            raise RuntimeError(f"No provider available for task {task_name}")
-
-        for cfg, adapter in chain:
-            if not adapter.capabilities & ProviderCapability.EMBEDDINGS:
-                continue
-            try:
-                embeddings = await adapter.embed([text])
-                return embeddings[0] if embeddings else []
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("embed failed for task=%s provider=%s: %s", task_name, cfg.provider, exc)
-
-        raise RuntimeError(f"No embedding provider available for task {task_name}")
-
     def get_chat_model(self, task_name: str) -> Any:
         """Return a LangChain chat model for direct use by LangGraph.
 

@@ -14,15 +14,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from langchain_core.messages import HumanMessage
 
 from llm import LLMManager, ModelRegistry
-from llm.types import LLMResponse, ProviderCapability, ToolSpec
-from observability import (
-    mark_first_token,
-    mark_llm_start,
-    record_llm_call_duration,
-)
+from llm.types import LLMResponse, ToolSpec
+
 from settings import settings
 
 logger = logging.getLogger(__name__)
@@ -118,14 +113,6 @@ class LLMClient:
         except Exception as exc:
             logger.warning("generate_json failed: %s", exc)
             return {}
-
-    async def embed(self, text: str) -> list[float] | None:
-        """Generate an embedding vector for the supplied text."""
-        try:
-            return await self._manager.embed("embedding", text)
-        except Exception as exc:
-            logger.warning("embed failed: %s", exc)
-            return None
 
     async def generate(
         self,

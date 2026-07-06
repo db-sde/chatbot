@@ -122,6 +122,10 @@ export const api = {
     return request("/analytics/funnel");
   },
 
+  async getAnalyticsLeads() {
+    return request("/analytics/leads");
+  },
+
   async getWidgetSettings(siteId) {
     return request(`/widget-settings/${encodeURIComponent(siteId)}`);
   },
