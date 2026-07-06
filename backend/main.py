@@ -93,40 +93,26 @@ class LeadRequest(BaseModel):
     course_interest: str | None = None
 
 
-class WidgetSettingsRequest(BaseModel):
-    show_estimated_wait_time: bool = True
-    sound_notifications: bool = True
-    desktop_notifications: bool = True
-    mobile_message_preview: bool = True
-    agent_typing_indicator: bool = True
-    visitor_typing_indicator: bool = True
-    browser_tab_notifications: bool = True
-    hide_when_offline: bool = False
-    hide_on_desktop: bool = False
-    hide_on_mobile: bool = False
-    offline_if_no_agents: bool = False
-    emoji_picker_enabled: bool = True
-    file_upload_enabled: bool = True
-    chat_rating_enabled: bool = True
-    email_transcript_enabled: bool = True
-
-
 class WidgetSettingsUpdate(BaseModel):
-    show_estimated_wait_time: bool | None = None
-    sound_notifications: bool | None = None
-    desktop_notifications: bool | None = None
-    mobile_message_preview: bool | None = None
-    agent_typing_indicator: bool | None = None
-    visitor_typing_indicator: bool | None = None
-    browser_tab_notifications: bool | None = None
-    hide_when_offline: bool | None = None
-    hide_on_desktop: bool | None = None
-    hide_on_mobile: bool | None = None
-    offline_if_no_agents: bool | None = None
-    emoji_picker_enabled: bool | None = None
-    file_upload_enabled: bool | None = None
-    chat_rating_enabled: bool | None = None
-    email_transcript_enabled: bool | None = None
+    # Branding
+    primary_color: str | None = None
+    widget_title: str | None = None
+    bot_name: str | None = None
+    welcome_message: str | None = None
+    logo_url: str | None = None
+
+    # Behavior
+    show_on_mobile: bool | None = None
+    show_on_desktop: bool | None = None
+
+    # Lead capture
+    lead_capture_enabled: bool | None = None
+    capture_name: bool | None = None
+    capture_email: bool | None = None
+    capture_phone: bool | None = None
+    lead_trigger: str | None = None
+    lead_form_title: str | None = None
+    lead_form_description: str | None = None
 
 
 
@@ -439,17 +425,17 @@ async def admin_site_domains(_: Annotated[None, Depends(check_admin_auth)]) -> d
 
 
 @app.get("/api/admin/widget-settings")
-async def admin_list_widget_settings(_: Annotated[None, Depends(check_admin_auth)]) -> list[dict]:
-    """List widget settings for all configured sites."""
+async def admin_list_widget_settings(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Get the global widget settings."""
     pool = await get_pool()
-    return await queries.list_widget_settings(pool)
+    return await queries.get_widget_settings(pool)
 
 
 @app.get("/api/admin/widget-settings/{site_id}")
 async def admin_get_widget_settings(site_id: str, _: Annotated[None, Depends(check_admin_auth)]) -> dict:
-    """Get widget settings for a specific site."""
+    """Get the global widget settings (site_id ignored)."""
     pool = await get_pool()
-    return await queries.get_widget_settings(pool, site_id)
+    return await queries.get_widget_settings(pool)
 
 
 @app.put("/api/admin/widget-settings/{site_id}")
@@ -458,44 +444,60 @@ async def admin_update_widget_settings(
     body: WidgetSettingsUpdate = Body(...),
     _: Annotated[None, Depends(check_admin_auth)] = None,
 ) -> dict:
-    """Update widget settings for a specific site."""
+    """Update global widget settings (site_id ignored)."""
     pool = await get_pool()
     update = {k: v for k, v in body.model_dump().items() if v is not None}
-    return await queries.upsert_widget_settings(pool, site_id, update)
+    return await queries.upsert_widget_settings(pool, "default", update)
 
 
-@app.get("/public/widget-settings")
+@app.get("/widget/config")
 @limiter.limit("60/minute")
-async def public_widget_settings(request: Request, site_key: str) -> dict:
+async def get_widget_config(request: Request) -> dict:
     """Public endpoint for the widget to fetch its runtime configuration.
 
-    Only safe, widget-facing settings are exposed.  site_key is validated
-    against allowed origins just like /chat.
+    Validates that the Origin/Referer header matches configured site domains.
+    Returns nested branding, behavior, and lead capture settings.
     """
-    validate_site_request(site_key, request.headers.get("origin"), request.headers.get("referer"))
-    pool = await get_pool()
-    row = await queries.get_widget_settings(pool, site_key)
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+    
+    # Validate origin/referer against allowed site domains
+    from auth import _host
+    host = _host(origin) or _host(referer)
+    if host is not None:
+        allowed = False
+        for domains in settings.site_domains.values():
+            if any(host == domain or host.endswith(f".{domain}") for domain in domains):
+                allowed = True
+                break
+        if not allowed:
+            raise HTTPException(status_code=403, detail="Origin not allowed")
 
-    # Strip internal/admin-only fields before returning to the browser.
-    safe_keys = [
-        "site_id",
-        "show_estimated_wait_time",
-        "sound_notifications",
-        "desktop_notifications",
-        "mobile_message_preview",
-        "agent_typing_indicator",
-        "visitor_typing_indicator",
-        "browser_tab_notifications",
-        "hide_when_offline",
-        "hide_on_desktop",
-        "hide_on_mobile",
-        "offline_if_no_agents",
-        "emoji_picker_enabled",
-        "file_upload_enabled",
-        "chat_rating_enabled",
-        "email_transcript_enabled",
-    ]
-    return {k: row.get(k) for k in safe_keys}
+    pool = await get_pool()
+    row = await queries.get_widget_settings(pool)
+
+    return {
+        "branding": {
+            "primary_color": row.get("primary_color") or "#135d66",
+            "widget_title": row.get("widget_title") or "DegreeBaba Assistant",
+            "bot_name": row.get("bot_name") or "DegreeBaba Assistant",
+            "welcome_message": row.get("welcome_message") or "Hello! Ask me about colleges, courses, admissions and fees.",
+            "logo_url": row.get("logo_url")
+        },
+        "behavior": {
+            "show_on_mobile": row.get("show_on_mobile") if row.get("show_on_mobile") is not None else True,
+            "show_on_desktop": row.get("show_on_desktop") if row.get("show_on_desktop") is not None else True
+        },
+        "lead_capture": {
+            "lead_capture_enabled": row.get("lead_capture_enabled") if row.get("lead_capture_enabled") is not None else True,
+            "capture_name": row.get("capture_name") if row.get("capture_name") is not None else True,
+            "capture_email": row.get("capture_email") if row.get("capture_email") is not None else True,
+            "capture_phone": row.get("capture_phone") if row.get("capture_phone") is not None else True,
+            "lead_trigger": row.get("lead_trigger") or "during_chat",
+            "lead_form_title": row.get("lead_form_title") or "Request callback",
+            "lead_form_description": row.get("lead_form_description") or "A counsellor can follow up with you."
+        }
+    }
 
 
 widget_dir = os.path.join(

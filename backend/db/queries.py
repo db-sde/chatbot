@@ -942,34 +942,35 @@ async def get_lead_intent_analytics(pool) -> dict[str, Any]:
 # Widget settings
 # ---------------------------------------------------------------------------
 
-_WIDGET_SETTINGS_COLUMNS = [
-    "show_estimated_wait_time",
-    "sound_notifications",
-    "desktop_notifications",
-    "mobile_message_preview",
-    "agent_typing_indicator",
-    "visitor_typing_indicator",
-    "browser_tab_notifications",
-    "hide_when_offline",
-    "hide_on_desktop",
-    "hide_on_mobile",
-    "offline_if_no_agents",
-    "emoji_picker_enabled",
-    "file_upload_enabled",
-    "chat_rating_enabled",
-    "email_transcript_enabled",
+_WIDGET_SETTINGS_BOOL_COLUMNS = [
+    "show_on_mobile",
+    "show_on_desktop",
+    "lead_capture_enabled",
+    "capture_name",
+    "capture_email",
+    "capture_phone",
+]
+
+_WIDGET_SETTINGS_TEXT_COLUMNS = [
+    "primary_color",
+    "widget_title",
+    "bot_name",
+    "welcome_message",
+    "logo_url",
+    "lead_trigger",
+    "lead_form_title",
+    "lead_form_description",
 ]
 
 
-async def get_widget_settings(pool, site_id: str) -> dict[str, Any]:
-    """Return widget settings for a site, creating defaults if missing."""
+async def get_widget_settings(pool, site_id: str = "default") -> dict[str, Any]:
+    """Return the global widget settings, creating defaults if missing."""
     row = await pool.fetchrow(
         """
         SELECT *
         FROM widget_settings
-        WHERE site_id = $1
-        """,
-        site_id,
+        WHERE site_id = 'default'
+        """
     )
     if row:
         return dict_row(row) or {}
@@ -977,18 +978,16 @@ async def get_widget_settings(pool, site_id: str) -> dict[str, Any]:
     await pool.execute(
         """
         INSERT INTO widget_settings (site_id)
-        VALUES ($1)
+        VALUES ('default')
         ON CONFLICT (site_id) DO NOTHING
-        """,
-        site_id,
+        """
     )
     row = await pool.fetchrow(
         """
         SELECT *
         FROM widget_settings
-        WHERE site_id = $1
-        """,
-        site_id,
+        WHERE site_id = 'default'
+        """
     )
     return dict_row(row) or {}
 
@@ -999,13 +998,22 @@ async def upsert_widget_settings(
     settings: dict[str, Any],
     updated_by: str | None = None,
 ) -> dict[str, Any]:
-    """Update widget settings for a site.  Only known boolean columns are written."""
+    """Update global widget settings. Ignores site_id and writes only configured columns."""
     columns = []
     values = []
-    for col in _WIDGET_SETTINGS_COLUMNS:
+    
+    # Process boolean settings
+    for col in _WIDGET_SETTINGS_BOOL_COLUMNS:
         if col in settings:
             columns.append(col)
             values.append(bool(settings[col]))
+            
+    # Process text/string settings
+    for col in _WIDGET_SETTINGS_TEXT_COLUMNS:
+        if col in settings:
+            columns.append(col)
+            val = settings[col]
+            values.append(str(val) if val is not None else None)
 
     if columns:
         set_clause = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(columns))
@@ -1023,10 +1031,10 @@ async def upsert_widget_settings(
             updated_by,
         )
 
-    return await get_widget_settings(pool, site_id)
+    return await get_widget_settings(pool)
 
 
 async def list_widget_settings(pool) -> list[dict[str, Any]]:
-    """Return widget settings for all sites."""
-    rows = await pool.fetch("SELECT * FROM widget_settings ORDER BY site_id")
-    return dict_rows(rows)
+    """Return the global widget settings as a list with a single element for compatibility."""
+    row = await get_widget_settings(pool)
+    return [row]

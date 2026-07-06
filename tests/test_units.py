@@ -92,12 +92,10 @@ def test_auth_host_parsing():
 def test_validate_site_request_success(monkeypatch):
     # Set site domains mock to avoid config dependencies
     monkeypatch.setattr(auth.settings, "allowed_site_keys", '{"test_key":["localhost"]}')
-    # Host is localhost
+    # Host is localhost (allowed)
     auth.validate_site_request("test_key", "http://localhost:8080", None)
-    # Check that invalid site key raises 403
-    with pytest.raises(HTTPException) as exc:
-        auth.validate_site_request("invalid_key", "http://localhost:8080", None)
-    assert exc.value.status_code == 403
+    # Invalid key but allowed origin (passes since validation is now origin-only)
+    auth.validate_site_request("invalid_key", "http://localhost:8080", None)
 
     # Check that mismatched origin/referer raises 403
     with pytest.raises(HTTPException) as exc:

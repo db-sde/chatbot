@@ -1,39 +1,33 @@
 (function () {
   const script = document.currentScript;
-  const siteKey = script && script.dataset.siteKey;
-  const apiBase = script && script.dataset.apiBase;
-  if (!siteKey || !apiBase) {
-    console.error("DegreeBaba widget: data-site-key and data-api-base are required.");
-    return;
-  }
+  const scriptSrc = script ? script.src : "";
+  const apiBase = (script && script.dataset.apiBase) || (scriptSrc && scriptSrc.startsWith("http") ? new URL(scriptSrc).origin : window.location.origin);
   const pageSlug = (script && script.dataset.universitySlug) || location.pathname.split("/").filter(Boolean).pop() || null;
   const storageKey = "degreebaba_ai_session_id";
   const sessionId = localStorage.getItem(storageKey) || crypto.randomUUID();
   localStorage.setItem(storageKey, sessionId);
 
   // -------------------------------------------------------------------------
-  // Default widget configuration.  These values are used until the public
-  // /public/widget-settings endpoint returns site-specific overrides.
+  // Default widget configuration. Loaded dynamically from /widget/config
   // -------------------------------------------------------------------------
-  const DEFAULT_SETTINGS = {
-    show_estimated_wait_time: true,
-    sound_notifications: true,
-    desktop_notifications: true,
-    mobile_message_preview: true,
-    agent_typing_indicator: true,
-    visitor_typing_indicator: true,
-    browser_tab_notifications: true,
-    hide_when_offline: false,
-    hide_on_desktop: false,
-    hide_on_mobile: false,
-    offline_if_no_agents: false,
-    emoji_picker_enabled: true,
-    file_upload_enabled: true,
-    chat_rating_enabled: true,
-    email_transcript_enabled: true,
-  };
+  const settings = {
+    primary_color: "#135d66",
+    widget_title: "DegreeBaba Assistant",
+    bot_name: "DegreeBaba Assistant",
+    welcome_message: "Hello! Ask me about colleges, courses, admissions and fees.",
+    logo_url: "",
+    
+    show_on_mobile: true,
+    show_on_desktop: true,
 
-  const settings = { ...DEFAULT_SETTINGS };
+    lead_capture_enabled: true,
+    capture_name: true,
+    capture_email: true,
+    capture_phone: true,
+    lead_trigger: "during_chat",
+    lead_form_title: "Request callback",
+    lead_form_description: "A counsellor can follow up with you."
+  };
 
   // -------------------------------------------------------------------------
   // Device detection
@@ -42,93 +36,22 @@
   const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || (isTouch && window.innerWidth <= 768);
 
   // -------------------------------------------------------------------------
-  // Sound notification — single base64 "pop" for new messages
+  // Sound notification
   // -------------------------------------------------------------------------
   const AUDIO_SRC = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAAAAAA==";
   const audioCtx = typeof AudioContext !== "undefined" ? new AudioContext() : null;
 
   async function playSound() {
-    if (!settings.sound_notifications) return;
     try {
       if (audioCtx && audioCtx.state === "suspended") await audioCtx.resume();
       const audio = new Audio(AUDIO_SRC);
       audio.volume = 0.4;
       await audio.play();
-    } catch (_) {
-      // Browsers block audio until user interaction; ignore.
-    }
+    } catch (_) {}
   }
 
   // -------------------------------------------------------------------------
-  // Desktop / browser-tab notifications
-  // -------------------------------------------------------------------------
-  async function requestDesktopPermission() {
-    if (!settings.desktop_notifications || !("Notification" in window)) return false;
-    if (Notification.permission === "granted") return true;
-    if (Notification.permission === "default") {
-      const permission = await Notification.requestPermission();
-      return permission === "granted";
-    }
-    return false;
-  }
-
-  function showDesktopNotification(title, body) {
-    if (!settings.desktop_notifications || !("Notification" in window)) return;
-    if (document.hidden && Notification.permission === "granted") {
-      try {
-        new Notification(title, { body, icon: "", tag: "degreebaba-msg" });
-      } catch (_) {}
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Browser tab title notifications
-  // -------------------------------------------------------------------------
-  let originalTitle = document.title;
-  let unreadCount = 0;
-  let titleFlashInterval = null;
-
-  function startTitleFlash() {
-    if (!settings.browser_tab_notifications || titleFlashInterval) return;
-    titleFlashInterval = setInterval(() => {
-      document.title = document.title === originalTitle ? `(${unreadCount}) New message — ${originalTitle}` : originalTitle;
-    }, 1200);
-  }
-
-  function stopTitleFlash() {
-    if (titleFlashInterval) {
-      clearInterval(titleFlashInterval);
-      titleFlashInterval = null;
-    }
-    document.title = originalTitle;
-    unreadCount = 0;
-  }
-
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) stopTitleFlash();
-  });
-
-  // -------------------------------------------------------------------------
-  // Typing indicators
-  // -------------------------------------------------------------------------
-  let typingTimeout = null;
-  let lastTypingSent = 0;
-
-  function sendTypingEvent() {
-    if (!settings.visitor_typing_indicator) return;
-    const now = Date.now();
-    if (now - lastTypingSent < 1200) return;
-    lastTypingSent = now;
-    // Future endpoint: notify admin dashboard that visitor is typing.
-    // fetch(`${apiBase}/public/typing`, { method: "POST", ... })
-  }
-
-  function clearVisitorTyping() {
-    if (typingTimeout) clearTimeout(typingTimeout);
-  }
-
-  // -------------------------------------------------------------------------
-  // DOM
+  // DOM setup
   // -------------------------------------------------------------------------
   const host = document.createElement("div");
   host.id = "degreebaba-ai-widget";
@@ -137,53 +60,56 @@
 
   root.innerHTML = `
     <style>
-      :host { all: initial; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .bubble { position: fixed; right: 20px; bottom: 20px; width: 58px; height: 58px; border-radius: 50%; border: 0; background: #135d66; color: white; box-shadow: 0 12px 30px rgba(0,0,0,.22); cursor: pointer; font-size: 24px; z-index: 2147483647; display: flex; align-items: center; justify-content: center; }
+      :host {
+        --primary-color: #135d66;
+        all: initial;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .bubble { position: fixed; right: 20px; bottom: 20px; width: 58px; height: 58px; border-radius: 50%; border: 0; background: var(--primary-color); color: white; box-shadow: 0 12px 30px rgba(0,0,0,.22); cursor: pointer; font-size: 24px; z-index: 2147483647; display: flex; align-items: center; justify-content: center; transition: transform 0.2s ease; }
+      .bubble:hover { transform: scale(1.05); }
       .bubble.hidden { display: none !important; }
-      .panel { position: fixed; right: 20px; bottom: 90px; width: min(380px, calc(100vw - 32px)); height: min(620px, calc(100vh - 120px)); background: #ffffff; color: #172326; border: 1px solid #d7e1df; box-shadow: 0 18px 60px rgba(0,0,0,.22); display: none; flex-direction: column; z-index: 2147483647; border-radius: 8px; overflow: hidden; }
+      .panel { position: fixed; right: 20px; bottom: 90px; width: min(380px, calc(100vw - 32px)); height: min(620px, calc(100vh - 120px)); background: #ffffff; color: #172326; border: 1px solid #d7e1df; box-shadow: 0 18px 60px rgba(0,0,0,.22); display: none; flex-direction: column; z-index: 2147483647; border-radius: 12px; overflow: hidden; }
       .panel.open { display: flex; }
-      .head { padding: 14px 16px; background: #135d66; color: white; display: flex; justify-content: space-between; align-items: center; font-weight: 700; }
+      .head { padding: 14px 16px; background: var(--primary-color); color: white; display: flex; justify-content: space-between; align-items: center; font-weight: 700; }
+      .head .title-area { display: flex; align-items: center; gap: 8px; }
+      .head .logo { width: 24px; height: 24px; border-radius: 50%; object-fit: cover; background: white; }
       .head .status { font-size: 11px; font-weight: 500; opacity: 0.9; margin-top: 2px; }
       .close { border: 0; background: transparent; color: white; font-size: 22px; cursor: pointer; }
       .msgs { flex: 1; overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; background: #f7faf9; }
       .msg { max-width: 84%; padding: 10px 12px; border-radius: 8px; line-height: 1.38; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
-      .user { align-self: flex-end; background: #135d66; color: white; }
+      .user { align-self: flex-end; background: var(--primary-color); color: white; }
       .bot { align-self: flex-start; background: white; border: 1px solid #d7e1df; color: #172326; }
       .history-divider { align-self: stretch; text-align: center; font-size: 11px; color: #9ca3af; padding: 4px 0 8px; display: flex; align-items: center; gap: 8px; }
       .history-divider::before, .history-divider::after { content: ""; flex: 1; height: 1px; background: #d7e1df; }
-      .load-more { align-self: center; background: none; border: 1px solid #b9cbc8; color: #135d66; padding: 5px 14px; border-radius: 999px; cursor: pointer; font-size: 12px; margin-bottom: 4px; }
+      .load-more { align-self: center; background: none; border: 1px solid #b9cbc8; color: var(--primary-color); padding: 5px 14px; border-radius: 999px; cursor: pointer; font-size: 12px; margin-bottom: 4px; }
       .load-more:hover { background: #eef4f3; }
       .chips { display: flex; gap: 8px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid #e7eeee; background: white; }
-      .chip { border: 1px solid #b9cbc8; background: white; color: #135d66; padding: 7px 10px; border-radius: 999px; cursor: pointer; font-size: 13px; }
+      .chip { border: 1px solid #b9cbc8; background: white; color: var(--primary-color); padding: 7px 10px; border-radius: 999px; cursor: pointer; font-size: 13px; }
       .composer { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #e7eeee; background: white; align-items: center; }
-      .composer-actions { display: flex; gap: 4px; }
-      .composer-btn { border: 0; background: transparent; color: #6b7d7a; cursor: pointer; font-size: 18px; padding: 6px; border-radius: 6px; }
-      .composer-btn:hover { background: #eef4f3; }
-      .composer-btn.hidden { display: none; }
       input { flex: 1; border: 1px solid #b9cbc8; border-radius: 6px; padding: 10px; font: inherit; min-width: 0; }
-      .send, .lead button { border: 0; border-radius: 6px; background: #135d66; color: white; padding: 10px 12px; cursor: pointer; font: inherit; }
-      .lead { display: grid; gap: 8px; padding: 10px; border: 1px solid #d7e1df; background: white; border-radius: 8px; }
-      .lead .skip { background: #eef4f3; color: #135d66; }
+      .send, .lead button { border: 0; border-radius: 6px; background: var(--primary-color); color: white; padding: 10px 12px; cursor: pointer; font: inherit; }
+      .lead { display: grid; gap: 8px; padding: 12px; border: 1px solid #d7e1df; background: white; border-radius: 8px; }
+      .lead input { width: 100%; box-sizing: border-box; }
+      .lead .skip { background: #eef4f3; color: var(--primary-color); border: 0; border-radius: 6px; padding: 8px; cursor: pointer; font-size: 12px; }
       .typing { align-self: flex-start; display: flex; gap: 5px; align-items: center; padding: 10px 14px; background: white; border: 1px solid #d7e1df; border-radius: 8px; }
-      .typing span { width: 7px; height: 7px; border-radius: 50%; background: #135d66; opacity: .4; animation: blink 1.2s infinite; }
+      .typing span { width: 7px; height: 7px; border-radius: 50%; background: var(--primary-color); opacity: .4; animation: blink 1.2s infinite; }
       .typing span:nth-child(2) { animation-delay: .2s; }
       .typing span:nth-child(3) { animation-delay: .4s; }
       @keyframes blink { 0%,80%,100% { opacity:.4; transform:scale(1); } 40% { opacity:1; transform:scale(1.25); } }
-      .offline-badge { align-self: center; font-size: 11px; color: #9ca3af; padding: 4px 0; }
-      .rating { align-self: flex-start; display: flex; gap: 8px; padding: 8px 0; }
-      .rating button { border: 1px solid #b9cbc8; background: white; border-radius: 999px; padding: 6px 12px; cursor: pointer; font-size: 12px; }
-      .rating button:hover { background: #eef4f3; }
       @media (max-width: 768px) {
         .panel { right: 10px; bottom: 80px; width: calc(100vw - 20px); height: calc(100vh - 100px); }
         .bubble { right: 10px; bottom: 10px; }
       }
     </style>
-    <button class="bubble" aria-label="Open DegreeBaba chat">💬</button>
-    <section class="panel" aria-label="DegreeBaba AI Chat">
+    <button class="bubble" aria-label="Open chat">💬</button>
+    <section class="panel" aria-label="AI Chat">
       <div class="head">
-        <div>
-          <span>DegreeBaba AI</span>
-          <div class="status" id="db-status">Online</div>
+        <div class="title-area">
+          <img class="logo" style="display:none;" />
+          <div>
+            <span id="db-title">DegreeBaba Assistant</span>
+            <div class="status">AI Advisor online</div>
+          </div>
         </div>
         <button class="close" aria-label="Close">×</button>
       </div>
@@ -194,10 +120,6 @@
         <button class="chip">Talk to counsellor</button>
       </div>
       <form class="composer">
-        <div class="composer-actions">
-          <button type="button" class="composer-btn emoji-btn" title="Emoji">😊</button>
-          <button type="button" class="composer-btn upload-btn" title="Upload">📎</button>
-        </div>
         <input placeholder="Ask about fees, eligibility, admissions..." maxlength="4000" />
         <button class="send">Send</button>
       </form>
@@ -211,23 +133,18 @@
   const form = root.querySelector(".composer");
   const input = root.querySelector("input");
   const chips = root.querySelector(".chips");
-  const emojiBtn = root.querySelector(".emoji-btn");
-  const uploadBtn = root.querySelector(".upload-btn");
-  const statusEl = root.querySelector("#db-status");
+  const titleEl = root.querySelector("#db-title");
+  const logoEl = root.querySelector(".logo");
 
-  // Pagination state for history restoration
   let oldestLoadedId = null;
   let historyFullyLoaded = false;
   let isOpen = false;
   let conversationEnded = false;
-
-  function setStatus(text) {
-    if (statusEl) statusEl.textContent = text;
-  }
+  let leadFormTriggered = false;
 
   function shouldHideWidget() {
-    if (settings.hide_on_desktop && !isMobile) return true;
-    if (settings.hide_on_mobile && isMobile) return true;
+    if (settings.show_on_desktop === false && !isMobile) return true;
+    if (settings.show_on_mobile === false && isMobile) return true;
     return false;
   }
 
@@ -240,18 +157,19 @@
     }
   }
 
-  function applyComposerFeatures() {
-    if (!settings.emoji_picker_enabled) emojiBtn.classList.add("hidden");
-    else emojiBtn.classList.remove("hidden");
-
-    if (!settings.file_upload_enabled) uploadBtn.classList.add("hidden");
-    else uploadBtn.classList.remove("hidden");
-
-    if (settings.offline_if_no_agents) {
-      setStatus("Offline");
+  function applyConfig() {
+    // Apply styling properties
+    host.style.setProperty("--primary-color", settings.primary_color);
+    
+    // Apply texts
+    titleEl.textContent = settings.widget_title;
+    if (settings.logo_url) {
+      logoEl.src = settings.logo_url;
+      logoEl.style.display = "block";
     } else {
-      setStatus(settings.show_estimated_wait_time ? "Typically replies instantly" : "AI Advisor online");
+      logoEl.style.display = "none";
     }
+
   }
 
   function addMessage(text, role) {
@@ -288,13 +206,20 @@
       const url =
         `${apiBase}/api/session/history` +
         `?session_id=${encodeURIComponent(sessionId)}` +
-        `&site_key=${encodeURIComponent(siteKey)}` +
+        `&site_key=default` +
         `&limit=20`;
       const res = await fetch(url);
       if (!res.ok) return;
       const data = await res.json();
       const messages = data.messages || [];
-      if (messages.length === 0) return;
+      if (messages.length === 0) {
+        // Welcome message on new session
+        addMessage(settings.welcome_message, "bot");
+        if (settings.lead_capture_enabled && settings.lead_trigger === "before_chat") {
+          renderLeadForm();
+        }
+        return;
+      }
 
       oldestLoadedId = data.oldest_id;
       historyFullyLoaded = !data.has_more;
@@ -316,7 +241,7 @@
       const url =
         `${apiBase}/api/session/history` +
         `?session_id=${encodeURIComponent(sessionId)}` +
-        `&site_key=${encodeURIComponent(siteKey)}` +
+        `&site_key=default` +
         `&limit=20` +
         `&before_id=${oldestLoadedId}`;
       const res = await fetch(url);
@@ -331,15 +256,31 @@
   }
 
   function renderLeadForm(courseInterest) {
+    if (!settings.lead_capture_enabled || leadFormTriggered) return;
+    leadFormTriggered = true;
+    
     const box = document.createElement("form");
     box.className = "lead";
+    
+    let inputsHtml = "";
+    if (settings.capture_name) {
+      inputsHtml += `<input name="name" placeholder="Name" required style="padding: 8px; border: 1px solid #b9cbc8; border-radius: 4px;" />`;
+    }
+    if (settings.capture_phone) {
+      inputsHtml += `<input name="phone" placeholder="Phone" required style="padding: 8px; border: 1px solid #b9cbc8; border-radius: 4px;" />`;
+    }
+    if (settings.capture_email) {
+      inputsHtml += `<input name="email" type="email" placeholder="Email" style="padding: 8px; border: 1px solid #b9cbc8; border-radius: 4px;" />`;
+    }
+
     box.innerHTML = `
-      <input name="name" placeholder="Name" required />
-      <input name="phone" placeholder="Phone" required />
-      <input name="email" placeholder="Email (optional)" />
-      <button>Request callback</button>
-      <button class="skip" type="button">No thanks, just browsing</button>
+      <div style="font-size: 13px; font-weight: bold; color: #172326;">${settings.lead_form_title}</div>
+      <div style="font-size: 11px; color: #6b7d7a; margin-bottom: 4px;">${settings.lead_form_description}</div>
+      ${inputsHtml}
+      <button class="send" style="padding: 8px 12px; margin-top: 4px;">Submit</button>
+      <button class="skip" type="button">No thanks</button>
     `;
+
     box.querySelector(".skip").addEventListener("click", () => box.remove());
     box.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -347,51 +288,30 @@
       await fetch(`${apiBase}/webhook/lead`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, site_key: siteKey, course_interest: courseInterest || "", ...data })
+        body: JSON.stringify({
+          session_id: sessionId,
+          site_key: "default",
+          course_interest: courseInterest || "",
+          name: data.name || "Anonymous",
+          phone: data.phone || "0000000000",
+          email: data.email || null
+        })
       });
-      box.innerHTML = "Thanks. A counsellor can follow up with you.";
+      box.innerHTML = `<span style="font-size: 12px; color: #6b7d7a;">Thanks. A counsellor can follow up with you.</span>`;
       await playSound();
     });
     msgs.appendChild(box);
     msgs.scrollTop = msgs.scrollHeight;
   }
 
-  function renderRating() {
-    if (!settings.chat_rating_enabled || conversationEnded) return;
-    conversationEnded = true;
-    const node = document.createElement("div");
-    node.className = "rating";
-    node.innerHTML = `
-      <button type="button" data-value="up">👍 Helpful</button>
-      <button type="button" data-value="down">👎 Not Helpful</button>
-    `;
-    node.addEventListener("click", (e) => {
-      const btn = e.target.closest("button");
-      if (!btn) return;
-      node.innerHTML = `<span style="font-size:12px;color:#6b7d7a;">Thanks for your feedback!</span>`;
-    });
-    msgs.appendChild(node);
-    msgs.scrollTop = msgs.scrollHeight;
-  }
 
-  function showAgentTyping() {
-    if (!settings.agent_typing_indicator) return null;
-    const node = document.createElement("div");
-    node.className = "typing";
-    node.innerHTML = "<span></span><span></span><span></span>";
-    msgs.appendChild(node);
-    msgs.scrollTop = msgs.scrollHeight;
-    return node;
-  }
 
   async function send(text) {
     const message = text.trim();
     if (!message) return;
     addMessage(message, "user");
     input.value = "";
-    clearVisitorTyping();
 
-    const typingNode = showAgentTyping();
     const bot = addMessage("", "bot");
     bot.style.display = "none";
 
@@ -399,7 +319,7 @@
       const response = await fetch(`${apiBase}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, site_key: siteKey, message, page_university_slug: pageSlug })
+        body: JSON.stringify({ session_id: sessionId, site_key: "default", message, page_university_slug: pageSlug })
       });
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -426,11 +346,9 @@
                 chips.appendChild(chip);
               });
             }
-            if (data.lead_ask) renderLeadForm(message);
-            if (settings.chat_rating_enabled) renderRating();
+            if (data.lead_ask && settings.lead_trigger !== "before_chat") renderLeadForm(message);
           } else {
             if (firstToken) {
-              if (typingNode) typingNode.remove();
               bot.style.display = "";
               firstToken = false;
             }
@@ -439,18 +357,8 @@
           }
         }
       }
-      if (firstToken && typingNode) typingNode.remove();
 
-      if (!isOpen && settings.desktop_notifications) {
-        showDesktopNotification("DegreeBaba AI", "New message received");
-      }
-      if (!isOpen && settings.browser_tab_notifications) {
-        unreadCount += 1;
-        startTitleFlash();
-      }
-      await playSound();
     } catch (err) {
-      if (typingNode) typingNode.remove();
       bot.style.display = "";
       bot.textContent = "I'm temporarily unavailable. Please try again.";
     }
@@ -462,8 +370,6 @@
   bubble.addEventListener("click", () => {
     panel.classList.add("open");
     isOpen = true;
-    stopTitleFlash();
-    requestDesktopPermission();
   });
   close.addEventListener("click", () => {
     panel.classList.remove("open");
@@ -473,47 +379,39 @@
     event.preventDefault();
     send(input.value);
   });
-  input.addEventListener("input", () => {
-    sendTypingEvent();
-    clearVisitorTyping();
-    typingTimeout = setTimeout(clearVisitorTyping, 1500);
-  });
   chips.addEventListener("click", (event) => {
     if (event.target.matches(".chip")) send(event.target.textContent);
   });
-  emojiBtn.addEventListener("click", () => {
-    if (!settings.emoji_picker_enabled) return;
-    input.value += "😊";
-    input.focus();
-  });
-  uploadBtn.addEventListener("click", () => {
-    if (!settings.file_upload_enabled) return;
-    alert("File upload will be enabled in a future release.");
-  });
+
 
   // -------------------------------------------------------------------------
-  // Load runtime settings then bootstrap widget
+  // Fetch config and start
   // -------------------------------------------------------------------------
-  async function loadSettings() {
+  async function loadConfig() {
     try {
-      const res = await fetch(`${apiBase}/public/widget-settings?site_key=${encodeURIComponent(siteKey)}`);
+      const res = await fetch(`${apiBase}/widget/config`);
       if (res.ok) {
         const data = await res.json();
-        Object.keys(DEFAULT_SETTINGS).forEach((key) => {
-          if (typeof data[key] === "boolean") settings[key] = data[key];
-        });
+        
+        // Merge branding
+        if (data.branding) {
+          Object.assign(settings, data.branding);
+        }
+        // Merge behavior
+        if (data.behavior) {
+          Object.assign(settings, data.behavior);
+        }
+        // Merge lead capture
+        if (data.lead_capture) {
+          Object.assign(settings, data.lead_capture);
+        }
       }
-    } catch (_) {
-      // Network failures fall back to defaults.
-    }
+    } catch (_) {}
   }
 
-  loadSettings().then(() => {
+  loadConfig().then(() => {
+    applyConfig();
     applyVisibility();
-    applyComposerFeatures();
-    if (settings.hide_when_offline && settings.offline_if_no_agents) {
-      bubble.classList.add("hidden");
-    }
     loadHistory();
   });
 })();
