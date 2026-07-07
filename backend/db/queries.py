@@ -194,6 +194,17 @@ async def find_entity_search(pool, entity_type: str) -> list[dict[str, Any]]:
     return dict_rows(rows)
 
 
+async def find_entities_trgm(pool, message: str, limit: int = 3) -> list[dict]:
+    query = """
+        SELECT entity_type, entity_id, search_text, word_similarity($1, search_text) as sim
+        FROM entity_search
+        WHERE $1 <% search_text
+        ORDER BY sim DESC
+        LIMIT $2
+    """
+    return await pool.fetch(query, message, limit)
+
+
 _ENTITY_TABLES = {"university": "universities", "course": "courses", "specialization": "specializations"}
 
 

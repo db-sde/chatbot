@@ -37,7 +37,7 @@ from observability import (
     mark_first_token,
     record_llm_call_duration,
 )
-from llm import LLMResponse, langchain_tools_to_specs, llm_response_to_ai_message
+
 
 logger = logging.getLogger(__name__)
 
@@ -226,23 +226,14 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
     mark_llm_start()
     t_start = time.perf_counter()
     try:
-        # We call the LLM with tools. 
-        # The LLM will natively decide to call a tool or reply directly.
-        response = await llm_client.generate(
-            "agent", 
-            _clean_messages(messages),
-            tools=langchain_tools_to_specs(TOOLS),
-        )
-        if isinstance(response, LLMResponse):
-            mark_first_token()
-            ai_message = llm_response_to_ai_message(response)
-            return {"messages": [ai_message]}
-        
-        text = ""
-        async for chunk in response:
-            text += chunk
+        # Get the raw LangChain model and bind tools
+        model = llm_client.chat_model.bind_tools(TOOLS)
+
+        # Invoke as a Runnable so LangGraph's astream_events can intercept the stream
+        response = await model.ainvoke(_clean_messages(messages))
+
         mark_first_token()
-        return {"messages": [AIMessage(content=text)]}
+        return {"messages": [response]}
     except Exception as exc:  # noqa: BLE001
         logger.warning("agent failed: %s", exc)
         return {"messages": [AIMessage(content="I encountered an issue processing your request. Please try again.")]}

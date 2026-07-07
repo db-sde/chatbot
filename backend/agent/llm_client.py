@@ -99,6 +99,11 @@ class LLMClient:
             logger.warning("generate_text failed: %s", exc)
             return ""
 
+    @property
+    def chat_model(self):
+        from llm.provider import get_chat_model
+        return get_chat_model()
+
 
 llm_client = LLMClient()
 

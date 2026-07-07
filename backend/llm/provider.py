@@ -78,6 +78,7 @@ def _get_client(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            streaming=True,
         )
         if json_mode:
             client = client.bind(response_format={"type": "json_object"})
@@ -92,6 +93,7 @@ def _get_client(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            streaming=True,
         )
         if json_mode:
             client = client.bind(response_format={"type": "json_object"})
@@ -101,6 +103,11 @@ def _get_client(
         f"Unknown LLM provider: {provider!r}. "
         "Edit config.PROVIDER in backend/llm/config.py."
     )
+
+
+def get_chat_model() -> Any:
+    """Return a streaming-enabled chat model instance (no tools bound, no json_mode)."""
+    return _get_client()
 
 
 # ---------------------------------------------------------------------------

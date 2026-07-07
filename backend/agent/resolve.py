@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any
 
 from rapidfuzz import fuzz
 
-from agent.llm_client import llm_client
 from db import queries
 from db.pool import get_pool
-from settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +16,7 @@ COURSE_HINTS = [
     "btech", "mtech", "masters", "masters in", "bachelors", "bachelors in",
 ]
 
-# Keywords that indicate the user needs factual catalog data and can
-# therefore legitimately inherit page context as a hint.
+# Keywords that indicate the user needs factual catalog data
 _FACTUAL_KEYWORDS = {
     "fee", "fees", "cost", "price", "emi", "eligib", "admission",
     "placement", "ranking", "course", "program", "specializ", "duration",
@@ -28,13 +24,16 @@ _FACTUAL_KEYWORDS = {
     "details", "what is", "how much", "brochure",
 }
 
+# Common conversational and structural stop words to ignore
+_STOP_WORDS = {
+    "tell", "me", "about", "what", "is", "the", "for", "of", "and", "in", "to", 
+    "a", "an", "i", "want", "know", "please", "can", "you", "get", "give", 
+    "details", "info", "information", "much", "does", "cost", "fee", "fees",
+    "university", "college", "institute", "program", "degree"
+}
+
 
 def _message_needs_entity(message: str) -> bool:
-    """
-    Returns True only when the user's message contains vocabulary that implies
-    a catalog query requiring an entity resolution.  Pure conversational turns
-    ("Hi", "Thanks", "How are you?") return False.
-    """
     lower = message.lower()
     return any(kw in lower for kw in _FACTUAL_KEYWORDS)
 
@@ -42,10 +41,6 @@ def _message_needs_entity(message: str) -> bool:
 def _local_extract(message: str) -> dict[str, Any]:
     text = message.lower()
     result: dict[str, Any] = {}
-    if "nmims" in text or "nims" in text:
-        result["university"] = "nmims"
-    if "amity" in text:
-        result["university"] = "amity"
     for course in COURSE_HINTS:
         if re.search(rf"\b{course}\b", text):
             result["course"] = course
@@ -61,56 +56,75 @@ def _local_extract(message: str) -> dict[str, Any]:
     return result
 
 
-async def extract_entities(message: str, context: dict[str, Any]) -> dict[str, Any]:
-    prompt = f"""
-Analyze the user message and extract search parameters for the DegreeBaba degree catalog.
-Current conversation context: {json.dumps(context)}
-User message: "{message}"
+def _extract_potential_name(message: str, local_hints: dict[str, Any]) -> str:
+    """
+    Strips away structural hints, factual keywords, and stop words.
+    The remaining words are highly likely to be the entity name (e.g., 'nims').
+    """
+    text = message.lower()
+    text = re.sub(r'[^\w\s]', '', text)  # remove punctuation
+    words = text.split()
+    
+    ignore_words = set(_FACTUAL_KEYWORDS)
+    ignore_words.update(COURSE_HINTS)
+    ignore_words.update(_STOP_WORDS)
+    
+    # Also ignore any values already extracted by local hints (like "online", "mba")
+    for v in local_hints.values():
+        if isinstance(v, str):
+            ignore_words.add(v.lower())
+            
+    remaining = [w for w in words if w not in ignore_words and len(w) > 1]
+    return " ".join(remaining)
 
-Return ONLY a JSON object with the following keys. Do not explain, do not add markdown:
-{{
-  "university": "Extracted university name or synonym, or null if none",
-  "course": "Extracted course name/level (e.g. MBA, BCA, BBA), or null if none",
-  "specialization": "Extracted specialization name, or null if none",
-  "mode": "online | hybrid | offline | null",
-  "max_fee": number or null,
-  "sort_by": "fee | duration | null",
-  "order": "asc | desc | null",
-  "limit": number or null,
-  "comparison_targets": ["list of other university or course names to compare", or empty list]
-}}
-"""
-    extracted = await llm_client.generate_json(prompt)
-    if not extracted:
-        # Fall back to local regex extraction if the API keys/calls fail
-        extracted = _local_extract(message)
+
+async def extract_entities(message: str, context: dict[str, Any]) -> dict[str, Any]:
+    # 1. Get fast structural hints (mode, fee limits, course type)
+    local = _local_extract(message)
+    extracted = dict(local)
+    
+    # 2. Isolate the potential entity name by stripping keywords
+    potential_name = _extract_potential_name(message, local)
+    
+    if potential_name:
+        # Assign the isolated name to university, course, and specialization.
+        # The downstream _snap() function will validate it against the actual DB rows 
+        # using RapidFuzz and only keep the one that actually matches.
+        if not extracted.get("university"):
+            extracted["university"] = potential_name
+        if not extracted.get("course"):
+            extracted["course"] = potential_name
+        if not extracted.get("specialization"):
+            extracted["specialization"] = potential_name
+            
     return extracted
 
 
 async def _snap(entity_type: str, name: str | None) -> str | None:
-    if not name:
-        return None
+    if not name: return None
+
+    normalized_name = name.lower().strip()
     pool = await get_pool()
     rows = await queries.find_entity_search(pool, entity_type)
-    if not rows:
-        return None
+    if not rows: return None
 
     best_score = 0
     best_row = None
 
     for row in rows:
         search_text = row["search_text"].lower()
-        score = fuzz.WRatio(name.lower(), search_text)
-        for word in search_text.split():
-            score = max(score, fuzz.WRatio(name.lower(), word))
+        score = max(
+            fuzz.WRatio(normalized_name, search_text),
+            fuzz.partial_ratio(normalized_name, search_text)
+        )
         if score > best_score:
             best_score = score
             best_row = row
 
-    threshold = 85 if len(name) < 5 else 80
+    # Short strings need more forgiveness for typos
+    threshold = 75 if len(normalized_name) < 6 else 80
     if best_row and best_score >= threshold:
         return await queries.slug_for_entity_id(pool, entity_type, best_row["entity_id"])
-
     return None
 
 
@@ -121,20 +135,10 @@ async def resolve_entities(
 ) -> dict[str, Any]:
     """
     Resolve named entities from the user's message.
-
-    Priority order for each slug:
-      1. LLM extraction + fuzzy snap  (explicit user intent this turn)
-      2. Conversational context slugs  (user established in a prior turn)
-      3. Page context hint             (page slug) — ONLY when the message
-                                       requires factual catalog data AND
-                                       nothing was found in 1 or 2.
-
-    Greeting / conversational turns ("Hi", "Thanks", "How are you?") will
-    never inherit the page slug because _message_needs_entity() returns False.
     """
     extracted = await extract_entities(message, context)
 
-    # Step 1: fuzzy snap on what the LLM extracted
+    # Step 1: fuzzy snap on what we extracted
     university_slug = await _snap("university", extracted.get("university"))
     course_slug = await _snap("course", extracted.get("course"))
     specialization_slug = await _snap("specialization", extracted.get("specialization"))
