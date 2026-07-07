@@ -316,6 +316,12 @@
     const bot = addMessage("", "bot");
     bot.style.display = "none";
 
+    const typing = document.createElement("div");
+    typing.className = "typing";
+    typing.innerHTML = "<span></span><span></span><span></span>";
+    msgs.appendChild(typing);
+    msgs.scrollTop = msgs.scrollHeight;
+
     try {
       const response = await fetch(`${apiBase}/chat`, {
         method: "POST",
@@ -323,6 +329,7 @@
         body: JSON.stringify({ session_id: sessionId, site_key: siteKey, message, page_university_slug: pageSlug })
       });
       if (!response.ok) {
+        typing.remove();
         bot.style.display = "";
         if (response.status === 403) {
           bot.textContent = "Your access has been restricted due to suspicious activity.";
@@ -362,6 +369,7 @@
             if (data.lead_ask && settings.lead_trigger !== "before_chat") renderLeadForm(message);
           } else {
             if (firstToken) {
+              typing.remove();
               bot.style.display = "";
               firstToken = false;
             }
@@ -372,6 +380,7 @@
       }
 
     } catch (err) {
+      typing.remove();
       bot.style.display = "";
       bot.textContent = "I'm temporarily unavailable. Please try again.";
     }
