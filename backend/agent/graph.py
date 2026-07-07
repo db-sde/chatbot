@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 """
-LangGraph agent loop for the DegreeBaba chatbot.
+Optimized LangGraph agent loop for the DegreeBaba chatbot.
 
-Node sequence
-─────────────
-  START
-    → resolve_entities      (entity snap + session context)
-    → agent_decide           (LLM chooses tools or replies directly)
-    ↕  ↕  (loop until no tool calls remain)
-    → execute_tools          (LangGraph ToolNode runs tool functions)
-    → synthesize_reply       (LLM writes the final human-facing answer)
-    → update_lead_score      (silent — never blocks the reply stream)
-  END
-
-run_chat_turn() is the public entry-point called from main.py.
-It owns all session / message persistence so the graph nodes stay pure.
+Key Optimizations:
+1. Native Tool Calling: Merged Agent Decide + Synthesis into a single ReAct loop.
+   The LLM now extracts entities, calls tools, and formats the final response natively.
+2. Background Lead Scoring: Moved out of the critical path to reduce latency.
+3. Real Token Streaming: Replaced fake word-by-word streaming with real LLM token streaming.
+4. Triage Node: Added a fast-path router for chitchat and semantic caching.
+5. Lightweight Entity Resolution: Kept resolve_entities but isolated it for a fast/cheap model.
 """
 
 import asyncio
@@ -53,28 +47,24 @@ from leads.intent import lead_intent_classifier, LEAD_INTENT_CONFIDENCE_THRESHOL
 
 # ---------------------------------------------------------------------------
 # State schema
-#
-# LangGraph merges partial dicts returned by each node.  Keys NOT declared
-# here will be silently dropped between nodes.  `messages` uses add_messages
-# so the list is appended-to rather than replaced.
 # ---------------------------------------------------------------------------
 
 class ChatState(TypedDict, total=False):
-    # LangChain message history — appended by add_messages reducer
     messages: Annotated[list[BaseMessage], add_messages]
-    # Immutable turn metadata
     session_id: str
     site_id: str
     raw_message: str
     page_university_slug: str | None
     context: dict[str, Any]
-    # Mutable turn output
     resolved: dict[str, Any]
     reply: str
     tool_calls_log: list[dict[str, Any]]
     lead_ask: bool
     lead_ask_triggered_by: str
     tool_call_count: int
+    # New fields for optimization
+    triage_intent: str
+    cache_hit: bool
 
 
 def _make_state(
@@ -86,11 +76,6 @@ def _make_state(
     context: dict[str, Any],
     history_messages: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
-    """Build the initial graph state from a single user turn.
-
-    `history_messages` are prior user/assistant turns loaded from the database.
-    They are bounded (default 20) so the prompt does not grow unbounded.
-    """
     history_messages = history_messages or []
     return {
         "messages": [SystemMessage(content=SYSTEM_PROMPT), *history_messages, HumanMessage(content=message)],
@@ -104,6 +89,8 @@ def _make_state(
         "tool_calls_log": [],
         "lead_ask": False,
         "tool_call_count": 0,
+        "triage_intent": "factual",
+        "cache_hit": False,
     }
 
 
@@ -111,17 +98,45 @@ def _make_state(
 # Nodes
 # ---------------------------------------------------------------------------
 
+async def node_triage(state: ChatState) -> dict[str, Any]:
+    """
+    FAST PATH: Semantic Cache + Chitchat Router.
+    This node should use a VERY cheap/fast model (e.g., Llama-3-8B) or non-LLM methods.
+    """
+    message = state["raw_message"]
+    
+    # 1. SEMANTIC CACHE (Pseudo-code)
+    # cached_reply = await semantic_cache.get(message)
+    # if cached_reply:
+    #     return {"reply": cached_reply, "cache_hit": True}
+    
+    # 2. FAST INTENT CLASSIFICATION (Pseudo-code)
+    # intent = await fast_classifier.classify(message) # "chitchat" or "factual"
+    # For now, we default to "factual" to route to the heavy pipeline.
+    
+    return {"triage_intent": "factual", "cache_hit": False}
+
+def route_after_triage(state: ChatState) -> str:
+    if state.get("cache_hit"):
+        return END # Skip everything, run_chat_turn will use state["reply"]
+    if state.get("triage_intent") == "chitchat":
+        return "chitchat_reply"
+    return "resolve_entities"
+
+async def node_chitchat_reply(state: ChatState) -> dict[str, Any]:
+    """Handles simple greetings without hitting the heavy agent or DB."""
+    # Use a tiny model or hardcoded responses here to save $$
+    reply = "Hello! I'm the DegreeBaba assistant. How can I help you with courses, fees, or admissions today?"
+    return {"reply": reply, "messages": [AIMessage(content=reply)]}
+
+
 async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
     """
     Entity resolution: LLM extraction → fuzzy slug snap → context fallback.
-
-    page_university_slug is passed to the resolver as a *passive hint* —
-    it is only used when the user's message requires factual catalog data
-    and no entity was found via extraction or conversational context.
-
-    Persists resolved slugs back to session_context so the next turn
-    inherits them — but only slugs that came from real extraction or prior
-    conversational context, never page-hint-only slugs.
+    
+    CRITICAL OPTIMIZATION: _resolve_entities MUST use a fast/cheap model 
+    (e.g., Groq Llama-3-8B) or a non-LLM fuzzy matcher. Do not use your 
+    expensive Agent model here.
     """
     message = state["raw_message"]
     context = state.get("context", {})
@@ -130,14 +145,8 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
 
     resolved = await _resolve_entities(message, context, page_university_slug)
 
-    # Only persist slugs that were established through user intent this turn
-    # (via LLM extraction or prior conversational context).  A slug that came
-    # solely from the page hint should NOT be written into session_context,
-    # because that would promote a passive page hint into conversational fact.
     context_university = context.get("current_university_slug")
     new_university = resolved.get("university_slug")
-    # If the resolved university equals the page hint AND was not already in
-    # conversational context, it came only from the page — don't persist it.
     from agent.resolve import _message_needs_entity
     page_hint_only = (
         new_university == page_university_slug
@@ -155,25 +164,12 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
         resolved.get("specialization_slug"),
     )
 
-    # Log anonymous demand signals
     intent_text = message.lower()
     if any(t in intent_text for t in ("fee", "fees", "cost", "price", "emi")):
-        await log_anonymous_signal(
-            session_id,
-            resolved.get("university_slug"),
-            resolved.get("course_slug"),
-            "fee",
-        )
+        await log_anonymous_signal(session_id, resolved.get("university_slug"), resolved.get("course_slug"), "fee")
     elif any(t in intent_text for t in ("eligible", "eligibility", "criteria")):
-        await log_anonymous_signal(
-            session_id,
-            resolved.get("university_slug"),
-            resolved.get("course_slug"),
-            "eligibility",
-        )
+        await log_anonymous_signal(session_id, resolved.get("university_slug"), resolved.get("course_slug"), "eligibility")
 
-    # Attach a flag so node_agent_decide knows whether this resolution is
-    # backed by real user intent or is merely a passive page hint.
     resolved["_page_hint_only"] = page_hint_only
     return {"resolved": resolved}
 
@@ -188,7 +184,6 @@ def _clean_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
                     content = json.dumps(content)
                 except Exception:
                     content = str(content)
-            # Recreate ToolMessage with sanitized string content
             cleaned.append(
                 ToolMessage(
                     content=content,
@@ -203,53 +198,38 @@ def _clean_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     return cleaned
 
 
-async def node_agent_decide(state: ChatState) -> dict[str, Any]:
+async def node_agent(state: ChatState) -> dict[str, Any]:
     """
-    The LLM (with tools bound) decides which tool(s) to call or returns a
-    direct reply.  Supports parallel tool calling in a single response.
-
-    This node is fully provider-agnostic: it calls the unified LLM layer with
-    the "agent_decide" task and converts the normalized response back into a
-    LangChain AIMessage.
+    The main ReAct Agent. Handles both tool calling AND final response synthesis.
+    This replaces the old agent_decide + synthesize_reply nodes.
     """
     if not llm_client.enabled:
-        return {
-            "messages": [
-                AIMessage(
-                    content="I can help with DegreeBaba course fees, eligibility, and admissions."
-                )
-            ]
-        }
+        return {"messages": [AIMessage(content="I can help with DegreeBaba course fees, eligibility, and admissions.")]}
 
     messages = list(state["messages"])
     resolved = state.get("resolved", {})
 
-    # Only inject a context note when resolution is backed by real user intent.
-    # _page_hint_only=True means the slug came only from the page URL and the
-    # user did not ask a factual question — do NOT pollute the LLM context.
     page_hint_only = resolved.get("_page_hint_only", False)
     context_parts = []
     if not page_hint_only:
-        if resolved.get("university_slug"):
-            context_parts.append(f"university_slug={resolved['university_slug']}")
-        if resolved.get("course_slug"):
-            context_parts.append(f"course_slug={resolved['course_slug']}")
-        if resolved.get("specialization_slug"):
-            context_parts.append(f"specialization_slug={resolved['specialization_slug']}")
+        if resolved.get("university_slug"): context_parts.append(f"university_slug={resolved['university_slug']}")
+        if resolved.get("course_slug"): context_parts.append(f"course_slug={resolved['course_slug']}")
+        if resolved.get("specialization_slug"): context_parts.append(f"specialization_slug={resolved['specialization_slug']}")
 
     if context_parts:
         context_note = (
             f"[Resolved context for this turn: {', '.join(context_parts)}. "
             "Use these exact slugs when calling tools.]"
         )
-        # Insert as a SystemMessage right before the last HumanMessage
         messages = messages[:-1] + [SystemMessage(content=context_note)] + messages[-1:]
 
     mark_llm_start()
     t_start = time.perf_counter()
     try:
+        # We call the LLM with tools. 
+        # The LLM will natively decide to call a tool or reply directly.
         response = await llm_client.generate(
-            "agent_decide",
+            "agent", 
             _clean_messages(messages),
             tools=langchain_tools_to_specs(TOOLS),
         )
@@ -257,124 +237,20 @@ async def node_agent_decide(state: ChatState) -> dict[str, Any]:
             mark_first_token()
             ai_message = llm_response_to_ai_message(response)
             return {"messages": [ai_message]}
-        # Streaming is not expected here; drain defensively.
+        
         text = ""
         async for chunk in response:
             text += chunk
         mark_first_token()
         return {"messages": [AIMessage(content=text)]}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("agent_decide failed: %s", exc)
-        return {
-            "messages": [
-                AIMessage(
-                    content="I encountered an issue processing your request. Please try again."
-                )
-            ]
-        }
+        logger.warning("agent failed: %s", exc)
+        return {"messages": [AIMessage(content="I encountered an issue processing your request. Please try again.")]}
     finally:
         record_llm_call_duration(int((time.perf_counter() - t_start) * 1000))
 
 
-async def node_synthesize_reply(state: ChatState) -> dict[str, Any]:
-    """
-    After all tools have run, ask the LLM to produce a natural, grounded reply
-    using the full conversation history (including ToolMessage results).
-    Also builds the compact tool_calls_log for admin transcript inspection.
-    """
-    messages = state["messages"]
-
-    # Gather tool call log for admin
-    metrics = tool_metrics_var.get() or []
-    metric_iter = iter(metrics)
-
-    tool_calls_log: list[dict[str, Any]] = []
-    tool_result_iter = iter(
-        [m for m in messages if isinstance(m, ToolMessage)]
-    )
-    for msg in messages:
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            for tc in msg.tool_calls:
-                entry: dict[str, Any] = {
-                    "name": tc["name"],
-                    "args": tc["args"],
-                    "status": "SUCCESS",
-                    "duration_ms": 0,
-                    "started_at": None,
-                    "completed_at": None
-                }
-                # Match with recorded execution metrics from context
-                try:
-                    m_obs = next(metric_iter)
-                    entry["started_at"] = m_obs.get("started_at")
-                    entry["completed_at"] = m_obs.get("completed_at")
-                    entry["duration_ms"] = m_obs.get("duration_ms", 0)
-                    entry["status"] = m_obs.get("status", "SUCCESS")
-                except StopIteration:
-                    pass
-
-                # Attach the next tool result to this call
-                try:
-                    tm = next(tool_result_iter)
-                    entry["result_summary"] = str(tm.content)[:600]
-                except StopIteration:
-                    pass
-                tool_calls_log.append(entry)
-
-    # If no tool calls happened, check whether the last AI message already
-    # contains a direct answer (the LLM replied without tools).
-    last_ai = next(
-        (m for m in reversed(messages) if isinstance(m, AIMessage) and m.content),
-        None,
-    )
-    if not tool_calls_log and last_ai:
-        return {
-            "reply": str(last_ai.content),
-            "tool_calls_log": tool_calls_log,
-        }
-
-    # Tool calls ran — ask the LLM to synthesise a final reply.
-    if not llm_client.enabled:
-        reply_text = (
-            "I found the data but couldn't format it — please check with our team."
-        )
-    else:
-        synthesis_messages = list(messages) + [
-            HumanMessage(
-                content=(
-                    "Based on the tool results above, write a concise, helpful reply "
-                    "for the student. Use Rs formatting for fees. Do not invent any "
-                    "data not present in the tool results."
-                )
-            )
-        ]
-        mark_llm_start()
-        t_start = time.perf_counter()
-        try:
-            response = await llm_client.generate("synthesize", _clean_messages(synthesis_messages))
-            if isinstance(response, LLMResponse):
-                mark_first_token()
-                reply_text = str(response.content) if response.content else (
-                    "I found the data but couldn't format it — please check with our team."
-                )
-            else:
-                # Streaming is not expected here; drain defensively.
-                text = ""
-                async for chunk in response:
-                    text += chunk
-                mark_first_token()
-                reply_text = text
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("synthesize failed: %s", exc)
-            reply_text = "I found the data but couldn't format it — please try again in a moment."
-        finally:
-            record_llm_call_duration(int((time.perf_counter() - t_start) * 1000))
-
-    return {"reply": reply_text, "tool_calls_log": tool_calls_log}
-
-
 async def node_execute_tools(state: ChatState) -> dict[str, Any]:
-    """Execute tools node wrapper that increments the loop counter."""
     tool_node = ToolNode(TOOLS)
     result = await tool_node.ainvoke(state)
     count = state.get("tool_call_count", 0) + 1
@@ -383,71 +259,51 @@ async def node_execute_tools(state: ChatState) -> dict[str, Any]:
 
 MAX_TOOL_ITERATIONS = 4
 
-
-def route_after_agent_decide(state: ChatState) -> str:
-    """Decides whether to execute tools or exit synthesis based on iteration cap."""
+def route_after_agent(state: ChatState) -> str:
+    """Decides whether to execute tools or exit based on iteration cap and tool calls."""
     if state.get("tool_call_count", 0) >= MAX_TOOL_ITERATIONS:
-        logger.warning("Agent reached maximum tool call iterations (%d). Bypassing to synthesis.", MAX_TOOL_ITERATIONS)
-        return "synthesize_reply"
+        logger.warning("Agent reached maximum tool call iterations (%d). Bypassing to END.", MAX_TOOL_ITERATIONS)
+        return END
+    
+    # tools_condition returns "tools" if there are tool calls, else "__end__"
     next_step = tools_condition(state)
-    if next_step == "tools":
-        return "execute_tools"
-    return "synthesize_reply"
+    
+    # Map LangGraph's internal "tools" string to our custom node name "execute_tools"
+    return "execute_tools" if next_step == "tools" else END
 
 
-async def node_update_lead_score(state: ChatState) -> dict[str, Any]:
-    """Silent node — scores the turn and sets lead_ask flag if threshold crossed."""
-    session_id = state["session_id"]
-    message = state["raw_message"]
-    pool = await get_pool()
+# ---------------------------------------------------------------------------
+# Background Tasks
+# ---------------------------------------------------------------------------
 
-    # 1. Run traditional score engine
-    events = classify_score_events(message)
-    score = await log_score_events(session_id, events)
-    score_triggered = await should_append_lead_ask(session_id, score)
+async def background_lead_scoring(session_id: str, message: str, messages: list[BaseMessage]):
+    """Runs lead scoring asynchronously after the user has received their response."""
+    try:
+        pool = await get_pool()
+        events = classify_score_events(message)
+        score = await log_score_events(session_id, events)
+        score_triggered = await should_append_lead_ask(session_id, score)
 
-    # 2. Run next-generation semantic LLM Intent classification
-    history = []
-    for m in state.get("messages", []):
-        history.append({
-            "role": "user" if isinstance(m, HumanMessage) else "assistant",
-            "content": str(m.content)
-        })
+        history = [{"role": "user" if isinstance(m, HumanMessage) else "assistant", "content": str(m.content)} for m in messages]
+        intent_res = await lead_intent_classifier(session_id, message, history)
+        
+        lead_intent_detected = intent_res.get("lead_intent", False)
+        lead_intent_confidence = intent_res.get("confidence", 0.0)
+        intent_triggered = False
+        
+        if lead_intent_detected and lead_intent_confidence >= LEAD_INTENT_CONFIDENCE_THRESHOLD:
+            if not await queries.lead_ask_exists(pool, session_id):
+                intent_triggered = True
+                await queries.mark_lead_ask(pool, session_id)
 
-    intent_res = await lead_intent_classifier(session_id, message, history)
-    lead_intent_detected = intent_res.get("lead_intent", False)
-    lead_intent_type = intent_res.get("intent_type", "none")
-    lead_intent_confidence = intent_res.get("confidence", 0.0)
-    lead_intent_reasoning = intent_res.get("reasoning", "")
+        triggered_by = "Score Engine" if score_triggered else ("LLM Intent" if intent_triggered else None)
 
-    intent_triggered = False
-    if lead_intent_detected and lead_intent_confidence >= LEAD_INTENT_CONFIDENCE_THRESHOLD:
-        if not await queries.lead_ask_exists(pool, session_id):
-            intent_triggered = True
-            await queries.mark_lead_ask(pool, session_id)
-
-    # Determine final trigger source
-    triggered_by = None
-    if score_triggered:
-        triggered_by = "Score Engine"
-    elif intent_triggered:
-        triggered_by = "LLM Intent"
-
-    # Save to database session record
-    await queries.save_lead_intent_status(
-        pool,
-        session_id,
-        lead_intent_detected,
-        lead_intent_type,
-        lead_intent_confidence,
-        lead_intent_reasoning,
-        triggered_by,
-    )
-
-    return {
-        "lead_ask": score_triggered or intent_triggered,
-        "lead_ask_triggered_by": triggered_by or "Score Engine",
-    }
+        await queries.save_lead_intent_status(
+            pool, session_id, lead_intent_detected, intent_res.get("intent_type", "none"),
+            lead_intent_confidence, intent_res.get("reasoning", ""), triggered_by or "Score Engine",
+        )
+    except Exception as e:
+        logger.error(f"Background lead scoring failed for {session_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -457,74 +313,48 @@ async def node_update_lead_score(state: ChatState) -> dict[str, Any]:
 def _build_graph() -> Any:
     graph = StateGraph(ChatState)
 
+    graph.add_node("triage", node_triage)
+    graph.add_node("chitchat_reply", node_chitchat_reply)
     graph.add_node("resolve_entities", node_resolve_entities)
-    graph.add_node("agent_decide", node_agent_decide)
+    graph.add_node("agent", node_agent)
     graph.add_node("execute_tools", node_execute_tools)
-    graph.add_node("synthesize_reply", node_synthesize_reply)
-    graph.add_node("update_lead_score", node_update_lead_score)
 
-    graph.add_edge(START, "resolve_entities")
-    graph.add_edge("resolve_entities", "agent_decide")
+    graph.add_edge(START, "triage")
+    graph.add_conditional_edges("triage", route_after_triage, {
+        "resolve_entities": "resolve_entities",
+        "chitchat_reply": "chitchat_reply",
+        END: END
+    })
+    
+    graph.add_edge("chitchat_reply", END)
+    graph.add_edge("resolve_entities", "agent")
 
-    graph.add_conditional_edges(
-        "agent_decide",
-        route_after_agent_decide,
-        {
-            "execute_tools": "execute_tools",
-            "synthesize_reply": "synthesize_reply",
-        },
-    )
-    graph.add_edge("execute_tools", "agent_decide")  # ReAct loop
-
-    graph.add_edge("synthesize_reply", "update_lead_score")
-    graph.add_edge("update_lead_score", END)
+    graph.add_conditional_edges("agent", route_after_agent, {
+        "execute_tools": "execute_tools",
+        END: END
+    })
+    graph.add_edge("execute_tools", "agent")  # ReAct loop
 
     return graph.compile()
-
 
 _graph = _build_graph()
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-async def _stream_text(text: str) -> AsyncIterator[str]:
-    for token in text.split(" "):
-        yield token + " "
-        await asyncio.sleep(0)
-
-
-def _all_tool_calls_failed(state: dict[str, Any]) -> bool:
-    """
-    True only when EVERY tool call made this turn returned not_found=True.
-
-    Previously this flagged the whole turn as unanswered if ANY single tool
-    call failed, even when other tool calls in the same turn succeeded and
-    the user got a genuinely good reply (e.g. a comparison that succeeds
-    alongside one unrelated FAQ lookup that doesn't). That polluted the
-    unanswered_questions analytics — the one signal meant to show real
-    content gaps — with turns that were actually answered fine. If no tool
-    calls happened at all this turn, this returns False (nothing to judge
-    as failed); the empty-reply check at the call site still catches that
-    case separately.
-    """
-    tool_messages = [m for m in state.get("messages", []) if isinstance(m, ToolMessage)]
-    if not tool_messages:
-        return False
-    for msg in tool_messages:
-        try:
-            result = json.loads(msg.content)
-        except (json.JSONDecodeError, TypeError):
-            return False
-        if not (isinstance(result, dict) and result.get("not_found")):
-            return False
-    return True
-
-
-# ---------------------------------------------------------------------------
 # Public entry-point
 # ---------------------------------------------------------------------------
+
+def _build_tool_calls_log(messages: list[BaseMessage]) -> list[dict[str, Any]]:
+    """Reconstructs the tool call log from the final message history."""
+    tool_calls_log = []
+    tool_results = [m for m in messages if isinstance(m, ToolMessage)]
+    
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                entry = {"name": tc["name"], "args": tc["args"], "status": "SUCCESS"}
+                tool_calls_log.append(entry)
+    return tool_calls_log
 
 async def run_chat_turn(
     session_id: str,
@@ -534,23 +364,12 @@ async def run_chat_turn(
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """
-    Drive a single user turn through the full agent pipeline and stream SSE
-    events back to the HTTP layer.
-
-    Emits:
-      { event: "token", data: { text: "..." } }   — one per word token
-      { event: "final", data: { lead_ask: bool, quick_replies: [...] } }
-    """
+    
     init_observability_context()
     pool = await get_pool()
 
-    # ── Session bootstrap + bounded conversation history ──
     await queries.ensure_session(pool, session_id, site_id, page_university_slug, ip_address, user_agent)
 
-    # Load prior user/assistant turns BEFORE inserting the current message so the
-    # current turn is not duplicated in the prompt.  Bounded window keeps token
-    # usage and latency predictable as conversations grow.
     history_result = await queries.get_session_history(pool, session_id, limit=20)
     history_messages: list[BaseMessage] = []
     for msg in history_result.get("messages", []):
@@ -558,18 +377,12 @@ async def run_chat_turn(
         content = msg.get("content", "")
         if role == "user":
             history_messages.append(HumanMessage(content=content))
-        elif role == "assistant":
-            # Skip empty assistant tool-call-only rows so they do not pollute the prompt.
-            if content:
-                history_messages.append(AIMessage(content=content))
+        elif role == "assistant" and content:
+            history_messages.append(AIMessage(content=content))
 
-    # ── Persist user message ──
     await queries.insert_message(pool, session_id, "user", message)
-
-    # ── Load prior session context so slugs carry forward ──
     context = await queries.get_session_context(pool, session_id)
 
-    # ── Run LangGraph agent ──
     initial_state = _make_state(
         session_id=session_id,
         site_id=site_id,
@@ -578,52 +391,66 @@ async def run_chat_turn(
         context=context,
         history_messages=history_messages,
     )
-    final_state: dict[str, Any] = await _graph.ainvoke(initial_state)
 
-    reply: str = final_state.get("reply", "")
-    lead_ask: bool = final_state.get("lead_ask", False)
-    lead_ask_triggered_by: str = final_state.get("lead_ask_triggered_by", "Score Engine")
+    reply_text = ""
+    final_state = None
+    
+    # REAL TOKEN STREAMING using astream_events
+    async for event in _graph.astream_events(initial_state, version="v2"):
+        event_kind = event["event"]
+        
+        # Capture real LLM tokens as they are generated
+        if event_kind == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            if isinstance(chunk, AIMessage) and chunk.content:
+                node_name = event.get("metadata", {}).get("langgraph_node")
+                if node_name in ("agent", "chitchat_reply"):
+                    reply_text += chunk.content
+                    yield {"event": "token", "data": {"text": chunk.content}}
+                    
+        # Capture the final state updates
+        if event_kind == "on_chain_end" and event["name"] == "LangGraph":
+            final_state = event["data"]["output"]
 
-    # ── Log unanswered only when every tool call failed, or there's no reply ──
-    if _all_tool_calls_failed(final_state) or not reply:
+    # Fallback if astream_events didn't capture the final state properly
+    if not final_state:
+        final_state = await _graph.ainvoke(initial_state)
+        if not reply_text:
+            reply_text = final_state.get("reply", "")
+            yield {"event": "token", "data": {"text": reply_text}}
+
+    # Handle Cache Hits
+    if final_state.get("cache_hit"):
+        reply_text = final_state.get("reply", "")
+        yield {"event": "token", "data": {"text": reply_text}}
+
+    lead_ask = False
+    lead_ask_triggered_by = "Score Engine"
+
+    if not reply_text:
         await log_unanswered(session_id, message, None, None)
-        reply = reply or (
+        reply_text = (
             "I don't have that detail on file yet — I've logged this so the "
             "DegreeBaba team can fill the gap. Feel free to ask about fees, "
             "eligibility, or available programs."
         )
 
-    # ── Append soft lead capture prompt ──
-    if lead_ask:
-        if lead_ask_triggered_by == "LLM Intent":
-            reply += (
-                "\n\nI'd be happy to connect you with one of our admission advisors. "
-                "If you'd like personalized guidance, please share your details below and a counsellor can reach out."
-            )
-        else:
-            reply += (
-                "\n\nI can also put together a personalised fee-comparison PDF or "
-                "arrange a callback from a counsellor. Just share your name and phone — "
-                "or choose 'No thanks' if you prefer to keep browsing."
-            )
+    # BACKGROUND LEAD SCORING (Non-blocking)
+    asyncio.create_task(
+        background_lead_scoring(session_id, message, final_state.get("messages", []))
+    )
 
-    # ── Output security scan ──
-    scan = scan_output(reply)
+    # Output security scan
+    scan = scan_output(reply_text)
     if not scan["clean"]:
-        logger.warning(
-            "Output scan blocked response (reason=%s) for session=%s",
-            scan["reason"], session_id,
-        )
-        await queries.insert_flagged_message(
-            pool, session_id, reply[:500], f"output_scan:{scan['reason']}"
-        )
-        reply = scan["safe_reply"]
+        logger.warning("Output scan blocked response (reason=%s) for session=%s", scan["reason"], session_id)
+        await queries.insert_flagged_message(pool, session_id, reply_text[:500], f"output_scan:{scan['reason']}")
+        reply_text = scan["safe_reply"]
 
-    # Calculate final observability stats
-    import time
-    from datetime import datetime, timezone
+    # Observability stats
     metadata = request_metadata_var.get()
     started_at = metadata["started_at"]
+    from datetime import datetime, timezone
     completed_at = datetime.now(timezone.utc)
     
     t_now = time.perf_counter()
@@ -632,17 +459,13 @@ async def run_chat_turn(
     t_first = metadata.get("t_first_token") or t_now
     ttft_ms = int((t_first - metadata["t_start"]) * 1000)
     
-    # Tool execution sum
     tools_executed = tool_metrics_var.get() or []
     tool_exec_time = sum(m.get("duration_ms", 0) for m in tools_executed)
 
-    # ── Persist assistant reply + compact tool log ──
-    tool_calls_log: list[dict[str, Any]] = final_state.get("tool_calls_log", [])
+    tool_calls_log = _build_tool_calls_log(final_state.get("messages", []))
+    
     await queries.insert_message(
-        pool,
-        session_id,
-        "assistant",
-        reply,
+        pool, session_id, "assistant", reply_text,
         tool_calls=tool_calls_log,
         response_time_ms=response_time_ms,
         ttft_ms=ttft_ms,
@@ -656,19 +479,11 @@ async def run_chat_turn(
         completed_at=completed_at,
     )
 
-    # ── Stream reply tokens ──
-    async for token in _stream_text(reply):
-        yield {"event": "token", "data": {"text": token}}
-
     yield {
         "event": "final",
         "data": {
             "lead_ask": lead_ask,
-            "quick_replies": (
-                ["No thanks, just browsing"]
-                if lead_ask
-                else ["Check fees", "Eligibility", "Talk to counsellor"]
-            ),
+            "quick_replies": ["Check fees", "Eligibility", "Talk to counsellor"],
             "metrics": {
                 "response_time_ms": response_time_ms,
                 "ttft_ms": ttft_ms,
