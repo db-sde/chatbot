@@ -60,6 +60,18 @@ app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxie
 
 
 @app.middleware("http")
+async def request_diagnostic_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    method = request.method
+    path = request.url.path
+    
+    response = await call_next(request)
+    
+    logger.warning("[DIAGNOSTIC] HTTP: %s %s | Client IP: %s | Status: %s", method, path, client_ip, response.status_code)
+    return response
+
+
+@app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -136,10 +148,15 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
     client_ip: str | None = request.client.host if request.client else None
     client_ua: str | None = request.headers.get("user-agent")
 
+    logger.warning("[DIAGNOSTIC] /chat received request from IP: %s, site_key: %s, session_id: %s", client_ip, body.site_key, body.session_id)
+
     # ── IP Block Check ──
     if client_ip:
         pool = await get_pool()
-        if await queries.is_ip_blocked(pool, client_ip):
+        logger.warning("[DIAGNOSTIC] /chat checking if IP is blocked: %s", client_ip)
+        is_blocked = await queries.is_ip_blocked(pool, client_ip)
+        logger.warning("[DIAGNOSTIC] /chat IP %s block check result: %s", client_ip, is_blocked)
+        if is_blocked:
             logger.warning("Blocked IP attempted chat: %s session=%s", client_ip, body.session_id)
             await queries.insert_security_event(
                 pool,
@@ -155,9 +172,14 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
             )
             raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
 
+    logger.warning("[DIAGNOSTIC] /chat validating site key: %s, origin: %s, referer: %s", body.site_key, request.headers.get("origin"), request.headers.get("referer"))
     validate_site_request(body.site_key, request.headers.get("origin"), request.headers.get("referer"))
+    logger.warning("[DIAGNOSTIC] /chat site request validation passed")
+    
     pool = await get_pool()
-    if await queries.count_site_messages_today(pool, body.site_key) >= settings.daily_message_cap_per_site:
+    daily_count = await queries.count_site_messages_today(pool, body.site_key)
+    logger.warning("[DIAGNOSTIC] /chat daily count check: %s / %s", daily_count, settings.daily_message_cap_per_site)
+    if daily_count >= settings.daily_message_cap_per_site:
         raise HTTPException(status_code=429, detail="Daily site message cap exceeded")
 
     _PROMPT_GUARD_BLOCKED = (
@@ -170,7 +192,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
             pool = await get_pool()
 
             # ── Layer 1: Prompt Guard 2 ──
+            logger.warning("[DIAGNOSTIC] /chat running check_prompt_safety on message length: %s", len(body.message))
             safety = await check_prompt_safety(body.message)
+            logger.warning("[DIAGNOSTIC] /chat check_prompt_safety result: safe=%s, risk_score=%s, reason=%s", safety.get("safe"), safety.get("risk_score"), safety.get("reason"))
             if not safety["safe"]:
                 source = safety.get("source", "unknown")
                 logger.warning(
@@ -202,7 +226,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
 
 
             # ── Layer 2: DegreeBaba Policy ──
+            logger.warning("[DIAGNOSTIC] /chat running check_policy on message")
             policy = check_policy(body.message)
+            logger.warning("[DIAGNOSTIC] /chat check_policy result: passed=%s, rule=%s", policy.get("passed"), policy.get("rule"))
             if not policy["passed"]:
                 logger.warning(
                     "Policy blocked message (rule=%s) session=%s",
