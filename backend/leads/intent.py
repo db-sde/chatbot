@@ -71,7 +71,12 @@ JSON Schema:
 }}
 """
     try:
-        res = await llm_client.generate_json(prompt, task="lead_intent")
+        from llm.provider import get_lead_intent_model, safe_parse_json
+        from langchain_core.messages import HumanMessage
+
+        model = get_lead_intent_model()
+        resp = await model.ainvoke([HumanMessage(content=prompt)])
+        res = safe_parse_json(resp.content)
         
         # Parse output safely and validate keys
         lead_intent = bool(res.get("lead_intent", False))

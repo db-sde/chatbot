@@ -98,13 +98,11 @@ class PromptGuardClient:
     Wraps Meta Llama Prompt Guard 2 via Groq's inference API.
 
     Key invariants:
-      - messages list = [{"role": "user", "content": <message>}]  (exactly one)
+      - messages list = [HumanMessage(content=message)]  (exactly one)
       - No system message (classifier models reject it with HTTP 400)
       - Response is a plain float string, not JSON
       - score >= _INJECTION_THRESHOLD → injection attempt
     """
-
-    MODEL = "meta-llama/llama-prompt-guard-2-86m"
 
     async def scan(self, message: str) -> SafetyResult | None:
         """
@@ -115,19 +113,12 @@ class PromptGuardClient:
             return None
 
         try:
-            from groq import AsyncGroq
-            client = AsyncGroq(api_key=settings.groq_api_key)
+            from llm.provider import get_prompt_guard_model
+            from langchain_core.messages import HumanMessage
 
-            resp = await client.chat.completions.create(
-                model=self.MODEL,
-                messages=[
-                    # CRITICAL: exactly ONE user message, NO system message.
-                    # Classifier models reject any other structure with HTTP 400.
-                    {"role": "user", "content": message},
-                ],
-            )
-
-            raw = (resp.choices[0].message.content or "").strip()
+            model = get_prompt_guard_model()
+            resp = await model.ainvoke([HumanMessage(content=message)])
+            raw = (resp.content or "").strip()
 
             # Response is a plain probability float (e.g. "0.9996"), not JSON.
             score = float(raw)

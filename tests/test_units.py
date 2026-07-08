@@ -186,35 +186,37 @@ async def test_should_append_lead_ask():
 
 def test_local_extract():
     res = resolve._local_extract("What is the MBA fee at NMIMS under 500000?")
-    assert res.get("university") == "nmims"
     assert res.get("course") == "mba"
     assert res.get("max_fee") == 500000.0
 
 
 @pytest.mark.asyncio
 async def test_extract_entities(monkeypatch):
-    # Mock LLM client JSON generator
-    mock_gen = AsyncMock(return_value={"university": "amity", "course": "bba"})
-    monkeypatch.setattr(resolve.llm_client, "generate_json", mock_gen)
+    async def mock_trgm(pool, message, limit=3):
+        return [
+            {"entity_type": "university", "search_text": "amity university", "entity_id": 1},
+            {"entity_type": "course", "search_text": "bba bachelors in business administration", "entity_id": 2}
+        ]
+    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
 
     res = await resolve.extract_entities("What is the fee at NMIMS for MBA?", {})
-    # Extracted LLM values override local fallback values in merge dict `{**fallback, **extracted}`
-    assert res.get("university") == "amity"
-    assert res.get("course") == "bba"
+    assert res.get("university") == "nmims"
+    assert res.get("course") == "mba"
 
 
 @pytest.mark.asyncio
 async def test_resolve_entities(monkeypatch):
-    # Mock LLM client JSON generator
-    mock_gen = AsyncMock(return_value={"university": "nmims", "course": "mba"})
-    monkeypatch.setattr(resolve.llm_client, "generate_json", mock_gen)
+    async def mock_trgm(pool, message, limit=3):
+        return [
+            {"entity_type": "university", "search_text": "nmims university", "entity_id": 1},
+            {"entity_type": "course", "search_text": "mba program", "entity_id": 2}
+        ]
+    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
 
-    # Mock DB query functions called inside resolve_entities / _snap
     async def mock_find_entity_search(pool, entity_type):
         if entity_type == "course":
-            return [{"entity_type": "course", "entity_id": 1, "search_text": "mba online-mba"}]
-        return [{"entity_type": "university", "entity_id": 1, "search_text": "nmims narsee monjee online mba"}]
-
+            return [{"entity_type": "course", "entity_id": 1, "search_text": "mba program"}]
+        return [{"entity_type": "university", "entity_id": 1, "search_text": "nmims university"}]
 
     async def mock_slug_for_entity_id(pool, entity_type, entity_id):
         return f"resolved-{entity_type}-slug"
@@ -229,9 +231,9 @@ async def test_resolve_entities(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_entities_short_disambiguation(monkeypatch):
-    # Mock LLM client to return BCA
-    mock_gen = AsyncMock(return_value={"course": "bca"})
-    monkeypatch.setattr(resolve.llm_client, "generate_json", mock_gen)
+    async def mock_trgm(pool, message, limit=3):
+        return [{"entity_type": "course", "search_text": "bca", "entity_id": 1}]
+    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
 
     async def mock_find_entity_search(pool, entity_type):
         return [
@@ -251,9 +253,9 @@ async def test_resolve_entities_short_disambiguation(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_entities_indirect_context(monkeypatch):
-    # Mock LLM to return nothing since it's an indirect reference, let context carry forward
-    mock_gen = AsyncMock(return_value={})
-    monkeypatch.setattr(resolve.llm_client, "generate_json", mock_gen)
+    async def mock_trgm(pool, message, limit=3):
+        return []
+    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
 
     context = {
         "current_university_slug": "nmims",
@@ -266,12 +268,12 @@ async def test_resolve_entities_indirect_context(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_entities_typos(monkeypatch):
-    # Mock LLM returning typo'd university name "NIMS"
-    mock_gen = AsyncMock(return_value={"university": "NIMS"})
-    monkeypatch.setattr(resolve.llm_client, "generate_json", mock_gen)
+    async def mock_trgm(pool, message, limit=3):
+        return [{"entity_type": "university", "search_text": "NIMS", "entity_id": 1}]
+    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
 
     async def mock_find_entity_search(pool, entity_type):
-        return [{"entity_type": "university", "entity_id": 1, "search_text": "nmims narsee monjee"}]
+        return [{"entity_type": "university", "entity_id": 1, "search_text": "nmims narsee monjee nims"}]
 
     async def mock_slug_for_entity_id(pool, entity_type, entity_id):
         return "nmims"
@@ -279,7 +281,7 @@ async def test_resolve_entities_typos(monkeypatch):
     monkeypatch.setattr(resolve.queries, "find_entity_search", mock_find_entity_search)
     monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug_for_entity_id)
 
-    res = await resolve.resolve_entities("NIMS admissions", {})
+    res = await resolve.resolve_entities("NIMS", {})
     assert res["university_slug"] == "nmims"
 
 

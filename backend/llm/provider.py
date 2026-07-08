@@ -61,14 +61,24 @@ class LLMResponse:
 
 def _get_client(
     *,
+    model_name: str | None = None,
     json_mode: bool = False,
     temperature: float = 0.0,
     max_tokens: int | None = None,
     timeout: float = 60.0,
+    streaming: bool = True,
 ) -> Any:
     """Return a configured LangChain chat client for the active provider."""
     provider = config.PROVIDER.lower()
-    model = config.JSON_MODEL if json_mode else config.MODEL
+    
+    if model_name:
+        model = model_name
+    else:
+        model = config.JSON_MODEL if json_mode else config.MODEL
+
+    # Prompt Guard is hosted on Groq; automatically route it to Groq if the model matches
+    if model and "prompt-guard" in model:
+        provider = "groq"
 
     if provider == "groq":
         from langchain_groq import ChatGroq  # noqa: PLC0415
@@ -78,7 +88,7 @@ def _get_client(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
-            streaming=True,
+            streaming=streaming,
         )
         if json_mode:
             client = client.bind(response_format={"type": "json_object"})
@@ -93,7 +103,7 @@ def _get_client(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
-            streaming=True,
+            streaming=streaming,
         )
         if json_mode:
             client = client.bind(response_format={"type": "json_object"})
@@ -105,9 +115,19 @@ def _get_client(
     )
 
 
-def get_chat_model() -> Any:
-    """Return a streaming-enabled chat model instance (no tools bound, no json_mode)."""
-    return _get_client()
+def get_chat_model(model_name: str | None = None, *, streaming: bool = True) -> Any:
+    """Return a chat model instance (no tools bound, no json_mode)."""
+    return _get_client(model_name=model_name, streaming=streaming)
+
+
+def get_lead_intent_model() -> Any:
+    """Return the configured ChatModel instance for lead intent classification (non-streaming)."""
+    return _get_client(model_name=config.LEAD_INTENT_MODEL, json_mode=True, streaming=False)
+
+
+def get_prompt_guard_model() -> Any:
+    """Return the configured ChatModel instance for prompt guard classification (non-streaming)."""
+    return _get_client(model_name=config.PROMPT_GUARD_MODEL, streaming=False)
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +137,14 @@ def get_chat_model() -> Any:
 async def generate(
     messages: list[BaseMessage],
     *,
+    model_name: str | None = None,
     tools: list[ToolSpec] | None = None,
     temperature: float = 0.0,
     max_tokens: int | None = None,
     json_mode: bool = False,
 ) -> LLMResponse:
     """Execute a single non-streaming LLM call and return a normalised response."""
-    client = _get_client(json_mode=json_mode, temperature=temperature, max_tokens=max_tokens)
+    client = _get_client(model_name=model_name, json_mode=json_mode, temperature=temperature, max_tokens=max_tokens, streaming=False)
 
     if json_mode:
         messages = append_json_system_message(messages)
@@ -142,8 +163,10 @@ async def generate(
         output_tok = usage.get("completion_tokens") or usage.get("output_tokens") or 0
         total_tok = usage.get("total_tokens") or 0
 
+        active_model = model_name or (config.JSON_MODEL if json_mode else config.MODEL)
+
         record_llm_call({
-            "model_name": config.MODEL,
+            "model_name": active_model,
             "token_usage": {
                 "input_tokens": input_tok,
                 "output_tokens": output_tok,
@@ -154,7 +177,7 @@ async def generate(
 
         return LLMResponse(
             content=str(response.content) if response.content else "",
-            model_name=config.MODEL,
+            model_name=active_model,
             input_tokens=input_tok,
             output_tokens=output_tok,
             total_tokens=total_tok,
@@ -168,22 +191,24 @@ async def generate(
 async def generate_json(
     messages: list[BaseMessage],
     *,
+    model_name: str | None = None,
     temperature: float = 0.0,
 ) -> dict[str, Any]:
     """Execute a JSON-mode call and return a parsed dict (empty dict on failure)."""
-    response = await generate(messages, temperature=temperature, json_mode=True)
+    response = await generate(messages, model_name=model_name, temperature=temperature, json_mode=True)
     return safe_parse_json(response.content)
 
 
 async def stream(
     messages: list[BaseMessage],
     *,
+    model_name: str | None = None,
     tools: list[ToolSpec] | None = None,
     temperature: float = 0.0,
     max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
     """Stream response tokens from the active LLM provider."""
-    client = _get_client(temperature=temperature, max_tokens=max_tokens)
+    client = _get_client(model_name=model_name, temperature=temperature, max_tokens=max_tokens)
     if tools:
         client = client.bind_tools(tool_specs_to_openai_schema(tools))
 

@@ -11,6 +11,31 @@ from db.pool import get_pool
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# In-memory entity cache (populated at startup, refreshable via admin endpoint)
+# ---------------------------------------------------------------------------
+
+ENTITY_CACHE: dict[str, list[dict[str, Any]]] = {
+    "university": [],
+    "course": [],
+    "specialization": [],
+}
+
+
+async def load_entity_cache() -> None:
+    """Fetch all entity_search rows from Postgres into RAM.
+
+    Called once at lifespan startup and on-demand via the admin cache-refresh
+    endpoint.  Thread-safety is not a concern here because asyncio is
+    single-threaded; the dict swap is atomic.
+    """
+    pool = await get_pool()
+    for etype in ENTITY_CACHE:
+        rows = await queries.find_entity_search(pool, etype)
+        ENTITY_CACHE[etype] = rows
+    total = sum(len(v) for v in ENTITY_CACHE.values())
+    logger.info("Entity cache loaded: %d rows across %d types", total, len(ENTITY_CACHE))
+
 COURSE_HINTS = [
     "mba", "bca", "mca", "bba", "ma", "ba", "mcom", "bcom",
     "btech", "mtech", "masters", "masters in", "bachelors", "bachelors in",
@@ -29,7 +54,8 @@ _STOP_WORDS = {
     "tell", "me", "about", "what", "is", "the", "for", "of", "and", "in", "to", 
     "a", "an", "i", "want", "know", "please", "can", "you", "get", "give", 
     "details", "info", "information", "much", "does", "cost", "fee", "fees",
-    "university", "college", "institute", "program", "degree"
+    "university", "college", "institute", "program", "degree",
+    "at", "from", "with", "by", "on", "under", "above", "below"
 }
 
 
@@ -101,12 +127,24 @@ async def extract_entities(message: str, context: dict[str, Any]) -> dict[str, A
 
 
 async def _snap(entity_type: str, name: str | None) -> str | None:
-    if not name: return None
+    """Fuzzy-match *name* against the in-memory entity cache.
+
+    Falls back to a live DB query if the cache for this entity_type is empty
+    (e.g. on the very first request before load_entity_cache() has run).
+    """
+    if not name:
+        return None
 
     normalized_name = name.lower().strip()
-    pool = await get_pool()
-    rows = await queries.find_entity_search(pool, entity_type)
-    if not rows: return None
+    rows = ENTITY_CACHE.get(entity_type) or []
+
+    if not rows:
+        # Cache miss — fall back to DB (cold start or unknown entity_type)
+        pool = await get_pool()
+        rows = await queries.find_entity_search(pool, entity_type)
+
+    if not rows:
+        return None
 
     best_score = 0
     best_row = None
@@ -115,7 +153,7 @@ async def _snap(entity_type: str, name: str | None) -> str | None:
         search_text = row["search_text"].lower()
         score = max(
             fuzz.WRatio(normalized_name, search_text),
-            fuzz.partial_ratio(normalized_name, search_text)
+            fuzz.partial_ratio(normalized_name, search_text),
         )
         if score > best_score:
             best_score = score
@@ -124,6 +162,7 @@ async def _snap(entity_type: str, name: str | None) -> str | None:
     # Short strings need more forgiveness for typos
     threshold = 75 if len(normalized_name) < 6 else 80
     if best_row and best_score >= threshold:
+        pool = await get_pool()
         return await queries.slug_for_entity_id(pool, entity_type, best_row["entity_id"])
     return None
 

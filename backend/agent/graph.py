@@ -55,6 +55,8 @@ class ChatState(TypedDict, total=False):
     site_id: str
     raw_message: str
     page_university_slug: str | None
+    # Human-readable page context resolved from URL pathname
+    page_context: dict[str, Any]
     context: dict[str, Any]
     resolved: dict[str, Any]
     reply: str
@@ -74,6 +76,7 @@ def _make_state(
     message: str,
     page_university_slug: str | None,
     context: dict[str, Any],
+    page_context: dict[str, Any] | None = None,
     history_messages: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
     history_messages = history_messages or []
@@ -83,6 +86,7 @@ def _make_state(
         "site_id": site_id,
         "raw_message": message,
         "page_university_slug": page_university_slug,
+        "page_context": page_context or {},
         "context": context,
         "resolved": {},
         "reply": "",
@@ -208,7 +212,25 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
 
     messages = list(state["messages"])
     resolved = state.get("resolved", {})
+    page_ctx = state.get("page_context", {})
 
+    # ── Page context note (from URL pathname, human-readable names) ────────
+    page_notes = []
+    if page_ctx.get("page_university_name"):
+        page_notes.append(f"page_university={page_ctx['page_university_name']} (slug={page_ctx['page_university_slug']})")
+    if page_ctx.get("page_course_name"):
+        page_notes.append(f"page_course={page_ctx['page_course_name']} (slug={page_ctx['page_course_slug']})")
+    if page_ctx.get("page_spec_name"):
+        page_notes.append(f"page_specialization={page_ctx['page_spec_name']} (slug={page_ctx['page_spec_slug']})")
+    if page_notes:
+        page_note = (
+            f"[The user is currently viewing: {', '.join(page_notes)}. "
+            "Use these slugs when calling tools if the message refers to 'this university', "
+            "'this course', or 'this page'.]"
+        )
+        messages = messages[:-1] + [SystemMessage(content=page_note)] + messages[-1:]
+
+    # ── Resolved entity slugs note (from fuzzy entity resolution) ─────────
     page_hint_only = resolved.get("_page_hint_only", False)
     context_parts = []
     if not page_hint_only:
@@ -352,6 +374,7 @@ async def run_chat_turn(
     site_id: str,
     message: str,
     page_university_slug: str | None,
+    page_context: dict[str, Any] | None = None,
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
@@ -379,6 +402,7 @@ async def run_chat_turn(
         site_id=site_id,
         message=message,
         page_university_slug=page_university_slug,
+        page_context=page_context or {},
         context=context,
         history_messages=history_messages,
     )
@@ -403,15 +427,23 @@ async def run_chat_turn(
         if event_kind == "on_chain_end" and event["name"] == "LangGraph":
             final_state = event["data"]["output"]
 
-    # Fallback if astream_events didn't capture the final state properly
+    # Fallback if astream_events didn't capture the final state properly or if streaming didn't output text
     if not final_state:
         final_state = await _graph.ainvoke(initial_state)
-        if not reply_text:
-            reply_text = final_state.get("reply", "")
+
+    if not reply_text:
+        if final_state.get("reply"):
+            reply_text = final_state["reply"]
+        elif final_state.get("messages"):
+            last_msg = final_state["messages"][-1]
+            if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
+                reply_text = str(last_msg.content)
+        
+        if reply_text:
             yield {"event": "token", "data": {"text": reply_text}}
 
     # Handle Cache Hits
-    if final_state.get("cache_hit"):
+    if final_state.get("cache_hit") and not reply_text:
         reply_text = final_state.get("reply", "")
         yield {"event": "token", "data": {"text": reply_text}}
 

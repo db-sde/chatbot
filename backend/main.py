@@ -35,6 +35,12 @@ from db.migrate import run_migrations
 async def lifespan(app_: FastAPI):  # noqa: ARG001
     await run_migrations()
     await init_pool()
+    # Warm up the in-memory entity cache so the first request is fast
+    try:
+        from agent.resolve import load_entity_cache
+        await load_entity_cache()
+    except Exception:
+        logger.warning("Entity cache warmup failed — will fall back to DB on first request")
     yield
     await close_pool()
 
@@ -82,6 +88,10 @@ class ChatRequest(BaseModel):
     site_key: str
     message: str = Field(min_length=1, max_length=4000)
     page_university_slug: str | None = None
+    # Zero-config page context: the widget sends the current URL pathname
+    # (e.g. "/colleges/nmims/mba-online").  The backend resolves it against
+    # the DB; the frontend never needs to know slug conventions.
+    page_pathname: str | None = None
 
 
 class LeadRequest(BaseModel):
@@ -236,11 +246,22 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 return
 
             # ── Layer 3: LangGraph Agent ──
+            # Resolve page context from pathname (zero-config; DB-verified slugs)
+            resolved_page_university_slug = body.page_university_slug
+            if body.page_pathname:
+                from agent.page_context import resolve_page_context
+                page_ctx = await resolve_page_context(body.page_pathname, pool)
+                if page_ctx.get("page_university_slug"):
+                    resolved_page_university_slug = page_ctx["page_university_slug"]
+            else:
+                page_ctx = {}
+
             async for event in run_chat_turn(
                 session_id=body.session_id,
                 site_id=body.site_key,
                 message=body.message,
-                page_university_slug=body.page_university_slug,
+                page_university_slug=resolved_page_university_slug,
+                page_context=page_ctx,
                 ip_address=client_ip,
                 user_agent=client_ua,
             ):
@@ -577,6 +598,21 @@ async def admin_settings_status(_: Annotated[None, Depends(check_admin_auth)]) -
             "username": "admin",
             "role": "System Administrator"
         }
+    }
+
+
+@app.post("/api/admin/cache/refresh")
+async def admin_refresh_entity_cache(_: Annotated[None, Depends(check_admin_auth)]) -> dict:
+    """Reload the in-memory entity cache from Postgres.
+
+    Call this after ingesting new universities or courses so the entity
+    resolver picks them up immediately without a server restart.
+    """
+    from agent.resolve import load_entity_cache, ENTITY_CACHE
+    await load_entity_cache()
+    return {
+        "ok": True,
+        "counts": {etype: len(rows) for etype, rows in ENTITY_CACHE.items()},
     }
 
 

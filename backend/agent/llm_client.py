@@ -78,12 +78,13 @@ class LLMClient:
         self,
         prompt: str,
         *,
+        model_name: str | None = None,
         task: str = "entity_resolution",
     ) -> dict[str, Any]:
         """Generate a JSON-mode response. `task` is kept for API compatibility."""
         try:
             messages = to_langchain_messages(prompt)
-            return await _generate_json(messages)
+            return await _generate_json(messages, model_name=model_name)
         except Exception as exc:
             logger.warning("generate_json failed: %s", exc)
             return {}

@@ -7,9 +7,12 @@ from __future__ import annotations
 # Active provider: "groq" or "deepseek"
 PROVIDER = "groq"
 
-# Main model for chat / agent decision turns
-MODEL = "llama-3.3-70b-versatile"
+# Unified model selection architecture
+MAIN_AGENT_MODEL = "llama-3.3-70b-versatile"
+LEAD_INTENT_MODEL = "llama-3.3-70b-versatile"
+PROMPT_GUARD_MODEL = "meta-llama/llama-prompt-guard-2-86m"
 
-# Model used for JSON extraction tasks (entity_resolution, lead_intent)
-# Must support response_format={"type": "json_object"}
-JSON_MODEL = "llama-3.3-70b-versatile"
+# Legacy aliases for backward compatibility
+MODEL = MAIN_AGENT_MODEL
+JSON_MODEL = LEAD_INTENT_MODEL
+
