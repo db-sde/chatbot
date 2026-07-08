@@ -28,7 +28,7 @@ else:
 
 MAIN_AGENT_MODEL = PROVIDER_MODELS[active_provider]["main_agent"]
 LEAD_INTENT_MODEL = PROVIDER_MODELS[active_provider]["lead_intent"]
-PROMPT_GUARD_MODEL = "meta-llama/prompt-guard-2-86m"  # Always meta-llama/prompt-guard-2-86m on Groq
+PROMPT_GUARD_MODEL = "meta-llama/llama-prompt-guard-2-86m"  # Always meta-llama/llama-prompt-guard-2-86m on Groq
 
 # Legacy aliases for backward compatibility
 MODEL = MAIN_AGENT_MODEL

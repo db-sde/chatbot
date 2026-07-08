@@ -119,6 +119,7 @@ def _get_client(
             max_tokens=max_tokens,
             timeout=timeout,
             streaming=streaming,
+            stream_usage=True,  # Ensure usage_metadata is populated even in streaming mode
         )
         if json_mode:
             client = client.bind(response_format={"type": "json_object"})
@@ -134,6 +135,7 @@ def _get_client(
             max_tokens=max_tokens,
             timeout=timeout,
             streaming=streaming,
+            stream_usage=True,  # Ensure usage_metadata is populated even in streaming mode
         )
         if json_mode:
             client = client.bind(response_format={"type": "json_object"})
@@ -188,11 +190,24 @@ async def generate(
         response: AIMessage = await client.ainvoke(clean_messages(messages))
         mark_first_token()
 
-        meta = getattr(response, "response_metadata", {}) or {}
-        usage = meta.get("token_usage") or {}
-        input_tok = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-        output_tok = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-        total_tok = usage.get("total_tokens") or 0
+        # Extract tokens: prefer usage_metadata (streaming + batch) then
+        # response_metadata['token_usage'] (batch-only, raw OpenAI field names).
+        input_tok = 0
+        output_tok = 0
+        total_tok = 0
+
+        usage_meta = getattr(response, "usage_metadata", None)
+        if usage_meta:
+            input_tok = usage_meta.get("input_tokens") or 0
+            output_tok = usage_meta.get("output_tokens") or 0
+            total_tok = usage_meta.get("total_tokens") or (input_tok + output_tok)
+
+        if input_tok == 0:
+            meta = getattr(response, "response_metadata", {}) or {}
+            usage = meta.get("token_usage") or {}
+            input_tok = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+            output_tok = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            total_tok = usage.get("total_tokens") or (input_tok + output_tok)
 
         active_model = model_name or (config.JSON_MODEL if json_mode else config.MODEL)
 

@@ -2,42 +2,62 @@ from __future__ import annotations
 
 # Pricing config for LLMs, price per million tokens in USD
 MODEL_PRICING = {
-    # Gemini 2.5 Flash
+    # Gemini 2.5 Flash (Legacy)
     "gemini-2.5-flash": {
         "input_per_million": 0.075,
         "output_per_million": 0.30
     },
-    # Gemini 1.5 Flash (fallback config)
+    # Gemini 1.5 Flash (Legacy fallback)
     "gemini-1.5-flash": {
         "input_per_million": 0.075,
         "output_per_million": 0.30
     },
-    # Llama 3.3 70B Versatile on Groq
+    # Llama 3.3 70B Versatile on Groq (Active)
     "llama-3.3-70b-versatile": {
         "input_per_million": 0.59,
         "output_per_million": 0.79
     },
-    # OpenAI GPT-4o mini
+    # Llama 3.1 8B Instant on Groq (Active)
+    "llama-3.1-8b-instant": {
+        "input_per_million": 0.05,
+        "output_per_million": 0.08
+    },
+    # Meta Llama Prompt Guard 2 on Groq (Active Security - Option A: free/tracked separately)
+    "meta-llama/prompt-guard-2-86m": {
+        "input_per_million": 0.0,
+        "output_per_million": 0.0
+    },
+    # OpenAI GPT-4.1 Mini (Future/Active)
+    "gpt-4.1-mini": {
+        "input_per_million": 0.40,
+        "output_per_million": 1.60
+    },
+    # OpenAI GPT-4.1 Nano (Future/Active)
+    "gpt-4.1-nano": {
+        "input_per_million": 0.10,
+        "output_per_million": 0.40
+    },
+    # OpenAI GPT-4o mini (Legacy)
     "gpt-4o-mini": {
         "input_per_million": 0.15,
         "output_per_million": 0.60
     },
-    # OpenAI GPT-4o
+    # OpenAI GPT-4o (Legacy/Active)
     "gpt-4o": {
         "input_per_million": 2.50,
         "output_per_million": 10.00
     },
-    # Anthropic Claude 3.5 Sonnet
+    # Anthropic Claude 3.5 Sonnet (Active)
     "claude-3-5-sonnet-20241022": {
         "input_per_million": 3.00,
         "output_per_million": 15.00
     },
-    # DeepSeek Chat
+    # DeepSeek Chat (Active)
     "deepseek-chat": {
         "input_per_million": 0.14,
         "output_per_million": 0.28
     },
-    # Kimi / Moonshot
+    # Kimi / Moonshot (Unused)
     "moonshot-v1-8k": {
         "input_per_million": 0.50,
         "output_per_million": 1.50

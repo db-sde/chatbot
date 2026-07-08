@@ -496,11 +496,14 @@ async def check_prompt_safety(
         # Reason & source determination
         reason = pg_result["reason"] or heuristic_result["reason"]
         if not pg_result["safe"] and not heuristic_result["safe"]:
-            source = "prompt_guard_2+heuristic"
+            source = "combined"
         elif not pg_result["safe"]:
             source = "prompt_guard_2"
-        else:
+        elif not heuristic_result["safe"]:
             source = "heuristic"
+        else:
+            # Both detectors ran and both passed: primary detector gets credit
+            source = "prompt_guard_2"
 
         result = SafetyResult(
             safe=safe,

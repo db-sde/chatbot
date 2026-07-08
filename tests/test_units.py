@@ -156,6 +156,43 @@ def test_security_local_heuristic():
     assert res["source"] == "heuristic"
 
 
+# ── Pricing Unit Tests ────────────────────────────────────────────────────────
+
+def test_calculate_message_cost():
+    from pricing_config import calculate_message_cost
+    
+    # Missing input/output tokens should return None
+    assert calculate_message_cost("gpt-4.1-mini", None, 100) is None
+    assert calculate_message_cost("gpt-4.1-mini", 100, None) is None
+    
+    # Case insensitivity & exact matches
+    # gpt-4.1-mini: input=$0.40/M, output=$1.60/M
+    # 1M input, 1M output -> 0.40 + 1.60 = 2.00
+    cost = calculate_message_cost("GPT-4.1-Mini", 1_000_000, 1_000_000)
+    assert cost == 2.0
+    
+    # gpt-4.1-nano: input=$0.10/M, output=$0.40/M
+    # 1M input, 1M output -> 0.10 + 0.40 = 0.50
+    cost = calculate_message_cost("gpt-4.1-nano", 1_000_000, 1_000_000)
+    assert cost == 0.5
+    
+    # llama-3.1-8b-instant: input=$0.05/M, output=$0.08/M
+    # 1M input, 1M output -> 0.05 + 0.08 = 0.13
+    cost = calculate_message_cost("llama-3.1-8b-instant", 1_000_000, 1_000_000)
+    assert cost == 0.13
+    
+    # meta-llama/prompt-guard-2-86m (Option A) should return 0.0 cost
+    cost = calculate_message_cost("meta-llama/prompt-guard-2-86m", 1_000_000, 1_000_000)
+    assert cost == 0.0
+
+    # Fallback to default
+    # default: input=$0.15/M, output=$0.60/M
+    # 1M input, 1M output -> 0.15 + 0.60 = 0.75
+    cost = calculate_message_cost("non-existent-model", 1_000_000, 1_000_000)
+    assert cost == 0.75
+
+
+
 
 # ── Scoring Unit Tests ──────────────────────────────────────────────────────
 

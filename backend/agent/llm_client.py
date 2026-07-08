@@ -56,6 +56,8 @@ class LLMClient:
         provider = config.PROVIDER.lower()
         if provider == "groq":
             return bool(settings.groq_api_key)
+        if provider == "openai":
+            return bool(settings.openai_api_key)
         if provider == "deepseek":
             return bool(settings.deepseek_api_key)
         return False

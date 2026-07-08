@@ -138,7 +138,16 @@ def patch_llm(monkeypatch):
     # Mock the LangChain ChatModel get_chat_model
     mock_model = AsyncMock()
     mock_model.bind_tools.return_value = mock_model
-    mock_model.ainvoke.return_value = AIMessage(content="The NMIMS Online MBA fee is Rs 2,20,000.")
+    
+    mock_msg = AIMessage(content="The NMIMS Online MBA fee is Rs 2,20,000.")
+    mock_msg.response_metadata = {
+        "token_usage": {
+            "prompt_tokens": 15,
+            "completion_tokens": 20,
+            "total_tokens": 35
+        }
+    }
+    mock_model.ainvoke.return_value = mock_msg
 
     monkeypatch.setattr("llm.provider.get_chat_model", lambda *args, **kwargs: mock_model)
     return mock_model

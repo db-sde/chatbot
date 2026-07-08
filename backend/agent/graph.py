@@ -229,7 +229,14 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
             "Use these slugs when calling tools if the message refers to 'this university', "
             "'this course', or 'this page'.]"
         )
-        messages = messages[:-1] + [SystemMessage(content=page_note)] + messages[-1:]
+        # Inject BEFORE the last HumanMessage only — never between AIMessage(tool_calls)
+        # and ToolMessage, which violates OpenAI's tool-calling protocol.
+        last_human_idx = next(
+            (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+            None,
+        )
+        if last_human_idx is not None:
+            messages = messages[:last_human_idx] + [SystemMessage(content=page_note)] + messages[last_human_idx:]
 
     # ── Resolved entity slugs note (from fuzzy entity resolution) ─────────
     page_hint_only = resolved.get("_page_hint_only", False)
@@ -244,7 +251,14 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
             f"[Resolved context for this turn: {', '.join(context_parts)}. "
             "Use these exact slugs when calling tools.]"
         )
-        messages = messages[:-1] + [SystemMessage(content=context_note)] + messages[-1:]
+        # Same rule: inject before the last HumanMessage to never break the
+        # AIMessage(tool_calls) → ToolMessage sequence required by OpenAI.
+        last_human_idx = next(
+            (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+            None,
+        )
+        if last_human_idx is not None:
+            messages = messages[:last_human_idx] + [SystemMessage(content=context_note)] + messages[last_human_idx:]
 
     mark_llm_start()
     t_start = time.perf_counter()
@@ -256,7 +270,46 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
         response = await model.ainvoke(_clean_messages(messages))
 
         mark_first_token()
+
+        # Extract and record token usage for observability/pricing.
+        # Prefer usage_metadata (populated for both streaming and batch by LangChain)
+        # over response_metadata['token_usage'] (batch-only, uses raw OpenAI field names).
+        try:
+            from observability import record_llm_call
+            from llm import config
+
+            input_tok = 0
+            output_tok = 0
+            total_tok = 0
+
+            # Path 1: usage_metadata — normalized by LangChain; works for streaming + batch
+            usage_meta = getattr(response, "usage_metadata", None)
+            if usage_meta:
+                input_tok = usage_meta.get("input_tokens") or 0
+                output_tok = usage_meta.get("output_tokens") or 0
+                total_tok = usage_meta.get("total_tokens") or (input_tok + output_tok)
+
+            # Path 2: response_metadata['token_usage'] — batch mode fallback (raw OpenAI names)
+            if input_tok == 0:
+                meta = getattr(response, "response_metadata", {}) or {}
+                usage = meta.get("token_usage") or {}
+                input_tok = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+                output_tok = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+                total_tok = usage.get("total_tokens") or (input_tok + output_tok)
+
+            record_llm_call({
+                "model_name": config.MAIN_AGENT_MODEL,
+                "token_usage": {
+                    "input_tokens": input_tok,
+                    "output_tokens": output_tok,
+                    "total_tokens": total_tok,
+                },
+            })
+        except Exception as o_exc:
+            logger.warning("Failed to record agent token usage: %s", o_exc)
+
         return {"messages": [response]}
+
     except Exception as exc:  # noqa: BLE001
         logger.warning("agent failed: %s", exc)
         return {"messages": [AIMessage(content="I encountered an issue processing your request. Please try again.")]}
