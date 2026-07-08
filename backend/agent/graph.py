@@ -143,30 +143,32 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
 
     logger.info("[%s] RESOLVE ENTITIES | msg=%r", session_id, message[:100])
     resolved = await _resolve_entities(message, context, page_university_slug)
+
+    resolution_status = resolved.get("resolution_status", "none")
     logger.info(
-        "[%s] RESOLVE RESULT | uni=%s course=%s spec=%s mode=%s max_fee=%s",
+        "[%s] RESOLVE RESULT | uni=%s course=%s spec=%s mode=%s max_fee=%s status=%s",
         session_id,
         resolved.get("university_slug"), resolved.get("course_slug"),
         resolved.get("specialization_slug"), resolved.get("mode"), resolved.get("max_fee"),
+        resolution_status,
     )
 
-    context_university = context.get("current_university_slug")
-    new_university = resolved.get("university_slug")
-    from agent.resolve import _message_needs_entity
-    page_hint_only = (
-        new_university == page_university_slug
-        and new_university != context_university
-        and not _message_needs_entity(message)
+    # Only persist to session when the entity was genuinely resolved from the catalog.
+    # Page context and session context reuse don't warrant overwriting the stored context.
+    # entity_not_found means no university at all — don't persist None over a valid stored value.
+    persist_university = (
+        resolved.get("university_slug")
+        if resolution_status == "resolved"
+        else None
     )
-    persist_university = None if page_hint_only else new_university
 
     pool = await get_pool()
     await queries.update_session_context(
         pool,
         session_id,
         persist_university,
-        resolved.get("course_slug"),
-        resolved.get("specialization_slug"),
+        resolved.get("course_slug") if resolution_status == "resolved" else None,
+        resolved.get("specialization_slug") if resolution_status == "resolved" else None,
     )
 
     intent_text = message.lower()
@@ -175,6 +177,10 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
     elif any(t in intent_text for t in ("eligible", "eligibility", "criteria")):
         await log_anonymous_signal(session_id, resolved.get("university_slug"), resolved.get("course_slug"), "eligibility")
 
+    # _page_hint_only=True suppresses the "resolved context" system note in node_agent.
+    # It is True for page_context and session_context (slug is contextual, not from user intent)
+    # and for entity_not_found/partial_match (agent handles the clarification itself).
+    page_hint_only = resolution_status in ("page_context", "session_context", "entity_not_found", "partial_match", "none")
     resolved["_page_hint_only"] = page_hint_only
     return {"resolved": resolved}
 
@@ -240,9 +246,15 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
 
     # ── Resolved entity slugs note (from fuzzy entity resolution) ─────────
     page_hint_only = resolved.get("_page_hint_only", False)
+    resolution_status = resolved.get("resolution_status", "none")
     context_parts = []
     if not page_hint_only:
-        if resolved.get("university_slug"): context_parts.append(f"university_slug={resolved['university_slug']}")
+        comp_targets = resolved.get("comparison_targets", [])
+        if len(comp_targets) > 1:
+            context_parts.append(f"comparison_targets={comp_targets}")
+        elif resolved.get("university_slug"):
+            context_parts.append(f"university_slug={resolved['university_slug']}")
+            
         if resolved.get("course_slug"): context_parts.append(f"course_slug={resolved['course_slug']}")
         if resolved.get("specialization_slug"): context_parts.append(f"specialization_slug={resolved['specialization_slug']}")
 
@@ -259,6 +271,46 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
         )
         if last_human_idx is not None:
             messages = messages[:last_human_idx] + [SystemMessage(content=context_note)] + messages[last_human_idx:]
+
+    # ── Entity-not-found advisory note ────────────────────────────────────────
+    # When the user explicitly named a university that isn't in the catalog,
+    # tell the agent clearly so it can respond without making a tool call.
+    if resolution_status == "entity_not_found":
+        requested = resolved.get("requested_entity") or "the university you mentioned"
+        not_found_note = (
+            f"[The user asked about '{requested}' but this entity was NOT found in "
+            "DegreeBaba's catalog. Do NOT call any tools. Inform the user politely that "
+            f"'{requested}' is not currently available in the catalog and ask them to "
+            "clarify or try a different university name.]"
+        )
+        last_human_idx = next(
+            (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+            None,
+        )
+        if last_human_idx is not None:
+            messages = messages[:last_human_idx] + [SystemMessage(content=not_found_note)] + messages[last_human_idx:]
+
+    # ── Partial-match advisory note ───────────────────────────────────────────
+    # When comparing multiple universities and some are missing from the catalog,
+    # tell the agent which are found/missing so it can inform the user without calling tools.
+    if resolution_status == "partial_match":
+        found = resolved.get("comparison_found") or []
+        missing = resolved.get("comparison_missing") or []
+        found_str = ", ".join(found) if found else "None"
+        missing_str = ", ".join(missing) if missing else "None"
+        partial_note = (
+            f"[The user wants to compare multiple universities. "
+            f"We found: {found_str}. We could NOT find: {missing_str}. "
+            "Do NOT call any comparison tools. Inform the user politely about which "
+            "universities were found and which were not, and ask them to clarify or "
+            "try different university names.]"
+        )
+        last_human_idx = next(
+            (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+            None,
+        )
+        if last_human_idx is not None:
+            messages = messages[:last_human_idx] + [SystemMessage(content=partial_note)] + messages[last_human_idx:]
 
     mark_llm_start()
     t_start = time.perf_counter()

@@ -134,6 +134,9 @@ _FACTUAL_KEYWORDS = {
     "placement", "ranking", "course", "program", "specializ", "duration",
     "compare", "comparison", "vs", "versus", "tell me about", "info",
     "details", "what is", "how much", "brochure",
+    "ugc", "naac", "approve", "accredit", "recogni",
+    "this", "current", "here", "page", "about", "university", "college", "school",
+    "more", "it",
 }
 
 # Stop words — stripped before isolating the entity name
@@ -144,6 +147,15 @@ _STOP_WORDS = {
     "university", "college", "institute", "program", "degree",
     "at", "from", "with", "by", "on", "under", "above", "below",
     "show", "list", "find", "search", "explore",
+    # Additional common words that are not university names
+    "more", "this", "here", "there", "are", "available", "courses", "how",
+    "do", "which", "any", "all", "its", "their", "my", "your", "our",
+    "has", "have", "had", "will", "would", "could", "should", "may", "might",
+    "some", "many", "best", "good", "great", "top", "right", "need",
+    "these", "those", "that", "been", "they", "them", "we", "he", "she",
+    "good", "better", "new", "look", "also", "currently", "now", "today",
+    "provide", "support", "help", "assist", "available", "get", "take",
+    "currently", "popular", "well", "known", "check", "see", "view",
 }
 
 
@@ -211,6 +223,21 @@ def _extract_university_name(message: str, local_hints: dict[str, Any]) -> str |
 
     remaining = [w for w in words if w not in ignore and len(w) > 1]
     return " ".join(remaining) if remaining else None
+
+
+def _extract_university_queries(message: str, local_hints: dict[str, Any]) -> list[str]:
+    """
+    Split the message by comparison or coordinate separators and extract university names
+    from each part individually to support comparison and multi-entity queries.
+    """
+    hints = {k: v for k, v in local_hints.items() if k != "university_query"}
+    parts = re.split(r"\b(?:and|vs|versus|with|or)\b|,", message, flags=re.IGNORECASE)
+    queries = []
+    for part in parts:
+        uni_name = _extract_university_name(part, hints)
+        if uni_name:
+            queries.append(uni_name)
+    return queries
 
 
 # ---------------------------------------------------------------------------
@@ -451,8 +478,13 @@ async def resolve_entities(
       2. Snap university → get entity_id for downstream scoping
       3. Snap course ONLY if course evidence exists, scoped to university
       4. Snap specialization ONLY if spec evidence exists, scoped to course+uni
-      5. Fall back to session context for missing slots
-      6. Apply page-context hint for university when message needs factual data
+      5. Session context fallback ONLY when user did NOT name a university explicitly
+      6. Page context ONLY when user did NOT name a university explicitly
+
+    POLICY: If the user explicitly names a university (university_query is present)
+    and it misses the catalog, the result is entity_not_found — page context and
+    session context are NOT used as silent substitutes. The agent is expected to
+    tell the user the university isn't in the catalog.
     """
     # ── Step 0: Greeting short-circuit ─────────────────────────────────
     if is_greeting(message):
@@ -467,15 +499,31 @@ async def resolve_entities(
             "sort_by": None,
             "order": "asc",
             "comparison_targets": [],
+            "resolution_status": "none",
+            "requested_entity": None,
         }
 
     intent = extract_intent(message)
     logger.info("INTENT | msg=%r -> %r", message[:80], intent)
 
+    university_queries = _extract_university_queries(message, intent)
+    explicit_university_requested = bool(university_queries)
+
     # ── Step 1: University ──────────────────────────────────────────────────
-    university_slug, university_entity_id = await snap_university(
-        intent.get("university_query")
-    )
+    resolved_slugs = []
+    resolved_ids = []
+    missing_queries = []
+    for q in university_queries:
+        slug, entity_id = await snap_university(q)
+        if slug:
+            resolved_slugs.append(slug)
+            resolved_ids.append(entity_id)
+        else:
+            missing_queries.append(q)
+
+    # Use the first resolved university for scoping course and specialization resolution
+    university_slug = resolved_slugs[0] if resolved_slugs else None
+    university_entity_id = resolved_ids[0] if resolved_ids else None
 
     # ── Step 2: Course (scoped to university) ───────────────────────────────
     course_slug: str | None = None
@@ -495,25 +543,76 @@ async def resolve_entities(
             course_entity_id=course_entity_id,
         )
 
-    # ── Step 4: Session context fallback ────────────────────────────────────
-    if not university_slug:
-        university_slug = context.get("current_university_slug")
-    if not course_slug:
-        course_slug = context.get("current_course_slug")
-    if not specialization_slug:
-        specialization_slug = context.get("current_specialization_slug")
+    # ── Step 4: Session + Page context fallbacks ─────────────────────────────
+    # CRITICAL POLICY: Only apply fallbacks when the user did NOT explicitly name
+    # a university. An explicit miss means the named entity is not in the catalog —
+    # silently substituting page/session context would answer about the wrong entity.
+    resolution_status: str
+    requested_entity: str | None = None
+    comparison_targets: list[str] = []
+    comparison_found: list[str] = []
+    comparison_missing: list[str] = []
 
-    # ── Step 5: Page context hint ────────────────────────────────────────────
-    if not university_slug and page_university_slug and _message_needs_entity(message):
-        university_slug = page_university_slug
-        logger.info(
-            "ENTITY FALLBACK | page_university_slug=%r applied for: %r",
-            page_university_slug, message[:80],
-        )
+    if explicit_university_requested:
+        requested_entity = ", ".join(university_queries)
+        if len(university_queries) > 1:
+            # Comparison or multi-entity query
+            if missing_queries:
+                resolution_status = "partial_match"
+                comparison_found = resolved_slugs
+                comparison_missing = missing_queries
+                logger.info(
+                    "PARTIAL MATCH DETECTED | found=%r | missing=%r | RESOLVED | uni=%s",
+                    resolved_slugs,
+                    missing_queries,
+                    university_slug,
+                )
+            else:
+                resolution_status = "resolved"
+                comparison_targets = resolved_slugs
+        else:
+            # Single named entity requested
+            if missing_queries:
+                resolution_status = "entity_not_found"
+                university_slug = None
+                requested_entity = university_queries[0]
+                logger.info(
+                    "EXPLICIT ENTITY NOT FOUND | requested=%r | RESOLVED | uni=None",
+                    requested_entity,
+                )
+            else:
+                resolution_status = "resolved"
+                requested_entity = resolved_slugs[0]
+    else:
+        # User did NOT name a university — implicit query ("What courses?", "Tell me more")
+        # Try session context first, then page context.
+        session_uni = context.get("current_university_slug")
+        if session_uni:
+            university_slug = session_uni
+            resolution_status = "session_context"
+            logger.info(
+                "NO EXPLICIT ENTITY DETECTED | SESSION CONTEXT APPLIED | uni=%s",
+                university_slug,
+            )
+        elif page_university_slug and _message_needs_entity(message):
+            university_slug = page_university_slug
+            resolution_status = "page_context"
+            logger.info(
+                "NO EXPLICIT ENTITY DETECTED | PAGE CONTEXT APPLIED | uni=%s",
+                university_slug,
+            )
+        else:
+            resolution_status = "none"
+
+        # Implicit course/spec fallbacks only apply when no explicit university either
+        if not course_slug:
+            course_slug = context.get("current_course_slug")
+        if not specialization_slug:
+            specialization_slug = context.get("current_specialization_slug")
 
     logger.info(
-        "RESOLVED | uni=%s course=%s spec=%s",
-        university_slug, course_slug, specialization_slug,
+        "RESOLVED | uni=%s course=%s spec=%s status=%s",
+        university_slug, course_slug, specialization_slug, resolution_status,
     )
 
     return {
@@ -525,5 +624,9 @@ async def resolve_entities(
         "max_fee": intent.get("max_fee"),
         "sort_by": intent.get("sort_by"),
         "order": intent.get("order", "asc"),
-        "comparison_targets": intent.get("comparison_targets") or [],
+        "comparison_targets": comparison_targets or resolved_slugs,
+        "resolution_status": resolution_status,
+        "requested_entity": requested_entity,
+        "comparison_found": comparison_found,
+        "comparison_missing": comparison_missing,
     }
