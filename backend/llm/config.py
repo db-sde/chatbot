@@ -9,7 +9,7 @@ PROVIDER = "groq"
 
 # Unified model selection architecture
 MAIN_AGENT_MODEL = "llama-3.3-70b-versatile"
-LEAD_INTENT_MODEL = "llama-3.3-70b-versatile"
+LEAD_INTENT_MODEL = "llama-3.1-8b-instant"
 PROMPT_GUARD_MODEL = "meta-llama/llama-prompt-guard-2-86m"
 
 # Legacy aliases for backward compatibility

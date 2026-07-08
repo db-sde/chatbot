@@ -104,33 +104,31 @@ def _make_state(
 
 async def node_triage(state: ChatState) -> dict[str, Any]:
     """
-    FAST PATH: Semantic Cache + Chitchat Router.
-    This node should use a VERY cheap/fast model (e.g., Llama-3-8B) or non-LLM methods.
+    FAST PATH: Greeting/chitchat detector + future semantic cache hook.
+    Uses a zero-cost regex/set check — no LLM, no DB, no network.
     """
+    from agent.resolve import is_greeting
     message = state["raw_message"]
-    
-    # 1. SEMANTIC CACHE (Pseudo-code)
-    # cached_reply = await semantic_cache.get(message)
-    # if cached_reply:
-    #     return {"reply": cached_reply, "cache_hit": True}
-    
-    # 2. FAST INTENT CLASSIFICATION (Pseudo-code)
-    # intent = await fast_classifier.classify(message) # "chitchat" or "factual"
-    # For now, we default to "factual" to route to the heavy pipeline.
-    
+
+    if is_greeting(message):
+        logger.info("[%s] TRIAGE -> chitchat (greeting detected: %r)", state.get("session_id"), message[:60])
+        return {"triage_intent": "chitchat", "cache_hit": False}
+
+    # Future: semantic cache lookup here before hitting the full pipeline.
     return {"triage_intent": "factual", "cache_hit": False}
+
 
 def route_after_triage(state: ChatState) -> str:
     if state.get("cache_hit"):
-        return END # Skip everything, run_chat_turn will use state["reply"]
+        return END
     if state.get("triage_intent") == "chitchat":
         return "chitchat_reply"
     return "resolve_entities"
 
+
 async def node_chitchat_reply(state: ChatState) -> dict[str, Any]:
-    """Handles simple greetings without hitting the heavy agent or DB."""
-    # Use a tiny model or hardcoded responses here to save $$
-    reply = "Hello! I'm the DegreeBaba assistant. How can I help you with courses, fees, or admissions today?"
+    """Handles greetings/simple chitchat without hitting the DB or the agent."""
+    reply = "Hello! I'm the DegreeBaba assistant. How can I help you with universities, courses, fees, or admissions today?"
     return {"reply": reply, "messages": [AIMessage(content=reply)]}
 
 

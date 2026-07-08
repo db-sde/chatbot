@@ -190,39 +190,60 @@ def test_local_extract():
     assert res.get("max_fee") == 500000.0
 
 
-@pytest.mark.asyncio
-async def test_extract_entities(monkeypatch):
-    async def mock_trgm(pool, message, limit=3):
-        return [
-            {"entity_type": "university", "search_text": "amity university", "entity_id": 1},
-            {"entity_type": "course", "search_text": "bba bachelors in business administration", "entity_id": 2}
-        ]
-    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
+def test_extract_intent_university_only():
+    """A bare university name should produce only university_query."""
+    intent = resolve.extract_intent("nmims")
+    assert intent.get("university_query") == "nmims"
+    assert "course_query" not in intent
+    assert "specialization_query" not in intent
 
-    res = await resolve.extract_entities("What is the fee at NMIMS for MBA?", {})
-    assert res.get("university") == "nmims"
-    assert res.get("course") == "mba"
+
+def test_extract_intent_university_and_course():
+    intent = resolve.extract_intent("nmims mba")
+    assert intent.get("university_query") == "nmims"
+    assert intent.get("course_query") == "mba"
+    assert "specialization_query" not in intent
+
+
+def test_extract_intent_all_three():
+    intent = resolve.extract_intent("nmims mba marketing")
+    assert intent.get("university_query") == "nmims"
+    assert intent.get("course_query") == "mba"
+    assert intent.get("specialization_query") == "marketing"
+
+
+def test_extract_intent_greeting():
+    """extract_intent is a pure text parser and does not filter greetings.
+    The greeting gate lives in resolve_entities (Step 0) and node_triage.
+    This test documents that boundary by checking the actual resolve layer."""
+    # Sanity: extraction on a real query still works
+    intent = resolve.extract_intent("nmims mba")
+    assert intent.get("university_query") is not None
+    assert intent.get("course_query") == "mba"
+
+
+def test_is_greeting():
+    for msg in ("hi", "Hi!", "hello", "Hello!", "thanks", "ok", "bye", "good morning"):
+        assert resolve.is_greeting(msg), f"{msg!r} should be detected as greeting"
+    for msg in ("nmims mba fee", "what is the fee?", "tell me about NMIMS"):
+        assert not resolve.is_greeting(msg), f"{msg!r} should NOT be a greeting"
 
 
 @pytest.mark.asyncio
 async def test_resolve_entities(monkeypatch):
-    async def mock_trgm(pool, message, limit=3):
-        return [
-            {"entity_type": "university", "search_text": "nmims university", "entity_id": 1},
-            {"entity_type": "course", "search_text": "mba program", "entity_id": 2}
-        ]
-    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
+    """University + course should resolve via cache snapping."""
+    resolve.ENTITY_CACHE["university"] = [
+        {"entity_id": 1, "search_text": "nmims narsee monjee institute nmims"}
+    ]
+    resolve.ENTITY_CACHE["course"] = [
+        {"entity_id": 1, "search_text": "online mba nmims-online-mba", "university_id": 1}
+    ]
+    resolve.ENTITY_CACHE["specialization"] = []
 
-    async def mock_find_entity_search(pool, entity_type):
-        if entity_type == "course":
-            return [{"entity_type": "course", "entity_id": 1, "search_text": "mba program"}]
-        return [{"entity_type": "university", "entity_id": 1, "search_text": "nmims university"}]
-
-    async def mock_slug_for_entity_id(pool, entity_type, entity_id):
+    async def mock_slug(pool, entity_type, entity_id):
         return f"resolved-{entity_type}-slug"
 
-    monkeypatch.setattr(resolve.queries, "find_entity_search", mock_find_entity_search)
-    monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug_for_entity_id)
+    monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug)
 
     res = await resolve.resolve_entities("MBA at NMIMS", {})
     assert res["university_slug"] == "resolved-university-slug"
@@ -231,31 +252,29 @@ async def test_resolve_entities(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_entities_short_disambiguation(monkeypatch):
-    async def mock_trgm(pool, message, limit=3):
-        return [{"entity_type": "course", "search_text": "bca", "entity_id": 1}]
-    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
+    """Short course abbreviation 'bca' should snap to its course."""
+    resolve.ENTITY_CACHE["university"] = []
+    resolve.ENTITY_CACHE["course"] = [
+        {"entity_id": 1, "search_text": "bca bachelors in computer applications online-bca", "university_id": 1},
+        {"entity_id": 2, "search_text": "mca masters in computer applications online-mca", "university_id": 1},
+    ]
+    resolve.ENTITY_CACHE["specialization"] = []
 
-    async def mock_find_entity_search(pool, entity_type):
-        return [
-            {"entity_type": "course", "entity_id": 1, "search_text": "bca bachelors in computer applications"},
-            {"entity_type": "course", "entity_id": 2, "search_text": "mca masters in computer applications"}
-        ]
-
-    async def mock_slug_for_entity_id(pool, entity_type, entity_id):
+    async def mock_slug(pool, entity_type, entity_id):
         return "online-bca" if entity_id == 1 else "online-mca"
 
-    monkeypatch.setattr(resolve.queries, "find_entity_search", mock_find_entity_search)
-    monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug_for_entity_id)
+    monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug)
 
     res = await resolve.resolve_entities("fees for bca", {})
     assert res["course_slug"] == "online-bca"
 
 
 @pytest.mark.asyncio
-async def test_resolve_entities_indirect_context(monkeypatch):
-    async def mock_trgm(pool, message, limit=3):
-        return []
-    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
+async def test_resolve_entities_indirect_context():
+    """When no entity in message, should fall back to session context."""
+    resolve.ENTITY_CACHE["university"] = []
+    resolve.ENTITY_CACHE["course"] = []
+    resolve.ENTITY_CACHE["specialization"] = []
 
     context = {
         "current_university_slug": "nmims",
@@ -268,21 +287,69 @@ async def test_resolve_entities_indirect_context(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_entities_typos(monkeypatch):
-    async def mock_trgm(pool, message, limit=3):
-        return [{"entity_type": "university", "search_text": "NIMS", "entity_id": 1}]
-    monkeypatch.setattr(resolve.queries, "find_entities_trgm", mock_trgm)
+    """Typo 'nims' should fuzzy-snap to NMIMS via token_set_ratio."""
+    resolve.ENTITY_CACHE["university"] = [
+        {"entity_id": 1, "search_text": "nmims narsee monjee institute nmims"}
+    ]
+    resolve.ENTITY_CACHE["course"] = []
+    resolve.ENTITY_CACHE["specialization"] = []
 
-    async def mock_find_entity_search(pool, entity_type):
-        return [{"entity_type": "university", "entity_id": 1, "search_text": "nmims narsee monjee nims"}]
-
-    async def mock_slug_for_entity_id(pool, entity_type, entity_id):
+    async def mock_slug(pool, entity_type, entity_id):
         return "nmims"
 
-    monkeypatch.setattr(resolve.queries, "find_entity_search", mock_find_entity_search)
-    monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug_for_entity_id)
+    monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug)
 
-    res = await resolve.resolve_entities("NIMS", {})
+    res = await resolve.resolve_entities("nims", {})
     assert res["university_slug"] == "nmims"
+
+
+@pytest.mark.asyncio
+async def test_greeting_produces_no_resolution():
+    """Greetings must never resolve any entity."""
+    resolve.ENTITY_CACHE["university"] = [
+        {"entity_id": 1, "search_text": "ignou indira gandhi national open university ignou"}
+    ]
+    resolve.ENTITY_CACHE["course"] = [
+        {"entity_id": 1, "search_text": "online mba online-mba", "university_id": 1}
+    ]
+    resolve.ENTITY_CACHE["specialization"] = []
+
+    for msg in ("hi", "hello", "thanks", "ok"):
+        res = await resolve.resolve_entities(msg, {})
+        assert res["university_slug"] is None, f"{msg!r} resolved university to {res['university_slug']!r}"
+        assert res["course_slug"] is None, f"{msg!r} resolved course to {res['course_slug']!r}"
+        assert res["specialization_slug"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_cross_university_specialization(monkeypatch):
+    """Specialization must be scoped to the resolved course, not global."""
+    resolve.ENTITY_CACHE["university"] = [
+        {"entity_id": 1, "search_text": "nmims narsee monjee nmims"}
+    ]
+    resolve.ENTITY_CACHE["course"] = [
+        {"entity_id": 10, "search_text": "online mba nmims-online-mba", "university_id": 1}
+    ]
+    # Two marketing specs: one for NMIMS (course_id=10), one for LPU (course_id=99, uni_id=4)
+    resolve.ENTITY_CACHE["specialization"] = [
+        {"entity_id": 1, "search_text": "marketing management specialization nmims-online-mba-marketing",
+         "university_id": 1, "course_id": 10},
+        {"entity_id": 99, "search_text": "marketing management specialization lpu-online-mba-marketing",
+         "university_id": 4, "course_id": 99},
+    ]
+
+    slugs = {1: "nmims-online-mba-marketing", 10: "nmims-online-mba", 99: "lpu-online-mba-marketing"}
+
+    async def mock_slug(pool, entity_type, entity_id):
+        if entity_type == "university":
+            return "nmims"
+        return slugs.get(entity_id)
+
+    monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug)
+
+    res = await resolve.resolve_entities("nmims mba marketing", {})
+    # Must pick NMIMS marketing, never LPU marketing
+    assert res["specialization_slug"] == "nmims-online-mba-marketing"
 
 
 

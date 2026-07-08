@@ -31,39 +31,41 @@ from settings import settings
 # Must be set before any logger.getLogger() calls so all modules inherit it.
 # Render streams stdout to its log console; plain text works best there.
 # ---------------------------------------------------------------------------
-_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+def configure_logging():
+    _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-logging.config.dictConfig({
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "default": {
-            "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-            "datefmt": "%Y-%m-%dT%H:%M:%S",
+    logging.config.dictConfig({
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                "datefmt": "%Y-%m-%dT%H:%M:%S",
+            },
         },
-    },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "stream": "ext://sys.stdout",
-            "formatter": "default",
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+                "formatter": "default",
+            },
         },
-    },
-    "root": {
-        "handlers": ["console"],
-        "level": _LOG_LEVEL,
-    },
-    # Keep uvicorn's own access/error logs visible too
-    "loggers": {
-        "uvicorn": {"handlers": ["console"], "level": "INFO", "propagate": False},
-        "uvicorn.error": {"handlers": ["console"], "level": "INFO", "propagate": False},
-        "uvicorn.access": {"handlers": ["console"], "level": "INFO", "propagate": False},
-        # Third-party noise: suppress httpx connection details unless debugging
-        "httpx": {"handlers": ["console"], "level": "WARNING", "propagate": False},
-        "httpcore": {"handlers": ["console"], "level": "WARNING", "propagate": False},
-    },
-})
+        "root": {
+            "handlers": ["console"],
+            "level": _LOG_LEVEL,
+        },
+        # Keep uvicorn's own access/error logs visible too
+        "loggers": {
+            "uvicorn": {"handlers": ["console"], "level": "INFO", "propagate": False},
+            "uvicorn.error": {"handlers": ["console"], "level": "INFO", "propagate": False},
+            "uvicorn.access": {"handlers": ["console"], "level": "INFO", "propagate": False},
+            # Third-party noise: suppress httpx connection details unless debugging
+            "httpx": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+            "httpcore": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+        },
+    })
 
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +74,7 @@ from db.migrate import run_migrations
 
 @asynccontextmanager
 async def lifespan(app_: FastAPI):  # noqa: ARG001
+    configure_logging()  # Override uvicorn logging initialization at startup
     await run_migrations()
     await init_pool()
     # Warm up the in-memory entity cache so the first request is fast
@@ -82,6 +85,7 @@ async def lifespan(app_: FastAPI):  # noqa: ARG001
         logger.warning("Entity cache warmup failed — will fall back to DB on first request")
     yield
     await close_pool()
+
 
 
 app = FastAPI(title="DegreeBaba AI Chatbot", version="0.1.0", lifespan=lifespan)
