@@ -44,6 +44,8 @@ import random
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+load_dotenv()
 
 try:
     import asyncpg

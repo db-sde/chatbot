@@ -118,7 +118,13 @@ async def get_fee(university_slug: str, course_slug: str | None = None, speciali
     except Exception:
         logger.exception("get_fee failed (university=%s course=%s spec=%s)", university_slug, course_slug, specialization_slug)
         return _fail("internal_error")
-    return row or _fail(
+    if row:
+        logger.info("get_fee | uni=%s course=%s spec=%s -> total_fee=%s starting_fee=%s",
+                    university_slug, course_slug, specialization_slug,
+                    row.get("total_fee"), row.get("starting_fee"))
+        return row
+    logger.info("get_fee | NOT FOUND uni=%s course=%s spec=%s", university_slug, course_slug, specialization_slug)
+    return _fail(
         "fee_not_found",
         university_slug=university_slug,
         course_slug=course_slug,
@@ -133,7 +139,11 @@ async def get_eligibility(university_slug: str, course_slug: str) -> dict:
     except Exception:
         logger.exception("get_eligibility failed (university=%s course=%s)", university_slug, course_slug)
         return _fail("internal_error")
-    return row or _fail("eligibility_not_found", university_slug=university_slug, course_slug=course_slug)
+    if row:
+        logger.info("get_eligibility | uni=%s course=%s -> found", university_slug, course_slug)
+        return row
+    logger.info("get_eligibility | NOT FOUND uni=%s course=%s", university_slug, course_slug)
+    return _fail("eligibility_not_found", university_slug=university_slug, course_slug=course_slug)
 
 
 async def list_courses(
@@ -235,7 +245,12 @@ async def get_university_overview(university_slug: str) -> dict:
     except Exception:
         logger.exception("get_university_overview failed (university=%s)", university_slug)
         return _fail("internal_error")
-    return row or _fail("university_not_found", university_slug=university_slug)
+    if row:
+        logger.info("get_university_overview | uni=%s -> name=%s naac=%s",
+                    university_slug, row.get("name"), row.get("naac_grade"))
+        return row
+    logger.info("get_university_overview | NOT FOUND uni=%s", university_slug)
+    return _fail("university_not_found", university_slug=university_slug)
 
 
 async def get_university_programs(university_slug: str, limit: int = DEFAULT_LIMIT) -> list[dict] | dict:

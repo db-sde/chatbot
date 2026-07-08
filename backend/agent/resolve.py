@@ -140,6 +140,7 @@ async def _snap(entity_type: str, name: str | None) -> str | None:
 
     if not rows:
         # Cache miss — fall back to DB (cold start or unknown entity_type)
+        logger.warning("ENTITY CACHE empty for type=%s, falling back to DB query", entity_type)
         pool = await get_pool()
         rows = await queries.find_entity_search(pool, entity_type)
 
@@ -161,6 +162,13 @@ async def _snap(entity_type: str, name: str | None) -> str | None:
 
     # Short strings need more forgiveness for typos
     threshold = 75 if len(normalized_name) < 6 else 80
+    logger.debug(
+        "SNAP | type=%s name=%r best_match=%r score=%.1f threshold=%d -> %s",
+        entity_type, normalized_name,
+        best_row["search_text"] if best_row else None,
+        best_score, threshold,
+        "HIT" if (best_row and best_score >= threshold) else "MISS",
+    )
     if best_row and best_score >= threshold:
         pool = await get_pool()
         return await queries.slug_for_entity_id(pool, entity_type, best_row["entity_id"])
@@ -193,10 +201,9 @@ async def resolve_entities(
     # Step 3: page context hint — only when the message actually needs an entity
     if not university_slug and page_university_slug and _message_needs_entity(message):
         university_slug = page_university_slug
-        logger.debug(
-            "Using page_university_slug=%r as hint for message: %r",
-            page_university_slug,
-            message,
+        logger.info(
+            "ENTITY FALLBACK | Using page_university_slug=%r as hint for: %r",
+            page_university_slug, message[:80],
         )
 
     return {

@@ -1,6 +1,7 @@
 
 import json
 import logging
+import logging.config
 import os
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -24,6 +25,44 @@ from security.scanner import check_prompt_safety
 from security.policy import check_policy
 from settings import settings
 
+
+# ---------------------------------------------------------------------------
+# Logging configuration
+# Must be set before any logger.getLogger() calls so all modules inherit it.
+# Render streams stdout to its log console; plain text works best there.
+# ---------------------------------------------------------------------------
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.config.dictConfig({
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            "datefmt": "%Y-%m-%dT%H:%M:%S",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": "default",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": _LOG_LEVEL,
+    },
+    # Keep uvicorn's own access/error logs visible too
+    "loggers": {
+        "uvicorn": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        "uvicorn.error": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        "uvicorn.access": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        # Third-party noise: suppress httpx connection details unless debugging
+        "httpx": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+        "httpcore": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+    },
+})
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +185,13 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
     client_ip: str | None = request.client.host if request.client else None
     client_ua: str | None = request.headers.get("user-agent")
 
+    logger.info(
+        "CHAT REQUEST | session=%s site=%s ip=%s pathname=%s msg_len=%d msg=%r",
+        body.session_id, body.site_key, client_ip,
+        body.page_pathname or body.page_university_slug or "(none)",
+        len(body.message), body.message[:120],
+    )
+
     # ── IP Block Check ──
     if client_ip:
         pool = await get_pool()
@@ -180,7 +226,13 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
             pool = await get_pool()
 
             # ── Layer 1: Prompt Guard 2 ──
+            logger.info("[%s] Running Prompt Guard...", body.session_id)
             safety = await check_prompt_safety(body.message)
+            logger.info(
+                "[%s] Prompt Guard result: safe=%s score=%.4f reason=%s source=%s",
+                body.session_id, safety["safe"], safety["risk_score"],
+                safety.get("reason"), safety.get("source"),
+            )
             if not safety["safe"]:
                 source = safety.get("source", "unknown")
                 logger.warning(
@@ -212,7 +264,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
 
 
             # ── Layer 2: DegreeBaba Policy ──
+            logger.info("[%s] Running policy check...", body.session_id)
             policy = check_policy(body.message)
+            logger.info("[%s] Policy result: passed=%s rule=%s", body.session_id, policy["passed"], policy.get("rule"))
             if not policy["passed"]:
                 logger.warning(
                     "Policy blocked message (rule=%s) session=%s",
@@ -249,13 +303,26 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
             # Resolve page context from pathname (zero-config; DB-verified slugs)
             resolved_page_university_slug = body.page_university_slug
             if body.page_pathname:
+                logger.info("[%s] Resolving page context for pathname: %s", body.session_id, body.page_pathname)
                 from agent.page_context import resolve_page_context
                 page_ctx = await resolve_page_context(body.page_pathname, pool)
                 if page_ctx.get("page_university_slug"):
                     resolved_page_university_slug = page_ctx["page_university_slug"]
+                logger.info(
+                    "[%s] Page context resolved: uni=%s (%s) course=%s (%s) spec=%s (%s)",
+                    body.session_id,
+                    page_ctx.get("page_university_name"), page_ctx.get("page_university_slug"),
+                    page_ctx.get("page_course_name"), page_ctx.get("page_course_slug"),
+                    page_ctx.get("page_spec_name"), page_ctx.get("page_spec_slug"),
+                )
             else:
                 page_ctx = {}
 
+            logger.info(
+                "[%s] Dispatching to LangGraph agent | uni_slug=%s",
+                body.session_id, resolved_page_university_slug,
+            )
+            token_count = 0
             async for event in run_chat_turn(
                 session_id=body.session_id,
                 site_id=body.site_key,
@@ -265,6 +332,18 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 ip_address=client_ip,
                 user_agent=client_ua,
             ):
+                if event["event"] == "token":
+                    token_count += 1
+                elif event["event"] == "final":
+                    metrics = event["data"].get("metrics", {})
+                    logger.info(
+                        "[%s] CHAT COMPLETE | tokens_streamed=%d response_time=%dms ttft=%dms "
+                        "input_tok=%d output_tok=%d cost_usd=%.6f model=%s",
+                        body.session_id, token_count,
+                        metrics.get("response_time_ms", 0), metrics.get("ttft_ms", 0),
+                        metrics.get("input_tokens", 0), metrics.get("output_tokens", 0),
+                        metrics.get("estimated_cost_usd", 0.0), metrics.get("model_name", "?"),
+                    )
                 yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
 
         except Exception as exc:  # noqa: BLE001

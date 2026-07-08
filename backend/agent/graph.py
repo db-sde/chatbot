@@ -137,17 +137,20 @@ async def node_chitchat_reply(state: ChatState) -> dict[str, Any]:
 async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
     """
     Entity resolution: LLM extraction → fuzzy slug snap → context fallback.
-    
-    CRITICAL OPTIMIZATION: _resolve_entities MUST use a fast/cheap model 
-    (e.g., Groq Llama-3-8B) or a non-LLM fuzzy matcher. Do not use your 
-    expensive Agent model here.
     """
     message = state["raw_message"]
     context = state.get("context", {})
     session_id = state["session_id"]
     page_university_slug = state.get("page_university_slug")
 
+    logger.info("[%s] RESOLVE ENTITIES | msg=%r", session_id, message[:100])
     resolved = await _resolve_entities(message, context, page_university_slug)
+    logger.info(
+        "[%s] RESOLVE RESULT | uni=%s course=%s spec=%s mode=%s max_fee=%s",
+        session_id,
+        resolved.get("university_slug"), resolved.get("course_slug"),
+        resolved.get("specialization_slug"), resolved.get("mode"), resolved.get("max_fee"),
+    )
 
     context_university = context.get("current_university_slug")
     new_university = resolved.get("university_slug")
@@ -264,8 +267,20 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
 
 
 async def node_execute_tools(state: ChatState) -> dict[str, Any]:
+    session_id = state.get("session_id", "?")
+    # Log which tools are being called
+    last_msg = state["messages"][-1]
+    if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+        for tc in last_msg.tool_calls:
+            logger.info("[%s] TOOL CALL | %s args=%s", session_id, tc["name"], tc["args"])
     tool_node = ToolNode(TOOLS)
     result = await tool_node.ainvoke(state)
+    # Log tool results
+    for msg in result.get("messages", []):
+        from langchain_core.messages import ToolMessage
+        if isinstance(msg, ToolMessage):
+            content_preview = str(msg.content)[:200]
+            logger.info("[%s] TOOL RESULT | %s -> %s", session_id, getattr(msg, "name", "?"), content_preview)
     count = state.get("tool_call_count", 0) + 1
     return {**result, "tool_call_count": count}
 
