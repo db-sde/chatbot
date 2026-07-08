@@ -11,10 +11,13 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "postgresql://postgres:postgres@localhost:5432/degreebaba_ai"
-    # Provider API keys
+    # Provider config
+    provider: str = "groq"
     groq_api_key: str | None = None
     deepseek_api_key: str | None = None
     deepseek_base_url: str | None = "https://api.deepseek.com"
+    openai_api_key: str | None = None
+
 
 
     allowed_site_keys: str = '{"degreebaba_dev":["localhost","127.0.0.1"],"degreebaba_prod":["degreebaba.com","www.degreebaba.com"],"degreebaba_demo":["*.onrender.com"]}'

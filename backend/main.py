@@ -75,8 +75,11 @@ from db.migrate import run_migrations
 @asynccontextmanager
 async def lifespan(app_: FastAPI):  # noqa: ARG001
     configure_logging()  # Override uvicorn logging initialization at startup
+    from llm.provider import validate_provider_config
+    validate_provider_config()
     await run_migrations()
     await init_pool()
+
     # Warm up the in-memory entity cache so the first request is fast
     try:
         from agent.resolve import load_entity_cache

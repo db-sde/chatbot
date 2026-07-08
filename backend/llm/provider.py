@@ -59,6 +59,22 @@ class LLMResponse:
 # Client factory — the only place provider names are referenced
 # ---------------------------------------------------------------------------
 
+def validate_provider_config() -> None:
+    """Validate active provider environment keys at startup."""
+    provider = config.PROVIDER.lower()
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise RuntimeError("PROVIDER=openai but OPENAI_API_KEY is not configured.")
+    elif provider == "groq":
+        if not settings.groq_api_key:
+            raise RuntimeError("PROVIDER=groq but GROQ_API_KEY is not configured.")
+    elif provider == "deepseek":
+        if not settings.deepseek_api_key:
+            raise RuntimeError("PROVIDER=deepseek but DEEPSEEK_API_KEY is not configured.")
+    else:
+        raise RuntimeError(f"Unknown PROVIDER configuration: {provider!r}")
+
+
 def _get_client(
     *,
     model_name: str | None = None,
@@ -77,7 +93,7 @@ def _get_client(
         model = config.JSON_MODEL if json_mode else config.MODEL
 
     # Prompt Guard is hosted on Groq; automatically route it to Groq if the model matches
-    if model and "prompt-guard" in model:
+    if model == config.PROMPT_GUARD_MODEL or (model and "prompt-guard" in model):
         provider = "groq"
 
     if provider == "groq":
@@ -85,6 +101,20 @@ def _get_client(
         client = ChatGroq(
             model=model,
             api_key=settings.groq_api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            streaming=streaming,
+        )
+        if json_mode:
+            client = client.bind(response_format={"type": "json_object"})
+        return client
+
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI  # noqa: PLC0415
+        client = ChatOpenAI(
+            model=model,
+            api_key=settings.openai_api_key,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
@@ -128,6 +158,7 @@ def get_lead_intent_model() -> Any:
 def get_prompt_guard_model() -> Any:
     """Return the configured ChatModel instance for prompt guard classification (non-streaming)."""
     return _get_client(model_name=config.PROMPT_GUARD_MODEL, streaming=False)
+
 
 
 # ---------------------------------------------------------------------------

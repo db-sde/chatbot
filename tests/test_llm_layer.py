@@ -158,3 +158,81 @@ def test_clean_messages_passthrough_human():
     msg = HumanMessage(content="hello")
     cleaned = clean_messages([msg])
     assert cleaned[0] is msg
+
+
+# ---------------------------------------------------------------------------
+# Provider & Model Validation Tests
+# ---------------------------------------------------------------------------
+
+def test_validate_provider_config_openai_missing_key(monkeypatch):
+    from llm import config
+    from settings import settings
+    
+    monkeypatch.setattr(config, "PROVIDER", "openai")
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    
+    from llm.provider import validate_provider_config
+    with pytest.raises(RuntimeError, match="PROVIDER=openai but OPENAI_API_KEY is not configured."):
+        validate_provider_config()
+
+
+def test_validate_provider_config_openai_success(monkeypatch):
+    from llm import config
+    from settings import settings
+    
+    monkeypatch.setattr(config, "PROVIDER", "openai")
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test-key")
+    
+    from llm.provider import validate_provider_config
+    # Should not raise any error
+    validate_provider_config()
+
+
+def test_validate_provider_config_groq_missing_key(monkeypatch):
+    from llm import config
+    from settings import settings
+    
+    monkeypatch.setattr(config, "PROVIDER", "groq")
+    monkeypatch.setattr(settings, "groq_api_key", None)
+    
+    from llm.provider import validate_provider_config
+    with pytest.raises(RuntimeError, match="PROVIDER=groq but GROQ_API_KEY is not configured."):
+        validate_provider_config()
+
+
+def test_validate_provider_config_groq_success(monkeypatch):
+    from llm import config
+    from settings import settings
+    
+    monkeypatch.setattr(config, "PROVIDER", "groq")
+    monkeypatch.setattr(settings, "groq_api_key", "gsk-test-key")
+    
+    from llm.provider import validate_provider_config
+    # Should not raise any error
+    validate_provider_config()
+
+
+def test_prompt_guard_model_always_forced_to_groq(monkeypatch):
+    from llm import config
+    from settings import settings
+    
+    # Even if provider is set to openai, prompt guard model must be routed to groq
+    monkeypatch.setattr(config, "PROVIDER", "openai")
+    monkeypatch.setattr(config, "PROMPT_GUARD_MODEL", "meta-llama/prompt-guard-2-86m")
+    
+    from llm.provider import _get_client
+    
+    # Mock ChatGroq to make sure it's instantiated
+    from unittest.mock import MagicMock
+    mock_chat_groq = MagicMock()
+    
+    # Temporarily override import or class instantiation inside _get_client
+    # Let's inspect the local imports inside _get_client:
+    # "from langchain_groq import ChatGroq"
+    # We can mock langchain_groq.ChatGroq
+    import sys
+    sys.modules["langchain_groq"] = MagicMock()
+    sys.modules["langchain_groq"].ChatGroq = MagicMock(return_value="mocked-groq-client")
+    
+    client = _get_client(model_name="meta-llama/prompt-guard-2-86m", streaming=False)
+    assert client == "mocked-groq-client"
