@@ -459,6 +459,97 @@ async def test_tool_call_budget_preserves_valid_small_multi_tool_batch(monkeypat
     assert executed_calls == calls
     assert result["tool_calls_executed"] == 2
     assert result["tool_call_limit_reached"] is False
+    assert result["tool_batch_completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_completed_tool_batch_synthesizes_without_tool_catalog(monkeypatch):
+    """A complete tool result uses the plain model for final synthesis."""
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+    import agent.graph as graph_mod
+
+    model = MagicMock()
+    model.bind_tools.return_value = model
+    model.ainvoke = AsyncMock(return_value=AIMessage(content="The fee is Rs 2,20,000."))
+    monkeypatch.setattr(graph_mod, "llm_client", SimpleNamespace(enabled=True, chat_model=model))
+
+    result = await graph_mod.node_agent({
+        "messages": [
+            SystemMessage(content="system"),
+            HumanMessage(content="What is the fee?"),
+            AIMessage(content="", tool_calls=[{"name": "get_fee_tool", "args": {}, "id": "fee"}]),
+            ToolMessage(content='{"total_fee": 220000}', name="get_fee_tool", tool_call_id="fee"),
+        ],
+        "resolved": {},
+        "page_context": {},
+        "tool_batch_completed": True,
+        "tool_call_limit_reached": False,
+        "llm_ms_total": 0.0,
+    })
+
+    assert result["messages"][0].content == "The fee is Rs 2,20,000."
+    model.bind_tools.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_tool_batch_retains_tool_access(monkeypatch):
+    """Not-found tool results preserve the existing ReAct retry path."""
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+    import agent.graph as graph_mod
+
+    model = MagicMock()
+    model.bind_tools.return_value = model
+    model.ainvoke = AsyncMock(return_value=AIMessage(content="Please clarify the university."))
+    monkeypatch.setattr(graph_mod, "llm_client", SimpleNamespace(enabled=True, chat_model=model))
+
+    await graph_mod.node_agent({
+        "messages": [
+            SystemMessage(content="system"),
+            HumanMessage(content="What is the fee?"),
+            AIMessage(content="", tool_calls=[{"name": "get_fee_tool", "args": {}, "id": "fee"}]),
+            ToolMessage(content='{"not_found": true}', name="get_fee_tool", tool_call_id="fee"),
+        ],
+        "resolved": {},
+        "page_context": {},
+        "tool_batch_completed": False,
+        "tool_call_limit_reached": False,
+        "llm_ms_total": 0.0,
+    })
+
+    assert model.bind_tools.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_anonymous_signal_is_not_on_resolver_critical_path(monkeypatch):
+    """Analytics writes start after entity resolution returns to the graph."""
+    import asyncio
+    import agent.graph as graph_mod
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_resolve(*_args):
+        return {"resolution_status": "none", "university_slug": None, "course_slug": None}
+
+    async def slow_signal(*_args):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(graph_mod, "_resolve_entities", fake_resolve)
+    monkeypatch.setattr(graph_mod, "log_anonymous_signal", slow_signal)
+
+    result = await graph_mod.node_resolve_entities({
+        "session_id": "signal-test",
+        "raw_message": "What is the fee?",
+        "context": {},
+        "page_university_slug": None,
+    })
+
+    assert result["resolved"]["resolution_status"] == "none"
+    assert not started.is_set()
+    await asyncio.wait_for(started.wait(), timeout=0.1)
+    release.set()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

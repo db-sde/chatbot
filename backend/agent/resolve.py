@@ -261,10 +261,10 @@ async def load_entity_cache() -> None:
     ]
     _rebuild_university_alias_index()
 
-    # Courses — include university_id for hierarchical filtering
+    # Courses — include canonical slug and name for zero-round-trip snapping.
     course_rows = await pool.fetch(
         """
-        SELECT es.entity_id, es.search_text, c.university_id
+        SELECT es.entity_id, es.search_text, c.slug, c.program_name, c.university_id
         FROM entity_search es
         JOIN courses c ON c.id = es.entity_id
         WHERE es.entity_type = 'course'
@@ -274,15 +274,17 @@ async def load_entity_cache() -> None:
         {
             "entity_id": r["entity_id"],
             "search_text": r["search_text"],
+            "slug": r["slug"],
+            "name": r["program_name"],
             "university_id": r["university_id"],
         }
         for r in course_rows
     ]
 
-    # Specializations — include university_id and course_id
+    # Specializations — include canonical slug and name for zero-round-trip snapping.
     spec_rows = await pool.fetch(
         """
-        SELECT es.entity_id, es.search_text, s.university_id, s.course_id
+        SELECT es.entity_id, es.search_text, s.slug, s.spec_name, s.university_id, s.course_id
         FROM entity_search es
         JOIN specializations s ON s.id = es.entity_id
         WHERE es.entity_type = 'specialization'
@@ -292,6 +294,8 @@ async def load_entity_cache() -> None:
         {
             "entity_id": r["entity_id"],
             "search_text": r["search_text"],
+            "slug": r["slug"],
+            "name": r["spec_name"],
             "university_id": r["university_id"],
             "course_id": r["course_id"],
         }
@@ -845,12 +849,12 @@ def _fuzzy_snap(
 
 
 async def _to_slug(entity_type: str, row: dict[str, Any]) -> str | None:
-    if entity_type == "university":
-        # Prefer in-cache canonical slug — avoids extra DB round-trip
-        if row.get("canonical_slug"):
-            return row["canonical_slug"]
-        if row.get("slug"):
-            return row["slug"]
+    # All warm-cache rows include a canonical slug. Keep the DB fallback for
+    # cold/legacy cache rows so resolver behavior remains unchanged.
+    if row.get("canonical_slug"):
+        return row["canonical_slug"]
+    if row.get("slug"):
+        return row["slug"]
     pool = await get_pool()
     return await queries.slug_for_entity_id(pool, entity_type, row["entity_id"])
 

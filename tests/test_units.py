@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import auth
 from agent import resolve, tools
 from agent.graph import _merge_resolved_into_tool_args
-from security import policy, scanner
+from security import policy, scanner, tool_validator
 from leads import scoring
 
 
@@ -450,6 +450,58 @@ async def test_no_cross_university_specialization(monkeypatch):
     res = await resolve.resolve_entities("nmims mba marketing", {})
     # Must pick NMIMS marketing, never LPU marketing
     assert res["specialization_slug"] == "nmims-online-mba-marketing"
+
+
+@pytest.mark.asyncio
+async def test_warm_course_and_specialization_cache_uses_cached_slugs(monkeypatch):
+    """Warm cache rows avoid the legacy entity-id-to-slug database lookup."""
+    resolve.ENTITY_CACHE["course"] = [
+        {"entity_id": 10, "search_text": "online mba", "slug": "nmims-online-mba", "university_id": 1},
+    ]
+    resolve.ENTITY_CACHE["specialization"] = [
+        {
+            "entity_id": 11,
+            "search_text": "marketing management",
+            "slug": "nmims-online-mba-marketing",
+            "university_id": 1,
+            "course_id": 10,
+        },
+    ]
+
+    async def unexpected_slug_lookup(*_args):
+        raise AssertionError("warm cache must not query slug_for_entity_id")
+
+    monkeypatch.setattr(resolve.queries, "slug_for_entity_id", unexpected_slug_lookup)
+
+    course_slug, course_id = await resolve.snap_course("mba", university_entity_id=1)
+    specialization_slug = await resolve.snap_specialization(
+        "marketing", university_entity_id=1, course_entity_id=course_id
+    )
+
+    assert course_slug == "nmims-online-mba"
+    assert specialization_slug == "nmims-online-mba-marketing"
+
+
+@pytest.mark.asyncio
+async def test_comparison_slug_validation_uses_one_batched_query(monkeypatch):
+    """All comparison candidates are checked through one catalog query."""
+    captured = []
+
+    async def existing_slugs(_pool, entity_type, slugs):
+        captured.append((entity_type, slugs))
+        return {"nmims-online-mba"}
+
+    monkeypatch.setattr(tool_validator.queries, "existing_entity_slugs", existing_slugs)
+
+    results = await tool_validator.validate_entity_slugs(
+        "course", ["nmims-online-mba", "missing-mba"]
+    )
+
+    assert captured == [("course", ["nmims-online-mba", "missing-mba"])]
+    assert results == [
+        {"is_valid": True, "error": None, "canonical_slug": "nmims-online-mba"},
+        {"is_valid": False, "error": "Course 'missing-mba' not found in catalog", "canonical_slug": None},
+    ]
 
 
 

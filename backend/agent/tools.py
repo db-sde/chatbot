@@ -31,6 +31,7 @@ from db import queries
 from db.pool import get_pool
 from security.tool_validator import (
     validate_course_slug,
+    validate_entity_slugs,
     validate_entity_type,
     validate_specialization_slug,
     validate_university_slug,
@@ -484,15 +485,8 @@ async def compare_entities_tool(entity_type: str, slugs: list[str], fields: list
     if len(slugs) < 2:
         return _fail("need_at_least_two_entities", entity_type=entity_type, slugs=slugs)
 
-    validator = {
-        "university": validate_university_slug,
-        "course": validate_course_slug,
-        "specialization": validate_specialization_slug,
-    }[entity_type]
-
     valid_slugs: list[str] = []
-    for slug in slugs:
-        v = await validator(slug)
+    for slug, v in zip(slugs, await validate_entity_slugs(entity_type, slugs)):
         if v["is_valid"]:
             valid_slugs.append(v.get("canonical_slug") or slug)
 
@@ -522,10 +516,9 @@ async def compare_programs_tool(course_slugs: list[str], fields: list[str] | Non
         return _fail("need_at_least_two_courses", course_slugs=slugs)
 
     valid_slugs: list[str] = []
-    for slug in slugs:
-        vc = await validate_course_slug(slug)
+    for slug, vc in zip(slugs, await validate_entity_slugs("course", slugs)):
         if vc["is_valid"]:
-            valid_slugs.append(slug)
+            valid_slugs.append(vc.get("canonical_slug") or slug)
 
     if len(valid_slugs) < 2:
         return _fail("insufficient_valid_courses", course_slugs=slugs, valid_slugs=valid_slugs)

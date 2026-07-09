@@ -19,6 +19,7 @@ import logging
 import re
 from typing import TypedDict
 
+from db import queries
 from db.pool import get_pool
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,82 @@ async def validate_specialization_slug(slug: str) -> ToolValidationResult:
             canonical_slug=None,
         )
     return ToolValidationResult(is_valid=True, error=None, canonical_slug=slug)
+
+
+async def validate_entity_slugs(
+    entity_type: str,
+    slugs: list[str],
+) -> list[ToolValidationResult]:
+    """Validate comparison inputs with one catalog round trip.
+
+    University aliases are canonicalized from the in-memory alias index first;
+    both their canonical and original values are queried together to retain the
+    existing cold-cache fallback behavior.
+    """
+    labels = {
+        "university": "university_slug",
+        "course": "course_slug",
+        "specialization": "specialization_slug",
+    }
+    label = labels[entity_type]
+    candidates_by_slug: dict[str, list[str]] = {}
+    pending: list[str] = []
+    results: list[ToolValidationResult | None] = []
+
+    for slug in slugs:
+        fmt = _check_slug_format(slug, label)
+        if fmt:
+            results.append(fmt)
+            continue
+
+        candidates = [slug]
+        if entity_type == "university":
+            try:
+                from agent.resolve import resolve_university_alias
+
+                canonical = resolve_university_alias(slug)
+                if canonical and canonical != slug:
+                    # Existing validation prefers a direct canonical alias
+                    # over the supplied alias when both exist.
+                    candidates = [canonical, slug]
+                else:
+                    # Match normalize_university_slug's cache-cold fallback:
+                    # accept an existing exact slug before trying its brand head.
+                    head = slug.split("-")[0]
+                    head_canonical = resolve_university_alias(head)
+                    if head_canonical and head_canonical not in candidates:
+                        candidates.append(head_canonical)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("batch university normalization fallback for %r: %s", slug, exc)
+        candidates_by_slug[slug] = candidates
+        pending.extend(candidates)
+        results.append(None)
+
+    existing: set[str] = set()
+    if pending:
+        pool = await get_pool()
+        existing = await queries.existing_entity_slugs(pool, entity_type, list(dict.fromkeys(pending)))
+
+    for index, (slug, result) in enumerate(zip(slugs, results)):
+        if result is not None:
+            continue
+        candidates = candidates_by_slug[slug]
+        canonical = next((candidate for candidate in candidates if candidate in existing), None)
+        if canonical:
+            results[index] = ToolValidationResult(
+                is_valid=True,
+                error=None,
+                canonical_slug=canonical,
+            )
+        else:
+            entity_label = entity_type.capitalize()
+            results[index] = ToolValidationResult(
+                is_valid=False,
+                error=f"{entity_label} '{slug}' not found in catalog",
+                canonical_slug=None,
+            )
+
+    return [result for result in results if result is not None]
 
 
 async def validate_entity_type(entity_type: str) -> ToolValidationResult:

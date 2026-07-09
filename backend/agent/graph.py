@@ -82,6 +82,9 @@ class ChatState(TypedDict, total=False):
     # from tool_call_count, which retains its existing meaning of ReAct rounds.
     tool_calls_executed: int
     tool_call_limit_reached: bool
+    # True only when the immediately preceding tool batch returned complete,
+    # successful results that can be synthesized without another lookup.
+    tool_batch_completed: bool
     tool_call_count: int
     # New fields for optimization
     triage_intent: str
@@ -118,6 +121,7 @@ def _make_state(
         "lead_ask": False,
         "tool_calls_executed": 0,
         "tool_call_limit_reached": False,
+        "tool_batch_completed": False,
         "tool_call_count": 0,
         "triage_intent": "factual",
         "cache_hit": False,
@@ -284,9 +288,19 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
 
     intent_text = message.lower()
     if any(t in intent_text for t in ("fee", "fees", "cost", "price", "emi")):
-        await log_anonymous_signal(session_id, resolved.get("university_slug"), resolved.get("course_slug"), "fee")
+        _schedule_anonymous_signal(
+            session_id,
+            resolved.get("university_slug"),
+            resolved.get("course_slug"),
+            "fee",
+        )
     elif any(t in intent_text for t in ("eligible", "eligibility", "criteria")):
-        await log_anonymous_signal(session_id, resolved.get("university_slug"), resolved.get("course_slug"), "eligibility")
+        _schedule_anonymous_signal(
+            session_id,
+            resolved.get("university_slug"),
+            resolved.get("course_slug"),
+            "eligibility",
+        )
 
     # _page_hint_only=True suppresses the "resolved context" system note in node_agent.
     #
@@ -448,11 +462,14 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
     t_start = time.perf_counter()
     result: dict[str, Any]
     try:
-        # Once the turn-level tool budget is exhausted, make one final model
-        # pass without tools so it synthesizes the already-collected results
-        # instead of requesting another tool batch.
+        # A completed tool batch already supplies the facts for synthesis, so
+        # avoid sending the full tool catalog again. Failed, not-found, or
+        # incomplete results retain tool access for the existing ReAct path.
         model = llm_client.chat_model
-        if not state.get("tool_call_limit_reached"):
+        if not (
+            state.get("tool_call_limit_reached")
+            or state.get("tool_batch_completed")
+        ):
             model = model.bind_tools(TOOLS)
 
         # Invoke as a Runnable so LangGraph's astream_events can intercept the stream
@@ -626,10 +643,15 @@ async def node_execute_tools(state: ChatState) -> dict[str, Any]:
     logger.info("[%s] TIMING | tool_exec_ms=%.1f tool_ms_total=%.1f", session_id, tool_ms, tool_ms_total)
 
     # Log tool results
-    for msg in result.get("messages", []):
+    tool_messages = [
+        msg for msg in result.get("messages", []) if isinstance(msg, ToolMessage)
+    ]
+    for msg in tool_messages:
         if isinstance(msg, ToolMessage):
             content_preview = str(msg.content)[:200]
             logger.info("[%s] TOOL RESULT | %s -> %s", session_id, getattr(msg, "name", "?"), content_preview)
+
+    tool_batch_completed = _tool_batch_completed(last_msg, tool_messages)
 
     executed_this_round = len(last_msg.tool_calls) if isinstance(last_msg, AIMessage) else 0
     tool_calls_executed += executed_this_round
@@ -652,12 +674,45 @@ async def node_execute_tools(state: ChatState) -> dict[str, Any]:
         "tool_call_count": count,
         "tool_calls_executed": tool_calls_executed,
         "tool_call_limit_reached": tool_call_limit_reached,
+        "tool_batch_completed": tool_batch_completed,
         "tool_ms_total": tool_ms_total,
     }
 
 
 MAX_TOOL_ITERATIONS = 4
 MAX_TOOL_CALLS_PER_TURN = 8
+
+
+def _tool_batch_completed(last_msg: BaseMessage, tool_messages: list[ToolMessage]) -> bool:
+    """Whether all requested tools returned facts suitable for final synthesis.
+
+    Tool failures use the uniform ``{"not_found": true}`` envelope. Unknown
+    payloads are treated conservatively so the model retains its existing
+    ability to request another lookup.
+    """
+    if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
+        return False
+    if len(tool_messages) != len(last_msg.tool_calls):
+        return False
+
+    for message in tool_messages:
+        if getattr(message, "status", "success") != "success":
+            return False
+        content = message.content
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError:
+                return False
+        if isinstance(content, dict) and (
+            content.get("not_found")
+            or content.get("incomplete")
+            or content.get("requires_follow_up")
+            or content.get("follow_up_required")
+            or content.get("next_action") == "follow_up_lookup"
+        ):
+            return False
+    return True
 
 def route_after_agent(state: ChatState) -> str:
     """Decides whether to execute tools or exit based on iteration cap and tool calls."""
@@ -675,6 +730,28 @@ def route_after_agent(state: ChatState) -> str:
 # ---------------------------------------------------------------------------
 # Background Tasks
 # ---------------------------------------------------------------------------
+
+def _observe_background_task(task: asyncio.Task[Any]) -> None:
+    """Ensure an unexpected analytics-task failure is logged and observed."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.debug("Background analytics task cancelled")
+    except Exception:
+        logger.exception("Background analytics task failed")
+
+
+def _schedule_anonymous_signal(
+    session_id: str,
+    university_slug: str | None,
+    course_slug: str | None,
+    question_type: str,
+) -> None:
+    task = asyncio.create_task(
+        log_anonymous_signal(session_id, university_slug, course_slug, question_type),
+        name="anonymous-signal",
+    )
+    task.add_done_callback(_observe_background_task)
 
 async def background_lead_scoring(session_id: str, message: str, messages: list[BaseMessage]):
     """Runs lead scoring asynchronously after the user has received their response."""

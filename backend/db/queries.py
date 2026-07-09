@@ -252,6 +252,21 @@ async def find_entity_search(pool, entity_type: str) -> list[dict[str, Any]]:
     return dict_rows(rows)
 
 
+async def existing_entity_slugs(pool, entity_type: str, slugs: list[str]) -> set[str]:
+    """Return the existing slugs for one trusted catalog entity type."""
+    tables = {
+        "university": "universities",
+        "course": "courses",
+        "specialization": "specializations",
+    }
+    table = tables[entity_type]
+    rows = await pool.fetch(
+        f"SELECT slug FROM {table} WHERE slug = ANY($1::text[])",
+        slugs,
+    )
+    return {str(row["slug"]) for row in rows}
+
+
 async def find_entities_trgm(pool, message: str, limit: int = 3) -> list[dict]:
     query = """
         SELECT entity_type, entity_id, search_text, word_similarity($1, search_text) as sim
