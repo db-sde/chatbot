@@ -10,6 +10,14 @@ Key Optimizations:
 3. Real Token Streaming: Replaced fake word-by-word streaming with real LLM token streaming.
 4. Triage Node: Added a fast-path router for chitchat and semantic caching.
 5. Lightweight Entity Resolution: Kept resolve_entities but isolated it for a fast/cheap model.
+6. Resolved-Entity Tool-Argument Merge: Tool calls are corrected against
+   resolve_entities()'s canonical university/course/specialization slugs
+   immediately before execution, so an LLM guess (e.g. "nmims"/"mba") can
+   never override a slug the resolver already found (e.g.
+   "nmims-online"/"executive-mba-nmims-online").
+7. Timing visibility: resolver_ms / llm_ms_total / tool_ms_total are tracked
+   through state and logged as a TIMING SUMMARY per turn, to localize
+   latency without changing any behavior.
 """
 
 import asyncio
@@ -73,6 +81,11 @@ class ChatState(TypedDict, total=False):
     # New fields for optimization
     triage_intent: str
     cache_hit: bool
+    # Timing instrumentation (visibility only, see run_chat_turn TIMING SUMMARY).
+    # llm_ms_total / tool_ms_total accumulate across every ReAct loop iteration.
+    resolver_ms: float
+    llm_ms_total: float
+    tool_ms_total: float
 
 
 def _make_state(
@@ -101,6 +114,9 @@ def _make_state(
         "tool_call_count": 0,
         "triage_intent": "factual",
         "cache_hit": False,
+        "resolver_ms": 0.0,
+        "llm_ms_total": 0.0,
+        "tool_ms_total": 0.0,
     }
 
 
@@ -201,7 +217,10 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
         }
 
     logger.info("[%s] RESOLVE ENTITIES | msg=%r", session_id, message[:100])
+    t0 = time.perf_counter()
     resolved = await _resolve_entities(message, context, page_university_slug)
+    resolver_ms = (time.perf_counter() - t0) * 1000
+    logger.info("[%s] TIMING | resolver_ms=%.1f", session_id, resolver_ms)
 
     # If resolve itself detected contact (safety)
     if resolved.get("resolution_status") == "contact" or resolved.get("intent_type") == "contact":
@@ -210,6 +229,7 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
             "lead_ask": True,
             "lead_ask_triggered_by": "Contact Intent",
             "resolved": {**resolved, "_page_hint_only": True},
+            "resolver_ms": resolver_ms,
         }
 
     resolution_status = resolved.get("resolution_status", "none")
@@ -251,11 +271,22 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
         await log_anonymous_signal(session_id, resolved.get("university_slug"), resolved.get("course_slug"), "eligibility")
 
     # _page_hint_only=True suppresses the "resolved context" system note in node_agent.
+    #
+    # FIX: "session_context" and "page_context" used to be in this suppression
+    # list. That meant whenever the resolver correctly carried forward a
+    # university/course from a prior turn or the current page (e.g. the user
+    # just says "MBA" after previously discussing NMIMS), node_agent never
+    # told the LLM what had been resolved — the LLM had to reconstruct it from
+    # raw chat history alone, which is exactly how "nmims-online" /
+    # "executive-mba-nmims-online" became the LLM's own "nmims" / "mba"
+    # guesses. Only genuinely-empty or handled-elsewhere statuses (which
+    # already get their own dedicated advisory note further down in
+    # node_agent, or have nothing to show) should suppress this note.
     page_hint_only = resolution_status in (
-        "page_context", "session_context", "entity_not_found", "partial_match", "none", "contact",
+        "entity_not_found", "partial_match", "none", "contact",
     )
     resolved["_page_hint_only"] = page_hint_only
-    return {"resolved": resolved}
+    return {"resolved": resolved, "resolver_ms": resolver_ms}
 
 
 def _clean_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -397,6 +428,7 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
 
     mark_llm_start()
     t_start = time.perf_counter()
+    result: dict[str, Any]
     try:
         # Get the raw LangChain model and bind tools
         model = llm_client.chat_model.bind_tools(TOOLS)
@@ -443,32 +475,128 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
         except Exception as o_exc:
             logger.warning("Failed to record agent token usage: %s", o_exc)
 
-        return {"messages": [response]}
+        result = {"messages": [response]}
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("agent failed: %s", exc)
-        return {"messages": [AIMessage(content="I encountered an issue processing your request. Please try again.")]}
+        result = {"messages": [AIMessage(content="I encountered an issue processing your request. Please try again.")]}
     finally:
-        record_llm_call_duration(int((time.perf_counter() - t_start) * 1000))
+        duration_ms = (time.perf_counter() - t_start) * 1000
+        record_llm_call_duration(int(duration_ms))
+        llm_ms_total = state.get("llm_ms_total", 0.0) + duration_ms
+        logger.info(
+            "[%s] TIMING | llm_call_ms=%.1f llm_ms_total=%.1f",
+            state.get("session_id"), duration_ms, llm_ms_total,
+        )
+
+    result["llm_ms_total"] = llm_ms_total
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Resolved-entity → tool-argument merge (Rules 1-3)
+# ---------------------------------------------------------------------------
+
+_RESOLVED_ENTITY_ARG_KEYS = ("university_slug", "course_slug", "specialization_slug")
+
+
+def _merge_resolved_into_tool_args(llm_args: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any]:
+    """
+    Canonical-truth merge for tool call arguments.
+
+      Rule 1/2 - resolved course/university slugs ALWAYS override whatever
+                 the LLM guessed for the same argument, whenever the LLM's
+                 tool call actually includes that argument.
+      Rule 3   - an argument the resolver did not resolve (None/missing) is
+                 left exactly as the LLM produced it.
+
+    Deliberately conservative in two ways:
+      - Only touches university_slug / course_slug / specialization_slug.
+        comparison_targets and any other tool argument (max_fee, mode,
+        sort_by, ...) are left to the LLM untouched — per Rule 4, preserve
+        existing behavior for comparison_targets / comparison queries.
+      - Never ADDS a key the LLM's tool call didn't already include. A
+        comparison-style tool that only takes e.g. `comparison_targets`
+        (no `university_slug` param at all) must not have an unexpected
+        kwarg forced onto it.
+    """
+    merged = dict(llm_args)
+    for key in _RESOLVED_ENTITY_ARG_KEYS:
+        if key not in merged:
+            continue
+        resolved_value = resolved.get(key)
+        if resolved_value:
+            merged[key] = resolved_value
+    return merged
 
 
 async def node_execute_tools(state: ChatState) -> dict[str, Any]:
     session_id = state.get("session_id", "?")
-    # Log which tools are being called
+    resolved = state.get("resolved", {}) or {}
     last_msg = state["messages"][-1]
+
+    # ── Merge resolver's canonical slugs into the LLM's tool-call args ─────
+    # Root fix for "resolver found nmims-online / executive-mba-..., but the
+    # tool executed with nmims / mba": the LLM's own tool-call arguments were
+    # never checked against resolve_entities()'s output before execution. We
+    # rebuild the last AIMessage with the SAME id (so LangGraph's add_messages
+    # reducer replaces it in place rather than duplicating it in history) but
+    # corrected args, then execute tools against that corrected message.
+    corrected_state = state
+    if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+        merged_tool_calls = []
+        for tc in last_msg.tool_calls:
+            original_args = tc.get("args", {}) or {}
+            new_args = _merge_resolved_into_tool_args(original_args, resolved)
+            if new_args != original_args:
+                logger.info(
+                    "[%s] TOOL ARGS CORRECTED | %s | llm=%s -> final=%s",
+                    session_id, tc.get("name"), original_args, new_args,
+                )
+            merged_tool_calls.append({**tc, "args": new_args})
+
+        last_msg = AIMessage(
+            content=last_msg.content,
+            tool_calls=merged_tool_calls,
+            id=last_msg.id,
+            name=getattr(last_msg, "name", None),
+            additional_kwargs=getattr(last_msg, "additional_kwargs", {}) or {},
+            response_metadata=getattr(last_msg, "response_metadata", {}) or {},
+            usage_metadata=getattr(last_msg, "usage_metadata", None),
+        )
+        corrected_state = {**state, "messages": [*state["messages"][:-1], last_msg]}
+
+    # Log which tools are being called (post-correction, so this reflects
+    # what will actually be sent to the tool)
     if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
         for tc in last_msg.tool_calls:
             logger.info("[%s] TOOL CALL | %s args=%s", session_id, tc["name"], tc["args"])
+
     tool_node = ToolNode(TOOLS)
-    result = await tool_node.ainvoke(state)
+    t0 = time.perf_counter()
+    result = await tool_node.ainvoke(corrected_state)
+    tool_ms = (time.perf_counter() - t0) * 1000
+    tool_ms_total = state.get("tool_ms_total", 0.0) + tool_ms
+    logger.info("[%s] TIMING | tool_exec_ms=%.1f tool_ms_total=%.1f", session_id, tool_ms, tool_ms_total)
+
     # Log tool results
     for msg in result.get("messages", []):
-        from langchain_core.messages import ToolMessage
         if isinstance(msg, ToolMessage):
             content_preview = str(msg.content)[:200]
             logger.info("[%s] TOOL RESULT | %s -> %s", session_id, getattr(msg, "name", "?"), content_preview)
+
     count = state.get("tool_call_count", 0) + 1
-    return {**result, "tool_call_count": count}
+
+    # Re-emit the corrected AIMessage alongside the new ToolMessages. It shares
+    # the original message's id, so add_messages replaces the wrong-args copy
+    # already in history instead of appending a duplicate — this keeps
+    # _build_tool_calls_log (and anything else reading message history)
+    # consistent with what actually executed.
+    out_messages = result.get("messages", [])
+    if corrected_state is not state:
+        out_messages = [last_msg, *out_messages]
+
+    return {**result, "messages": out_messages, "tool_call_count": count, "tool_ms_total": tool_ms_total}
 
 
 MAX_TOOL_ITERATIONS = 4
@@ -709,6 +837,21 @@ async def run_chat_turn(
     
     tools_executed = tool_metrics_var.get() or []
     tool_exec_time = sum(m.get("duration_ms", 0) for m in tools_executed)
+
+    # ── Timing visibility: resolver / llm / tool / total ────────────────────
+    # Added purely for bottleneck localization (per the "RESOLVED -> ~2s ->
+    # TOOL CALL" / "TOOL RESULT -> ~2s -> CHAT COMPLETE" gaps) — no behavior
+    # or latency changes here, only logging.
+    resolver_ms = (final_state or {}).get("resolver_ms", 0.0)
+    llm_ms_total = (final_state or {}).get("llm_ms_total", 0.0)
+    tool_ms_total = (final_state or {}).get("tool_ms_total", 0.0)
+    accounted_ms = resolver_ms + llm_ms_total + tool_ms_total
+    logger.info(
+        "[%s] TIMING SUMMARY | resolver_ms=%.1f llm_ms=%.1f tool_ms=%.1f "
+        "accounted_ms=%.1f total_ms=%d unaccounted_ms=%.1f",
+        session_id, resolver_ms, llm_ms_total, tool_ms_total,
+        accounted_ms, response_time_ms, response_time_ms - accounted_ms,
+    )
 
     tool_calls_log = _build_tool_calls_log(final_state.get("messages", []))
     
