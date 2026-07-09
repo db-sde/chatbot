@@ -759,6 +759,18 @@ def _is_comparison_query(message: str) -> bool:
     return bool(_COMPARISON_PATTERN.search(message))
 
 
+_COMPARISON_FOLLOW_UP_PATTERN = re.compile(
+    r"\b(?:which|who)\b.*\b(?:cheaper|better|best|stronger|placements?|alumni|working professionals?)\b"
+    r"|\b(?:cheaper|better|best|stronger)\b.*\b(?:placements?|alumni|working professionals?)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_comparison_follow_up(message: str) -> bool:
+    """Recognize pronoun-based comparison questions only with saved comparison state."""
+    return bool(_COMPARISON_FOLLOW_UP_PATTERN.search(message))
+
+
 _CATALOG_WIDE_PATTERN = re.compile(
     r"\b(?:which|what|list|show\s+me|top|best)\b[^.?!]{0,25}"
     r"\b(?:universit(?:y|ies)|colleges?|institutes?)\b"
@@ -1042,10 +1054,21 @@ async def resolve_entities(
     # This is used to detect partial matches and entity_not_found when
     # catalog scan found fewer hits than the user intended.
     intended_count = _count_intended_universities(message)
+    saved_comparison_context = context.get("comparison_context") or {}
+    saved_comparison_targets = saved_comparison_context.get("university_slugs") or []
+    is_saved_comparison_follow_up = (
+        len(saved_comparison_targets) > 1 and _is_comparison_follow_up(message)
+    )
 
     # explicit_university_requested: user mentioned at least one university-like
     # name, regardless of whether it was in the catalog.
-    explicit_university_requested = bool(resolved_slugs) or intended_count > 0
+    # Interrogatives such as "Which has better placements?" can look
+    # university-like to the broad detector. Saved comparison context takes
+    # precedence only for the narrow follow-up pattern above.
+    explicit_university_requested = (
+        (bool(resolved_slugs) or intended_count > 0)
+        and not is_saved_comparison_follow_up
+    )
     university_slug = resolved_slugs[0] if resolved_slugs else None
     university_entity_id = resolved_ids[0] if resolved_ids else None
 
@@ -1143,6 +1166,8 @@ async def resolve_entities(
         catalog_wide = _is_catalog_wide_query(message)
         page_canonical = resolve_university_alias(page_university_slug) or page_university_slug
         session_uni = context.get("current_university_slug")
+        comparison_context = saved_comparison_context
+        saved_targets = saved_comparison_targets
 
         if catalog_wide:
             # Explicit catalog-wide question ("which university offers BTech?",
@@ -1154,6 +1179,15 @@ async def resolve_entities(
                 "CATALOG-WIDE QUERY DETECTED | msg=%r | SESSION/PAGE CONTEXT SKIPPED",
                 message[:80],
             )
+        elif len(saved_targets) > 1 and _is_comparison_follow_up(message):
+            comparison_targets = list(saved_targets)
+            comparison_found = list(saved_targets)
+            university_slug = saved_targets[0]
+            course_slug = comparison_context.get("course_slug") or course_slug
+            specialization_slug = comparison_context.get("specialization_slug") or specialization_slug
+            resolution_status = "comparison_context"
+            mention_type = "comparison_follow_up"
+            logger.info("COMPARISON CONTEXT APPLIED | targets=%s", comparison_targets)
         elif session_uni:
             university_slug = resolve_university_alias(session_uni) or session_uni
             resolution_status = "session_context"

@@ -234,7 +234,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
 
             # ── Layer 1: Prompt Guard 2 ──
             logger.info("[%s] Running Prompt Guard...", body.session_id)
-            safety = await check_prompt_safety(body.message)
+            safety = await check_prompt_safety(body.message, body.session_id)
             logger.info(
                 "[%s] Prompt Guard result: safe=%s score=%.4f reason=%s source=%s",
                 body.session_id, safety["safe"], safety["risk_score"],
@@ -800,6 +800,5 @@ async def serve_widget_js():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=2323, reload=True)
-
 
 

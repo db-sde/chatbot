@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import auth
 from agent import resolve, tools
+from agent.graph import _merge_resolved_into_tool_args
 from security import policy, scanner
 from leads import scoring
 
@@ -463,3 +464,67 @@ async def test_tool_decorator_wrappers():
 
     res_faq = await tools.get_faq_tool.ainvoke({"entity_type": "course", "entity_slug": "mba"})
     assert res_faq[0]["question"] == "What is the fee?"
+
+
+# ── Comparison remediation tests ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_comparison_follow_up_uses_persisted_context(monkeypatch):
+    """Pronoun follow-ups must not fall back to a single-university session."""
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    result = await resolve.resolve_entities(
+        "Which has better placements?",
+        {
+            "current_university_slug": "nmims-online",
+            "comparison_context": {
+                "university_slugs": ["nmims-online", "amity-online"],
+                "course_slug": "online-mba",
+            },
+        },
+    )
+
+    assert result["resolution_status"] == "comparison_context"
+    assert result["comparison_targets"] == ["nmims-online", "amity-online"]
+    assert result["course_slug"] == "online-mba"
+
+
+def test_comparison_tool_args_keep_entity_specific_slugs():
+    resolved = {
+        "university_slug": "nmims-online",
+        "comparison_targets": ["nmims-online", "amity-online"],
+    }
+    assert _merge_resolved_into_tool_args(
+        {"entity_type": "university", "slugs": ["wrong"], "fields": ["placement"]}, resolved
+    )["slugs"] == ["nmims-online", "amity-online"]
+
+    # A comparison-specific course list is not replaced by the primary course.
+    assert _merge_resolved_into_tool_args(
+        {"course_slugs": ["nmims-mba", "amity-mba"]},
+        {**resolved, "course_slug": "nmims-mba"},
+    )["course_slugs"] == ["nmims-mba", "amity-mba"]
+
+
+@pytest.mark.asyncio
+async def test_manipaal_typo_resolves_with_catalog_alias(monkeypatch):
+    """Manipaal is handled by existing fuzzy matching when catalog aliases exist."""
+    original_cache = {key: list(value) for key, value in resolve.ENTITY_CACHE.items()}
+    try:
+        resolve.ENTITY_CACHE["university"] = [{
+            "entity_id": 7,
+            "search_text": "manipal university manipal academy",
+            "canonical_slug": "manipal",
+            "slug": "manipal",
+            "name": "Manipal University",
+            "full_name": "Manipal Academy of Higher Education Online",
+        }]
+        resolve.ENTITY_CACHE["course"] = []
+        resolve.ENTITY_CACHE["specialization"] = []
+        resolve._rebuild_university_alias_index()
+
+        result = await resolve.resolve_entities("Manipaal MBA placement", {})
+        assert result["university_slug"] == "manipal"
+    finally:
+        resolve.ENTITY_CACHE.update(original_cache)
+        resolve._rebuild_university_alias_index()

@@ -469,9 +469,18 @@ async def check_prompt_safety(
 
     session = _session_manager.get(session_id) if session_id else None
 
-    # 2. Run both detectors in parallel / sequence
-    pg_result = await _prompt_guard.scan(message)
+    # 2. Local checks are immediate. A definite local block does not need to
+    # wait through external retries; this preserves the stricter outcome while
+    # avoiding avoidable attack-path latency.
     heuristic_result = _local_heuristic(message, session)
+    if not heuristic_result["safe"]:
+        _session_manager.update(session_id, heuristic_result) if session_id else None
+        heuristic_result["details"]["elapsed_ms"] = round((time.time() - start_time) * 1000, 2)
+        logger.info("PROMPT_GUARD_SKIPPED_LOCAL_BLOCK")
+        return heuristic_result
+
+    # Only benign local input needs the remote classifier.
+    pg_result = await _prompt_guard.scan(message)
 
     if pg_result is None:
         logger.info("PROMPT_GUARD_FALLBACK_USED")

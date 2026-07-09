@@ -261,6 +261,17 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
             resolved.get("course_slug"),
             resolved.get("specialization_slug"),
         )
+        if len(resolved.get("comparison_targets") or []) > 1:
+            await queries.update_comparison_context(
+                pool,
+                session_id,
+                {
+                    "university_slugs": resolved["comparison_targets"],
+                    "course_slug": resolved.get("course_slug"),
+                    "specialization_slug": resolved.get("specialization_slug"),
+                },
+            )
+            logger.info("[%s] COMPARISON CONTEXT UPDATED | targets=%s", session_id, resolved["comparison_targets"])
     elif resolution_status == "resolved":
         # Comparison-only edge: no single primary uni — still safe no-op
         pass
@@ -437,8 +448,6 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
         # Invoke as a Runnable so LangGraph's astream_events can intercept the stream
         response = await model.ainvoke(_clean_messages(messages))
 
-        mark_first_token()
-
         # Extract and record token usage for observability/pricing.
         # Prefer usage_metadata (populated for both streaming and batch by LangChain)
         # over response_metadata['token_usage'] (batch-only, uses raw OpenAI field names).
@@ -522,6 +531,17 @@ def _merge_resolved_into_tool_args(llm_args: dict[str, Any], resolved: dict[str,
         kwarg forced onto it.
     """
     merged = dict(llm_args)
+    # Comparison tools take lists of entity-specific slugs.  Their arguments
+    # are never replaced with the primary entity selected for normal lookups.
+    comparison_targets = resolved.get("comparison_targets") or []
+    if len(comparison_targets) > 1:
+        if "slugs" in merged:
+            merged["slugs"] = list(comparison_targets)
+        # A course list is already entity-specific. Do not overwrite it with
+        # the one primary course resolver result unless we have one course per
+        # target (which this resolver deliberately does not infer).
+        if "course_slugs" in merged:
+            return merged
     for key in _RESOLVED_ENTITY_ARG_KEYS:
         if key not in merged:
             continue
@@ -756,6 +776,7 @@ async def run_chat_turn(
                 node_name = event.get("metadata", {}).get("langgraph_node")
                 if node_name in ("agent", "chitchat_reply"):
                     reply_text += chunk.content
+                    mark_first_token()
                     yield {"event": "token", "data": {"text": chunk.content}}
                     
         # Capture the final state updates
@@ -775,11 +796,13 @@ async def run_chat_turn(
                 reply_text = str(last_msg.content)
         
         if reply_text:
+            mark_first_token()
             yield {"event": "token", "data": {"text": reply_text}}
 
     # Handle Cache Hits
     if final_state.get("cache_hit") and not reply_text:
         reply_text = final_state.get("reply", "")
+        mark_first_token()
         yield {"event": "token", "data": {"text": reply_text}}
 
     # P0: request-time lead decision (must be in SSE final before client disconnects)
@@ -803,6 +826,7 @@ async def run_chat_turn(
         # Contact path should already have set reply via state; fallback safety
         if lead_ask and (final_state or {}).get("triage_intent") == "contact":
             reply_text = CONTACT_REPLY
+            mark_first_token()
             yield {"event": "token", "data": {"text": reply_text}}
         else:
             await log_unanswered(session_id, message, None, None)
@@ -855,6 +879,16 @@ async def run_chat_turn(
     )
 
     tool_calls_log = _build_tool_calls_log(final_state.get("messages", []))
+    # Tool calls are reconstructed from graph messages for compatibility;
+    # attach the timing/status captured by the execution decorator so analytics
+    # retains per-invocation duration instead of only an aggregate total.
+    for call, metric in zip(tool_calls_log, tools_executed):
+        call.update({
+            "duration_ms": metric.get("duration_ms", 0),
+            "status": metric.get("status", call.get("status", "SUCCESS")),
+            "started_at": metric.get("started_at"),
+            "completed_at": metric.get("completed_at"),
+        })
     
     await queries.insert_message(
         pool, session_id, "assistant", reply_text,

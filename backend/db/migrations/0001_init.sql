@@ -205,6 +205,7 @@ CREATE TABLE IF NOT EXISTS session_context (
     current_university_slug TEXT,
     current_course_slug TEXT,
     current_specialization_slug TEXT,
+    comparison_context JSONB,
     last_updated TIMESTAMPTZ DEFAULT now()
 );
 
@@ -421,6 +422,9 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_execution_time_ms INTEGER;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 
+-- Structured comparison state must outlive the in-memory graph and message window.
+ALTER TABLE session_context ADD COLUMN IF NOT EXISTS comparison_context JSONB;
+
 ALTER TABLE unanswered_questions ADD COLUMN IF NOT EXISTS reason TEXT;
 
 ALTER TABLE flagged_messages ADD COLUMN IF NOT EXISTS layer TEXT NOT NULL DEFAULT 'unknown';
@@ -442,4 +446,3 @@ ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS lead_form_title TEXT DEFAUL
 ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS lead_form_description TEXT DEFAULT 'A counsellor can follow up with you.';
 
 ALTER TABLE security_events ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT 'India';
-

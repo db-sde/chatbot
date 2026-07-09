@@ -64,7 +64,8 @@ async def ensure_session(
 async def get_session_context(pool, session_id: str) -> dict[str, Any]:
     row = await pool.fetchrow(
         """
-        SELECT current_university_slug, current_course_slug, current_specialization_slug
+        SELECT current_university_slug, current_course_slug, current_specialization_slug,
+               comparison_context
         FROM session_context
         WHERE session_id = $1::uuid
         """,
@@ -160,6 +161,23 @@ async def update_session_context(
         university_slug,
         course_slug,
         specialization_slug,
+    )
+
+
+async def update_comparison_context(
+    pool, session_id: str, comparison_context: dict[str, Any]
+) -> None:
+    """Persist canonical comparison targets separately from single-entity context."""
+    await pool.execute(
+        """
+        INSERT INTO session_context(session_id, comparison_context)
+        VALUES($1::uuid, $2::jsonb)
+        ON CONFLICT (session_id) DO UPDATE SET
+            comparison_context = EXCLUDED.comparison_context,
+            last_updated = now()
+        """,
+        session_id,
+        json.dumps(comparison_context),
     )
 
 
@@ -812,7 +830,7 @@ async def get_analytics_tools(pool) -> list[dict[str, Any]]:
     """Flatten and aggregate tool call duration and success statistics from JSONB records."""
     rows = await pool.fetch(
         """
-        SELECT t.name,
+        SELECT t.item->>'name' AS name,
                count(*) AS executions,
                coalesce(avg((t.item->>'duration_ms')::int), 0.0) AS avg_duration,
                coalesce(max((t.item->>'duration_ms')::int), 0) AS max_duration,
@@ -821,7 +839,7 @@ async def get_analytics_tools(pool) -> list[dict[str, Any]]:
         FROM messages m,
              lateral jsonb_array_elements(m.tool_calls) AS t(item)
         WHERE m.role = 'assistant' AND m.tool_calls IS NOT NULL
-        GROUP BY t.name
+        GROUP BY t.item->>'name'
         ORDER BY executions DESC
         """
     )
