@@ -21,6 +21,7 @@ Key Optimizations:
 """
 
 import asyncio
+from settings import settings
 import json
 import logging
 import time
@@ -718,7 +719,7 @@ async def run_chat_turn(
 
     await queries.ensure_session(pool, session_id, site_id, page_university_slug, ip_address, user_agent)
 
-    history_result = await queries.get_session_history(pool, session_id, limit=20)
+    history_result = await queries.get_session_history(pool, session_id, limit=settings.max_conversation_messages)
     history_messages: list[BaseMessage] = []
     for msg in history_result.get("messages", []):
         role = msg.get("role")

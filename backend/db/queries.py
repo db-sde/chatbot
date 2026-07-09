@@ -4,6 +4,8 @@ import json
 import ipaddress
 from typing import Any
 
+from settings import settings
+
 
 def _clean_row(d: dict[str, Any]) -> dict[str, Any]:
     for k, v in d.items():
@@ -74,7 +76,7 @@ async def get_session_context(pool, session_id: str) -> dict[str, Any]:
 async def get_session_history(
     pool,
     session_id: str,
-    limit: int = 20,
+    limit: int | None = None,
     before_id: int | None = None,
 ) -> dict[str, Any]:
     """
@@ -84,6 +86,8 @@ async def get_session_history(
     from this public endpoint (available in the admin /api/admin/conversations/{id}).
     Cursor-based pagination: pass before_id to load messages older than that id.
     """
+    if limit is None:
+        limit = settings.max_conversation_messages
     limit = min(limit, 50)  # cap at 50 regardless of caller
     rows = await pool.fetch(
         """

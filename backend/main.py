@@ -396,7 +396,7 @@ async def session_history(
     request: Request,
     session_id: str,
     site_key: str,
-    limit: int = 20,
+    limit: int | None = None,
     before_id: int | None = None,
 ) -> dict:
     """Public endpoint for the widget to load prior messages on page load.

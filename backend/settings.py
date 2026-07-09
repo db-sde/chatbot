@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 10
     daily_message_cap_per_site: int = 2000
     postgres_password: str = "postgres"
+    max_conversation_messages: int = 8
 
     # Comma-separated list of IPs that are trusted to set X-Forwarded-For
     # (your reverse proxy — Nginx/Caddy/Cloudflare Tunnel). Required for
