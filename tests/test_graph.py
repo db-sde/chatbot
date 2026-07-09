@@ -7,6 +7,7 @@ run fully offline — no Gemini key or Postgres required.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -181,6 +182,57 @@ async def test_graph_direct_reply_no_tool_calls(patch_llm):
     final_data = events[-1]["data"]
     assert "lead_ask" in final_data
     assert "quick_replies" in final_data
+
+
+@pytest.mark.asyncio
+async def test_graph_final_event_avoids_fallback_and_reports_timing_tree(monkeypatch):
+    """A LangGraph final event is authoritative and exposes all turn stages."""
+    from langchain_core.messages import AIMessage
+    import agent.graph as graph_mod
+
+    class FinalEventGraph:
+        def __init__(self):
+            self.fallback_invocations = 0
+
+        async def astream_events(self, _state, version):
+            assert version == "v2"
+            yield {
+                "event": "on_chain_end",
+                "name": "LangGraph",
+                "data": {"output": {"messages": [AIMessage(content="Final reply")]}} ,
+            }
+
+        async def ainvoke(self, _state):
+            self.fallback_invocations += 1
+            raise AssertionError("graph fallback must not run after a final event")
+
+    fake_graph = FinalEventGraph()
+    monkeypatch.setattr(graph_mod, "_graph", fake_graph)
+    request_started_at = time.perf_counter() - 0.05
+
+    events = []
+    async for event in graph_mod.run_chat_turn(
+        session_id="77777777-7777-4777-8777-777777777777",
+        site_id="test",
+        message="Tell me about NMIMS",
+        page_university_slug="nmims",
+        request_started_at=request_started_at,
+    ):
+        events.append(event)
+
+    metrics = events[-1]["data"]["metrics"]
+    timing_tree = metrics["timing_tree"]
+    assert fake_graph.fallback_invocations == 0
+    assert metrics["ttft_ms"] >= metrics["first_sse_event_ms"]
+    assert metrics["agent_ttft_ms"] == metrics["first_sse_event_ms"]
+    assert {
+        "pre_graph_setup_ms",
+        "graph_execution_ms",
+        "graph_internal_overhead_ms",
+        "assistant_persist_ms",
+        "accounted_ms",
+        "unaccounted_ms",
+    } <= timing_tree.keys()
 
 
 @pytest.mark.asyncio

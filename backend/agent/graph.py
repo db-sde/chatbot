@@ -769,14 +769,22 @@ async def run_chat_turn(
     page_context: dict[str, Any] | None = None,
     ip_address: str | None = None,
     user_agent: str | None = None,
+    request_started_at: float | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     
     init_observability_context()
+
+    t_stage = time.perf_counter()
     pool = await get_pool()
+    pool_ms = (time.perf_counter() - t_stage) * 1000
 
+    t_stage = time.perf_counter()
     await queries.ensure_session(pool, session_id, site_id, page_university_slug, ip_address, user_agent)
+    ensure_session_ms = (time.perf_counter() - t_stage) * 1000
 
+    t_stage = time.perf_counter()
     history_result = await queries.get_session_history(pool, session_id, limit=settings.max_conversation_messages)
+    history_ms = (time.perf_counter() - t_stage) * 1000
     history_messages: list[BaseMessage] = []
     for msg in history_result.get("messages", []):
         role = msg.get("role")
@@ -786,8 +794,13 @@ async def run_chat_turn(
         elif role == "assistant" and content:
             history_messages.append(AIMessage(content=content))
 
+    t_stage = time.perf_counter()
     await queries.insert_message(pool, session_id, "user", message)
+    persist_user_message_ms = (time.perf_counter() - t_stage) * 1000
+
+    t_stage = time.perf_counter()
     context = await queries.get_session_context(pool, session_id)
+    session_context_ms = (time.perf_counter() - t_stage) * 1000
 
     initial_state = _make_state(
         session_id=session_id,
@@ -801,8 +814,19 @@ async def run_chat_turn(
 
     reply_text = ""
     final_state = None
+    first_sse_event_at: float | None = None
+
+    def mark_first_sse_event() -> None:
+        nonlocal first_sse_event_at
+        if first_sse_event_at is None:
+            first_sse_event_at = time.perf_counter()
+            mark_first_token()
     
-    # REAL TOKEN STREAMING using astream_events
+    # This observes graph events. node_agent currently uses model.ainvoke(), so
+    # user-visible token events occur only if a node itself uses a streaming
+    # model call; otherwise the first token is emitted from the buffered reply
+    # after graph completion below.
+    graph_stream_started = time.perf_counter()
     async for event in _graph.astream_events(initial_state, version="v2"):
         event_kind = event["event"]
         
@@ -813,17 +837,22 @@ async def run_chat_turn(
                 node_name = event.get("metadata", {}).get("langgraph_node")
                 if node_name in ("agent", "chitchat_reply"):
                     reply_text += chunk.content
-                    mark_first_token()
+                    mark_first_sse_event()
                     yield {"event": "token", "data": {"text": chunk.content}}
                     
         # Capture the final state updates
         if event_kind == "on_chain_end" and event["name"] == "LangGraph":
             final_state = event["data"]["output"]
+    graph_stream_ms = (time.perf_counter() - graph_stream_started) * 1000
 
     # Fallback if astream_events didn't capture the final state properly or if streaming didn't output text
+    graph_fallback_ms = 0.0
     if not final_state:
+        graph_fallback_started = time.perf_counter()
         final_state = await _graph.ainvoke(initial_state)
+        graph_fallback_ms = (time.perf_counter() - graph_fallback_started) * 1000
 
+    reply_assembly_started = time.perf_counter()
     if not reply_text:
         if final_state.get("reply"):
             reply_text = final_state["reply"]
@@ -833,13 +862,13 @@ async def run_chat_turn(
                 reply_text = str(last_msg.content)
         
         if reply_text:
-            mark_first_token()
+            mark_first_sse_event()
             yield {"event": "token", "data": {"text": reply_text}}
 
     # Handle Cache Hits
     if final_state.get("cache_hit") and not reply_text:
         reply_text = final_state.get("reply", "")
-        mark_first_token()
+        mark_first_sse_event()
         yield {"event": "token", "data": {"text": reply_text}}
 
     # P0: request-time lead decision (must be in SSE final before client disconnects)
@@ -863,7 +892,7 @@ async def run_chat_turn(
         # Contact path should already have set reply via state; fallback safety
         if lead_ask and (final_state or {}).get("triage_intent") == "contact":
             reply_text = CONTACT_REPLY
-            mark_first_token()
+            mark_first_sse_event()
             yield {"event": "token", "data": {"text": reply_text}}
         else:
             await log_unanswered(session_id, message, None, None)
@@ -894,8 +923,9 @@ async def run_chat_turn(
     t_now = time.perf_counter()
     response_time_ms = int((t_now - metadata["t_start"]) * 1000)
     
-    t_first = metadata.get("t_first_token") or t_now
-    ttft_ms = int((t_first - metadata["t_start"]) * 1000)
+    t_first = first_sse_event_at or t_now
+    agent_ttft_ms = int((t_first - metadata["t_start"]) * 1000)
+    ttft_ms = int((t_first - (request_started_at or metadata["t_start"])) * 1000)
     
     tools_executed = tool_metrics_var.get() or []
     tool_exec_time = sum(m.get("duration_ms", 0) for m in tools_executed)
@@ -907,13 +937,16 @@ async def run_chat_turn(
     resolver_ms = (final_state or {}).get("resolver_ms", 0.0)
     llm_ms_total = (final_state or {}).get("llm_ms_total", 0.0)
     tool_ms_total = (final_state or {}).get("tool_ms_total", 0.0)
-    accounted_ms = resolver_ms + llm_ms_total + tool_ms_total
-    logger.info(
-        "[%s] TIMING SUMMARY | resolver_ms=%.1f llm_ms=%.1f tool_ms=%.1f "
-        "accounted_ms=%.1f total_ms=%d unaccounted_ms=%.1f",
-        session_id, resolver_ms, llm_ms_total, tool_ms_total,
-        accounted_ms, response_time_ms, response_time_ms - accounted_ms,
+    pre_graph_setup_ms = (
+        pool_ms + ensure_session_ms + history_ms + persist_user_message_ms + session_context_ms
     )
+    graph_internal_overhead_ms = max(
+        graph_stream_ms - resolver_ms - llm_ms_total - tool_ms_total,
+        0.0,
+    )
+    reply_assembly_ms = (t_now - reply_assembly_started) * 1000
+    accounted_ms = pre_graph_setup_ms + graph_stream_ms + graph_fallback_ms + reply_assembly_ms
+    unaccounted_ms = max(response_time_ms - accounted_ms, 0.0)
 
     tool_calls_log = _build_tool_calls_log(final_state.get("messages", []))
     # Tool calls are reconstructed from graph messages for compatibility;
@@ -927,6 +960,7 @@ async def run_chat_turn(
             "completed_at": metric.get("completed_at"),
         })
     
+    assistant_persist_started = time.perf_counter()
     await queries.insert_message(
         pool, session_id, "assistant", reply_text,
         tool_calls=tool_calls_log,
@@ -941,6 +975,22 @@ async def run_chat_turn(
         started_at=started_at,
         completed_at=completed_at,
     )
+    assistant_persist_ms = (time.perf_counter() - assistant_persist_started) * 1000
+    turn_total_ms = (time.perf_counter() - metadata["t_start"]) * 1000
+    turn_accounted_ms = accounted_ms + assistant_persist_ms
+    turn_unaccounted_ms = max(turn_total_ms - turn_accounted_ms, 0.0)
+    logger.info(
+        "[%s] TIMING TREE | pool_ms=%.1f ensure_session_ms=%.1f history_ms=%.1f "
+        "persist_user_ms=%.1f session_context_ms=%.1f resolver_ms=%.1f llm_ms=%.1f "
+        "tool_ms=%.1f graph_ms=%.1f graph_overhead_ms=%.1f reply_assembly_ms=%.1f "
+        "assistant_persist_ms=%.1f accounted_ms=%.1f total_ms=%.1f unaccounted_ms=%.1f "
+        "ttft_first_sse_ms=%d agent_ttft_ms=%d",
+        session_id,
+        pool_ms, ensure_session_ms, history_ms, persist_user_message_ms, session_context_ms,
+        resolver_ms, llm_ms_total, tool_ms_total, graph_stream_ms, graph_internal_overhead_ms,
+        reply_assembly_ms, assistant_persist_ms, turn_accounted_ms, turn_total_ms,
+        turn_unaccounted_ms, ttft_ms, agent_ttft_ms,
+    )
 
     yield {
         "event": "final",
@@ -950,6 +1000,8 @@ async def run_chat_turn(
             "metrics": {
                 "response_time_ms": response_time_ms,
                 "ttft_ms": ttft_ms,
+                "first_sse_event_ms": agent_ttft_ms,
+                "agent_ttft_ms": agent_ttft_ms,
                 "llm_duration_ms": metadata.get("llm_duration_ms", 0),
                 "tool_execution_time_ms": tool_exec_time,
                 "input_tokens": metadata["input_tokens"],
@@ -957,6 +1009,24 @@ async def run_chat_turn(
                 "total_tokens": metadata["total_tokens"],
                 "estimated_cost_usd": metadata["estimated_cost_usd"],
                 "model_name": metadata["model_name"],
+                "timing_tree": {
+                    "pool_ms": round(pool_ms, 1),
+                    "ensure_session_ms": round(ensure_session_ms, 1),
+                    "history_ms": round(history_ms, 1),
+                    "persist_user_message_ms": round(persist_user_message_ms, 1),
+                    "session_context_ms": round(session_context_ms, 1),
+                    "pre_graph_setup_ms": round(pre_graph_setup_ms, 1),
+                    "graph_execution_ms": round(graph_stream_ms, 1),
+                    "graph_fallback_ms": round(graph_fallback_ms, 1),
+                    "graph_internal_overhead_ms": round(graph_internal_overhead_ms, 1),
+                    "reply_assembly_ms": round(reply_assembly_ms, 1),
+                    "assistant_persist_ms": round(assistant_persist_ms, 1),
+                    "response_generation_ms": response_time_ms,
+                    "response_generation_unaccounted_ms": round(unaccounted_ms, 1),
+                    "accounted_ms": round(turn_accounted_ms, 1),
+                    "total_ms": round(turn_total_ms, 1),
+                    "unaccounted_ms": round(turn_unaccounted_ms, 1),
+                },
             },
         },
     }

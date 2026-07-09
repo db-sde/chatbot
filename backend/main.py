@@ -3,6 +3,7 @@ import json
 import logging
 import logging.config
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -230,11 +231,14 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
 
     async def event_stream():
         try:
+            request_started = time.perf_counter()
             pool = await get_pool()
 
             # ── Layer 1: Prompt Guard 2 ──
             logger.info("[%s] Running Prompt Guard...", body.session_id)
+            stage_started = time.perf_counter()
             safety = await check_prompt_safety(body.message, body.session_id)
+            prompt_guard_ms = (time.perf_counter() - stage_started) * 1000
             logger.info(
                 "[%s] Prompt Guard result: safe=%s score=%.4f reason=%s source=%s",
                 body.session_id, safety["safe"], safety["risk_score"],
@@ -272,7 +276,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
 
             # ── Layer 2: DegreeBaba Policy ──
             logger.info("[%s] Running policy check...", body.session_id)
+            stage_started = time.perf_counter()
             policy = check_policy(body.message)
+            policy_ms = (time.perf_counter() - stage_started) * 1000
             logger.info("[%s] Policy result: passed=%s rule=%s", body.session_id, policy["passed"], policy.get("rule"))
             if not policy["passed"]:
                 logger.warning(
@@ -309,10 +315,13 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
             # ── Layer 3: LangGraph Agent ──
             # Resolve page context from pathname (zero-config; DB-verified slugs)
             resolved_page_university_slug = body.page_university_slug
+            page_context_ms = 0.0
             if body.page_pathname:
                 logger.info("[%s] Resolving page context for pathname: %s", body.session_id, body.page_pathname)
                 from agent.page_context import resolve_page_context
+                stage_started = time.perf_counter()
                 page_ctx = await resolve_page_context(body.page_pathname, pool)
+                page_context_ms = (time.perf_counter() - stage_started) * 1000
                 if page_ctx.get("page_university_slug"):
                     resolved_page_university_slug = page_ctx["page_university_slug"]
                 logger.info(
@@ -330,6 +339,8 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 body.session_id, resolved_page_university_slug,
             )
             token_count = 0
+            first_sse_event_at: float | None = None
+            agent_turn_started = time.perf_counter()
             async for event in run_chat_turn(
                 session_id=body.session_id,
                 site_id=body.site_key,
@@ -338,16 +349,53 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 page_context=page_ctx,
                 ip_address=client_ip,
                 user_agent=client_ua,
+                request_started_at=request_started,
             ):
                 if event["event"] == "token":
                     token_count += 1
+                    if first_sse_event_at is None:
+                        first_sse_event_at = time.perf_counter()
                 elif event["event"] == "final":
                     metrics = event["data"].get("metrics", {})
+                    agent_turn_ms = (time.perf_counter() - agent_turn_started) * 1000
+                    request_total_ms = (time.perf_counter() - request_started) * 1000
+                    request_ttft_ms = (
+                        (first_sse_event_at - request_started) * 1000
+                        if first_sse_event_at is not None
+                        else request_total_ms
+                    )
+                    request_accounted_ms = prompt_guard_ms + policy_ms + page_context_ms + agent_turn_ms
+                    request_unaccounted_ms = max(request_total_ms - request_accounted_ms, 0.0)
+                    metrics["request_timing_tree"] = {
+                        "prompt_guard_ms": round(prompt_guard_ms, 1),
+                        "policy_ms": round(policy_ms, 1),
+                        "page_context_ms": round(page_context_ms, 1),
+                        "agent_turn_ms": round(agent_turn_ms, 1),
+                        "request_accounted_ms": round(request_accounted_ms, 1),
+                        "request_unaccounted_ms": round(request_unaccounted_ms, 1),
+                        "request_total_ms": round(request_total_ms, 1),
+                        "request_ttft_ms": round(request_ttft_ms, 1),
+                    }
+                    logger.info(
+                        "[%s] REQUEST TIMING TREE | prompt_guard_ms=%.1f policy_ms=%.1f "
+                        "page_context_ms=%.1f agent_turn_ms=%.1f accounted_ms=%.1f "
+                        "total_ms=%.1f unaccounted_ms=%.1f ttft_first_sse_ms=%.1f",
+                        body.session_id,
+                        prompt_guard_ms,
+                        policy_ms,
+                        page_context_ms,
+                        agent_turn_ms,
+                        request_accounted_ms,
+                        request_total_ms,
+                        request_unaccounted_ms,
+                        request_ttft_ms,
+                    )
                     logger.info(
                         "[%s] CHAT COMPLETE | tokens_streamed=%d response_time=%dms ttft=%dms "
-                        "input_tok=%d output_tok=%d cost_usd=%.6f model=%s",
+                        "request_ttft=%dms request_total=%dms input_tok=%d output_tok=%d cost_usd=%.6f model=%s",
                         body.session_id, token_count,
                         metrics.get("response_time_ms", 0), metrics.get("ttft_ms", 0),
+                        request_ttft_ms, request_total_ms,
                         metrics.get("input_tokens", 0), metrics.get("output_tokens", 0),
                         metrics.get("estimated_cost_usd", 0.0), metrics.get("model_name", "?"),
                     )
@@ -801,4 +849,3 @@ async def serve_widget_js():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=2323, reload=True)
-
