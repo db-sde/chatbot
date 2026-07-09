@@ -509,6 +509,69 @@ def find_universities_in_message(message: str) -> list[dict[str, Any]]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Generic academic intent denylist (Change 1)
+# ---------------------------------------------------------------------------
+# These words describe *intent* or *topic*, not a university brand.
+# They must never enter the fuzzy candidate pool, even if they happen to
+# score highly against a university name fragment (e.g. "admission" → "mission").
+GENERIC_NON_ENTITY_TERMS: frozenset[str] = frozenset({
+    # Admission / application
+    "admission", "admissions", "admission process", "application",
+    "application process", "apply", "registration", "registration process",
+    # Financials
+    "fee", "fees", "cost", "price", "emi", "scholarship", "scholarships",
+    "stipend", "waiver",
+    # Eligibility / criteria
+    "eligibility", "eligible", "criteria", "qualification", "qualifications",
+    "requirement", "requirements",
+    # Catalog / program vocabulary
+    "course", "courses", "program", "programs", "degree", "online",
+    "distance", "learning", "certification", "certifications",
+    # Support / contact
+    "help", "support", "counsellor", "counselor", "advisor", "adviser",
+    "contact", "callback", "enquiry", "inquiry",
+    # Misc factual queries
+    "scope", "career", "placement", "ranking", "ranking", "review",
+    "process", "procedure", "document", "documents",
+})
+
+
+def _has_token_overlap(cand: str, alias: str, min_prefix: int = 3) -> bool:
+    """
+    Change 2 — token-overlap guard.
+
+    A fuzzy score can be misleadingly high when the candidate and alias
+    share no meaningful tokens (e.g. "admission" vs "mission" scores 87.5
+    on simple ratio because one is a substring of the other).  We require
+    that at least one token from `cand` shares a common prefix of length
+    >= min_prefix with at least one token from `alias`.  This is a much
+    stricter criterion than substring containment while still allowing:
+
+      * "nmis" → "nmims"   (prefix "nmi")
+      * "amity" → "amity online"  (exact token match)
+      * "srm" → "srm"   (full match, len 3, prefix len 3)
+
+    and rejecting:
+
+      * "admission" → "mission"   (no common prefix ≥ 3)
+    """
+    cand_tokens = cand.lower().split()
+    alias_tokens = alias.lower().split()
+    for ct in cand_tokens:
+        for at in alias_tokens:
+            # Determine longest common prefix
+            lcp = 0
+            for a, b in zip(ct, at):
+                if a == b:
+                    lcp += 1
+                else:
+                    break
+            if lcp >= min_prefix:
+                return True
+    return False
+
+
 def _fuzzy_find_universities_in_message(
     message: str,
     already: list[dict[str, Any]],
@@ -517,17 +580,30 @@ def _fuzzy_find_universities_in_message(
     """
     Spelling-correction pass: fuzzy-match message tokens against catalog aliases
     when catalog-first scan found nothing (or to catch typos of unmatched tokens).
+
+    Two guards prevent false positives (Change 1 + Change 2):
+      1. GENERIC_NON_ENTITY_TERMS denylist — generic academic words are rejected
+         before they ever enter the candidate pool.
+      2. Token-overlap guard (_has_token_overlap) — a match is only accepted
+         when candidate and alias share a meaningful prefix token, ruling out
+         substring-only coincidences like "admission" → "mission".
     """
     if not UNIVERSITY_ALIAS_INDEX:
         return []
 
     already_ids = {m["entity_id"] for m in already}
     text = _normalize_message_for_scan(message)
-    tokens = [t for t in text.split() if len(t) >= 3 and t not in _ALIAS_BLOCKLIST]
+    raw_tokens = [t for t in text.split() if len(t) >= 3 and t not in _ALIAS_BLOCKLIST]
+
+    # Change 1: strip generic academic intent words before fuzzy matching
+    tokens = [t for t in raw_tokens if t not in GENERIC_NON_ENTITY_TERMS]
+
     # Also try bigrams for multi-word brands
     candidates = list(tokens)
     for i in range(len(tokens) - 1):
-        candidates.append(f"{tokens[i]} {tokens[i + 1]}")
+        bigram = f"{tokens[i]} {tokens[i + 1]}"
+        if bigram not in GENERIC_NON_ENTITY_TERMS:
+            candidates.append(bigram)
 
     found: list[dict[str, Any]] = []
     for cand in candidates:
@@ -547,7 +623,16 @@ def _fuzzy_find_universities_in_message(
                 best_score = score
                 best_alias = alias
                 best_meta = meta
+
         if best_meta and best_score >= threshold:
+            # Change 2: require meaningful token overlap — rejects substring-only hits
+            if not _has_token_overlap(cand, best_alias):
+                logger.debug(
+                    "FUZZY REJECTED | no token overlap | query=%r alias=%r score=%.1f",
+                    cand, best_alias, best_score,
+                )
+                continue
+
             already_ids.add(best_meta["entity_id"])
             item = {
                 "entity_id": best_meta["entity_id"],
@@ -584,7 +669,7 @@ _UNIVERSITY_LIKE_BLOCKLIST = {
     # Back-reference words (not university names)
     "uni", "talking", "referring", "said", "asking", "mentioned", "above",
     "that", "same", "one", "other", "another", "both", "either",
-} | _ALIAS_BLOCKLIST
+} | _ALIAS_BLOCKLIST | GENERIC_NON_ENTITY_TERMS
 
 
 def _count_intended_universities(message: str) -> int:
