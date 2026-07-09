@@ -15,10 +15,17 @@ def _host(value: str | None) -> str | None:
     return (parsed.hostname or value).lower()
 
 
-def is_domain_allowed(host: str | None) -> bool:
+def is_domain_allowed(host: str | None, site_key: str | None = None) -> bool:
     if host is None:
-        return True
-    for domains in settings.site_domains.values():
+        return False
+
+    site_domains = settings.site_domains
+    domains_to_check = (
+        [site_domains.get(site_key, [])]
+        if site_key is not None
+        else site_domains.values()
+    )
+    for domains in domains_to_check:
         for domain in domains:
             if domain.startswith("*."):
                 suffix = domain[1:]  # e.g. ".onrender.com"
@@ -30,8 +37,13 @@ def is_domain_allowed(host: str | None) -> bool:
 
 
 def validate_site_request(site_key: str, origin: str | None, referer: str | None) -> None:
+    if site_key not in settings.site_domains:
+        raise HTTPException(status_code=403, detail="Invalid site key")
+
     host = _host(origin) or _host(referer)
-    if host is not None and not is_domain_allowed(host):
+    if not host:
+        raise HTTPException(status_code=403, detail="Origin or Referer required")
+    if not is_domain_allowed(host, site_key):
         raise HTTPException(status_code=403, detail="Origin not allowed")
 
 

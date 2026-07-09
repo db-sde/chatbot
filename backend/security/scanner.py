@@ -30,6 +30,14 @@ _MAX_INPUT_LENGTH = 10000
 _CIRCUIT_BREAKER_THRESHOLD = 5   # failures before opening
 _CIRCUIT_BREAKER_TIMEOUT = 30    # seconds before half-open
 
+# Prompt Guard is a supplemental remote classifier: the local heuristic runs
+# before it and remains the fallback. Keep one retry for transient provider
+# failures, but bound the user-facing outage path to 4.1 seconds instead of
+# 16.5 seconds.
+_PROMPT_GUARD_TIMEOUT_SECONDS = 2.0
+_PROMPT_GUARD_MAX_RETRIES = 1
+_PROMPT_GUARD_RETRY_BACKOFF_SECONDS = 0.1
+
 
 class RiskLevel(Enum):
     BENIGN = "benign"
@@ -377,8 +385,8 @@ class PromptGuardClient:
     async def scan(
         self,
         message: str,
-        timeout: float = 5.0,
-        max_retries: int = 2,
+        timeout: float = _PROMPT_GUARD_TIMEOUT_SECONDS,
+        max_retries: int = _PROMPT_GUARD_MAX_RETRIES,
     ) -> SafetyResult | None:
         if not settings.groq_api_key:
             return None
@@ -423,14 +431,14 @@ class PromptGuardClient:
                 if attempt == max_retries:
                     self._circuit_breaker.record_failure()
                     return None
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(_PROMPT_GUARD_RETRY_BACKOFF_SECONDS * (2 ** attempt))
 
             except Exception as exc:
                 logger.warning("PROMPT_GUARD_PRIMARY_FAILED error=%s attempt=%d", exc, attempt)
                 if attempt == max_retries:
                     self._circuit_breaker.record_failure()
                     return None
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(_PROMPT_GUARD_RETRY_BACKOFF_SECONDS * (2 ** attempt))
 
         return None
 

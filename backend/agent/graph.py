@@ -78,6 +78,10 @@ class ChatState(TypedDict, total=False):
     tool_calls_log: list[dict[str, Any]]
     lead_ask: bool
     lead_ask_triggered_by: str
+    # Actual tool invocations across the entire user turn. This is separate
+    # from tool_call_count, which retains its existing meaning of ReAct rounds.
+    tool_calls_executed: int
+    tool_call_limit_reached: bool
     tool_call_count: int
     # New fields for optimization
     triage_intent: str
@@ -112,6 +116,8 @@ def _make_state(
         "reply": "",
         "tool_calls_log": [],
         "lead_ask": False,
+        "tool_calls_executed": 0,
+        "tool_call_limit_reached": False,
         "tool_call_count": 0,
         "triage_intent": "factual",
         "cache_hit": False,
@@ -442,8 +448,12 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
     t_start = time.perf_counter()
     result: dict[str, Any]
     try:
-        # Get the raw LangChain model and bind tools
-        model = llm_client.chat_model.bind_tools(TOOLS)
+        # Once the turn-level tool budget is exhausted, make one final model
+        # pass without tools so it synthesizes the already-collected results
+        # instead of requesting another tool batch.
+        model = llm_client.chat_model
+        if not state.get("tool_call_limit_reached"):
+            model = model.bind_tools(TOOLS)
 
         # Invoke as a Runnable so LangGraph's astream_events can intercept the stream
         response = await model.ainvoke(_clean_messages(messages))
@@ -564,9 +574,24 @@ async def node_execute_tools(state: ChatState) -> dict[str, Any]:
     # reducer replaces it in place rather than duplicating it in history) but
     # corrected args, then execute tools against that corrected message.
     corrected_state = state
+    tool_calls_executed = state.get("tool_calls_executed", 0)
+    remaining_tool_calls = max(MAX_TOOL_CALLS_PER_TURN - tool_calls_executed, 0)
+    tool_call_limit_reached = state.get("tool_call_limit_reached", False)
     if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+        requested_tool_calls = list(last_msg.tool_calls)
+        if len(requested_tool_calls) > remaining_tool_calls:
+            logger.warning(
+                "[%s] TOOL CALL LIMIT | requested=%d remaining=%d cap=%d; forcing synthesis after allowed calls",
+                session_id,
+                len(requested_tool_calls),
+                remaining_tool_calls,
+                MAX_TOOL_CALLS_PER_TURN,
+            )
+            requested_tool_calls = requested_tool_calls[:remaining_tool_calls]
+            tool_call_limit_reached = True
+
         merged_tool_calls = []
-        for tc in last_msg.tool_calls:
+        for tc in requested_tool_calls:
             original_args = tc.get("args", {}) or {}
             new_args = _merge_resolved_into_tool_args(original_args, resolved)
             if new_args != original_args:
@@ -606,6 +631,10 @@ async def node_execute_tools(state: ChatState) -> dict[str, Any]:
             content_preview = str(msg.content)[:200]
             logger.info("[%s] TOOL RESULT | %s -> %s", session_id, getattr(msg, "name", "?"), content_preview)
 
+    executed_this_round = len(last_msg.tool_calls) if isinstance(last_msg, AIMessage) else 0
+    tool_calls_executed += executed_this_round
+    if tool_calls_executed >= MAX_TOOL_CALLS_PER_TURN:
+        tool_call_limit_reached = True
     count = state.get("tool_call_count", 0) + 1
 
     # Re-emit the corrected AIMessage alongside the new ToolMessages. It shares
@@ -617,10 +646,18 @@ async def node_execute_tools(state: ChatState) -> dict[str, Any]:
     if corrected_state is not state:
         out_messages = [last_msg, *out_messages]
 
-    return {**result, "messages": out_messages, "tool_call_count": count, "tool_ms_total": tool_ms_total}
+    return {
+        **result,
+        "messages": out_messages,
+        "tool_call_count": count,
+        "tool_calls_executed": tool_calls_executed,
+        "tool_call_limit_reached": tool_call_limit_reached,
+        "tool_ms_total": tool_ms_total,
+    }
 
 
 MAX_TOOL_ITERATIONS = 4
+MAX_TOOL_CALLS_PER_TURN = 8
 
 def route_after_agent(state: ChatState) -> str:
     """Decides whether to execute tools or exit based on iteration cap and tool calls."""

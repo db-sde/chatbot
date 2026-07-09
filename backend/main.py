@@ -383,6 +383,7 @@ async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[
         str(body.email) if body.email else None,
         body.course_interest,
         "widget_form",
+        body.site_key,
     )
     if settings.crm_webhook_url:
         async with httpx.AsyncClient(timeout=8) as client:
@@ -800,5 +801,4 @@ async def serve_widget_js():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=2323, reload=True)
-
 

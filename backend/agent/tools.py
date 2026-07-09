@@ -197,6 +197,7 @@ async def capture_lead(
     email: str | None,
     course_interest: str | None,
     trigger_reason: str,
+    site_id: str = "degreebaba_dev",
 ) -> dict:
     try:
         pool = await get_pool()
@@ -206,7 +207,7 @@ async def capture_lead(
             await pool.execute(
                 "INSERT INTO sessions (id, site_id, page_university_slug) VALUES ($1::uuid, $2, $3) ON CONFLICT DO NOTHING",
                 session_id,
-                "degreebaba_dev",
+                site_id,
                 None
             )
         if trigger_reason == "widget_form":

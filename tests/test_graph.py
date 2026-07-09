@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -297,6 +298,118 @@ async def test_graph_loop_iteration_cap(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tool_call_budget_limits_large_batch_and_forces_synthesis(monkeypatch):
+    """A large model tool batch executes at most the turn budget, then synthesizes."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    import agent.graph as graph_mod
+
+    executed_calls = []
+
+    class RecordingToolNode:
+        def __init__(self, _tools):
+            pass
+
+        async def ainvoke(self, state):
+            calls = state["messages"][-1].tool_calls
+            executed_calls.extend(calls)
+            return {
+                "messages": [
+                    ToolMessage(content="{}", name=call["name"], tool_call_id=call["id"])
+                    for call in calls
+                ]
+            }
+
+    large_batch = [
+        {
+            "name": "get_fee_tool",
+            "args": {"university_slug": "nmims", "course_slug": "mba"},
+            "id": f"call_{index}",
+            "type": "tool_call",
+        }
+        for index in range(graph_mod.MAX_TOOL_CALLS_PER_TURN + 3)
+    ]
+    model = MagicMock()
+    model.bind_tools.return_value = model
+    model.ainvoke = AsyncMock(side_effect=[
+        AIMessage(content="", tool_calls=large_batch),
+        AIMessage(content="Here is the information available from the completed lookups."),
+    ])
+
+    monkeypatch.setattr(graph_mod, "ToolNode", RecordingToolNode)
+    monkeypatch.setattr(graph_mod, "llm_client", SimpleNamespace(enabled=True, chat_model=model))
+
+    events = []
+    async for event in graph_mod.run_chat_turn(
+        session_id="66666666-6666-4666-8666-666666666666",
+        site_id="test",
+        message="NMIMS MBA fee and eligibility",
+        page_university_slug="nmims",
+    ):
+        events.append(event)
+
+    assert len(executed_calls) == graph_mod.MAX_TOOL_CALLS_PER_TURN
+    assert model.bind_tools.call_count == 1
+    assert model.ainvoke.await_count == 2
+    assert events[-1]["event"] == "final"
+    assert "completed lookups" in "".join(
+        event["data"].get("text", "") for event in events if event["event"] == "token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_call_budget_preserves_valid_small_multi_tool_batch(monkeypatch):
+    """Fee and eligibility lookups below the cap execute unchanged."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    import agent.graph as graph_mod
+
+    executed_calls = []
+
+    class RecordingToolNode:
+        def __init__(self, _tools):
+            pass
+
+        async def ainvoke(self, state):
+            calls = state["messages"][-1].tool_calls
+            executed_calls.extend(calls)
+            return {
+                "messages": [
+                    ToolMessage(content="{}", name=call["name"], tool_call_id=call["id"])
+                    for call in calls
+                ]
+            }
+
+    calls = [
+        {
+            "name": "get_fee_tool",
+            "args": {"university_slug": "nmims", "course_slug": "mba"},
+            "id": "fee",
+            "type": "tool_call",
+        },
+        {
+            "name": "get_eligibility_tool",
+            "args": {"university_slug": "nmims", "course_slug": "mba"},
+            "id": "eligibility",
+            "type": "tool_call",
+        },
+    ]
+    monkeypatch.setattr(graph_mod, "ToolNode", RecordingToolNode)
+
+    result = await graph_mod.node_execute_tools({
+        "session_id": "test-session",
+        "messages": [AIMessage(content="", tool_calls=calls)],
+        "resolved": {},
+        "tool_call_count": 0,
+        "tool_calls_executed": 0,
+        "tool_call_limit_reached": False,
+        "tool_ms_total": 0.0,
+    })
+
+    assert executed_calls == calls
+    assert result["tool_calls_executed"] == 2
+    assert result["tool_call_limit_reached"] is False
+
+
+@pytest.mark.asyncio
 async def test_lead_intent_node(monkeypatch):
     """
     Verify that background_lead_scoring triggers lead ask and stores classification
@@ -334,5 +447,3 @@ async def test_lead_intent_node(monkeypatch):
     
     assert mock_save.called
     assert mock_mark.called
-
-
