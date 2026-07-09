@@ -41,7 +41,13 @@ from observability import (
 
 logger = logging.getLogger(__name__)
 
-from leads.scoring import classify_score_events, log_score_events, should_append_lead_ask
+from leads.scoring import (
+    classify_score_events,
+    log_score_events,
+    should_append_lead_ask,
+    detect_fast_lead_intent,
+    is_contact_intent,
+)
 from leads.intent import lead_intent_classifier, LEAD_INTENT_CONFIDENCE_THRESHOLD
 
 
@@ -102,17 +108,28 @@ def _make_state(
 # Nodes
 # ---------------------------------------------------------------------------
 
+CONTACT_REPLY = (
+    "I'd be happy to connect you with an admission counsellor. "
+    "Please share your contact details."
+)
+
+
 async def node_triage(state: ChatState) -> dict[str, Any]:
     """
-    FAST PATH: Greeting/chitchat detector + future semantic cache hook.
-    Uses a zero-cost regex/set check — no LLM, no DB, no network.
+    FAST PATH: Greeting / contact intent / future semantic cache.
+    Uses zero-cost checks — no LLM, no DB, no network.
     """
     from agent.resolve import is_greeting
     message = state["raw_message"]
+    session_id = state.get("session_id")
 
     if is_greeting(message):
-        logger.info("[%s] TRIAGE -> chitchat (greeting detected: %r)", state.get("session_id"), message[:60])
-        return {"triage_intent": "chitchat", "cache_hit": False}
+        logger.info("[%s] TRIAGE -> chitchat (greeting detected: %r)", session_id, message[:60])
+        return {"triage_intent": "chitchat", "cache_hit": False, "lead_ask": False}
+
+    if is_contact_intent(message):
+        logger.info("[%s] CONTACT INTENT DETECTED | triage msg=%r", session_id, message[:80])
+        return {"triage_intent": "contact", "cache_hit": False, "lead_ask": True}
 
     # Future: semantic cache lookup here before hitting the full pipeline.
     return {"triage_intent": "factual", "cache_hit": False}
@@ -123,6 +140,8 @@ def route_after_triage(state: ChatState) -> str:
         return END
     if state.get("triage_intent") == "chitchat":
         return "chitchat_reply"
+    if state.get("triage_intent") == "contact":
+        return "contact_reply"
     return "resolve_entities"
 
 
@@ -132,17 +151,66 @@ async def node_chitchat_reply(state: ChatState) -> dict[str, Any]:
     return {"reply": reply, "messages": [AIMessage(content=reply)]}
 
 
+async def node_contact_reply(state: ChatState) -> dict[str, Any]:
+    """Contact/lead intent: skip entity resolve + agent; open lead form."""
+    logger.info(
+        "[%s] CONTACT INTENT DETECTED | LEAD ASK TRIGGERED | msg=%r",
+        state.get("session_id"),
+        state.get("raw_message", "")[:80],
+    )
+    return {
+        "reply": CONTACT_REPLY,
+        "messages": [AIMessage(content=CONTACT_REPLY)],
+        "lead_ask": True,
+        "lead_ask_triggered_by": "Contact Intent",
+        "resolved": {
+            "resolution_status": "contact",
+            "intent_type": "contact",
+            "university_slug": None,
+            "course_slug": None,
+            "specialization_slug": None,
+            "_page_hint_only": True,
+        },
+    }
+
+
 async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
     """
-    Entity resolution: LLM extraction → fuzzy slug snap → context fallback.
+    Entity resolution: catalog-first university detection → course/spec snap → context.
+    Contact intent is handled in triage before this node runs.
     """
     message = state["raw_message"]
     context = state.get("context", {})
     session_id = state["session_id"]
     page_university_slug = state.get("page_university_slug")
 
+    # Defense in depth: contact messages must never enter entity extraction
+    if is_contact_intent(message):
+        logger.info("[%s] CONTACT INTENT DETECTED | resolve bypass", session_id)
+        return {
+            "lead_ask": True,
+            "lead_ask_triggered_by": "Contact Intent",
+            "resolved": {
+                "resolution_status": "contact",
+                "intent_type": "contact",
+                "university_slug": None,
+                "course_slug": None,
+                "specialization_slug": None,
+                "_page_hint_only": True,
+            },
+        }
+
     logger.info("[%s] RESOLVE ENTITIES | msg=%r", session_id, message[:100])
     resolved = await _resolve_entities(message, context, page_university_slug)
+
+    # If resolve itself detected contact (safety)
+    if resolved.get("resolution_status") == "contact" or resolved.get("intent_type") == "contact":
+        logger.info("[%s] CONTACT INTENT DETECTED | from resolve layer", session_id)
+        return {
+            "lead_ask": True,
+            "lead_ask_triggered_by": "Contact Intent",
+            "resolved": {**resolved, "_page_hint_only": True},
+        }
 
     resolution_status = resolved.get("resolution_status", "none")
     logger.info(
@@ -153,23 +221,28 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
         resolution_status,
     )
 
-    # Only persist to session when the entity was genuinely resolved from the catalog.
-    # Page context and session context reuse don't warrant overwriting the stored context.
-    # entity_not_found means no university at all — don't persist None over a valid stored value.
-    persist_university = (
-        resolved.get("university_slug")
-        if resolution_status == "resolved"
-        else None
-    )
-
+    # Persist newly catalog-resolved entities. replace_dependents clears stale course/spec
+    # when the user switches university (NMIMS → Sharda).
     pool = await get_pool()
-    await queries.update_session_context(
-        pool,
-        session_id,
-        persist_university,
-        resolved.get("course_slug") if resolution_status == "resolved" else None,
-        resolved.get("specialization_slug") if resolution_status == "resolved" else None,
-    )
+    if resolution_status == "resolved" and resolved.get("university_slug"):
+        await queries.update_session_context(
+            pool,
+            session_id,
+            resolved.get("university_slug"),
+            resolved.get("course_slug"),
+            resolved.get("specialization_slug"),
+            replace_dependents=True,
+        )
+        logger.info(
+            "[%s] SESSION CONTEXT UPDATED | uni=%s course=%s spec=%s",
+            session_id,
+            resolved.get("university_slug"),
+            resolved.get("course_slug"),
+            resolved.get("specialization_slug"),
+        )
+    elif resolution_status == "resolved":
+        # Comparison-only edge: no single primary uni — still safe no-op
+        pass
 
     intent_text = message.lower()
     if any(t in intent_text for t in ("fee", "fees", "cost", "price", "emi")):
@@ -178,9 +251,9 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
         await log_anonymous_signal(session_id, resolved.get("university_slug"), resolved.get("course_slug"), "eligibility")
 
     # _page_hint_only=True suppresses the "resolved context" system note in node_agent.
-    # It is True for page_context and session_context (slug is contextual, not from user intent)
-    # and for entity_not_found/partial_match (agent handles the clarification itself).
-    page_hint_only = resolution_status in ("page_context", "session_context", "entity_not_found", "partial_match", "none")
+    page_hint_only = resolution_status in (
+        "page_context", "session_context", "entity_not_found", "partial_match", "none", "contact",
+    )
     resolved["_page_hint_only"] = page_hint_only
     return {"resolved": resolved}
 
@@ -272,9 +345,21 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
         if last_human_idx is not None:
             messages = messages[:last_human_idx] + [SystemMessage(content=context_note)] + messages[last_human_idx:]
 
+    # ── Contact intent advisory (defense if agent path is reached) ────────────
+    if resolution_status == "contact" or resolved.get("intent_type") == "contact":
+        contact_note = (
+            "[The user wants to speak with a counsellor / get in touch. "
+            "Do NOT call catalog tools. Respond briefly that you'll connect them "
+            "with an admission counsellor and ask them to share contact details.]"
+        )
+        last_human_idx = next(
+            (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+            None,
+        )
+        if last_human_idx is not None:
+            messages = messages[:last_human_idx] + [SystemMessage(content=contact_note)] + messages[last_human_idx:]
+
     # ── Entity-not-found advisory note ────────────────────────────────────────
-    # When the user explicitly named a university that isn't in the catalog,
-    # tell the agent clearly so it can respond without making a tool call.
     if resolution_status == "entity_not_found":
         requested = resolved.get("requested_entity") or "the university you mentioned"
         not_found_note = (
@@ -291,8 +376,6 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
             messages = messages[:last_human_idx] + [SystemMessage(content=not_found_note)] + messages[last_human_idx:]
 
     # ── Partial-match advisory note ───────────────────────────────────────────
-    # When comparing multiple universities and some are missing from the catalog,
-    # tell the agent which are found/missing so it can inform the user without calling tools.
     if resolution_status == "partial_match":
         found = resolved.get("comparison_found") or []
         missing = resolved.get("comparison_missing") or []
@@ -446,6 +529,7 @@ def _build_graph() -> Any:
 
     graph.add_node("triage", node_triage)
     graph.add_node("chitchat_reply", node_chitchat_reply)
+    graph.add_node("contact_reply", node_contact_reply)
     graph.add_node("resolve_entities", node_resolve_entities)
     graph.add_node("agent", node_agent)
     graph.add_node("execute_tools", node_execute_tools)
@@ -454,15 +538,19 @@ def _build_graph() -> Any:
     graph.add_conditional_edges("triage", route_after_triage, {
         "resolve_entities": "resolve_entities",
         "chitchat_reply": "chitchat_reply",
-        END: END
+        "contact_reply": "contact_reply",
+        END: END,
     })
-    
+
     graph.add_edge("chitchat_reply", END)
+    graph.add_edge("contact_reply", END)
     graph.add_edge("resolve_entities", "agent")
 
+    # Contact status set only in resolve (defense) should still reach agent OR short-circuit.
+    # resolve_entities always continues to agent for factual turns; contact is handled in triage.
     graph.add_conditional_edges("agent", route_after_agent, {
         "execute_tools": "execute_tools",
-        END: END
+        END: END,
     })
     graph.add_edge("execute_tools", "agent")  # ReAct loop
 
@@ -565,20 +653,39 @@ async def run_chat_turn(
         reply_text = final_state.get("reply", "")
         yield {"event": "token", "data": {"text": reply_text}}
 
-    lead_ask = False
-    lead_ask_triggered_by = "Score Engine"
+    # P0: request-time lead decision (must be in SSE final before client disconnects)
+    lead_ask = bool(final_state.get("lead_ask")) if final_state else False
+    lead_ask_triggered_by = final_state.get("lead_ask_triggered_by") if final_state else None
+    if not lead_ask and detect_fast_lead_intent(message):
+        lead_ask = True
+        lead_ask_triggered_by = lead_ask_triggered_by or "Fast Lead Intent"
+    if not lead_ask_triggered_by:
+        lead_ask_triggered_by = "Score Engine"
 
-    if not reply_text:
-        await log_unanswered(session_id, message, None, None)
-        reply_text = (
-            "I don't have that detail on file yet — I've logged this so the "
-            "DegreeBaba team can fill the gap. Feel free to ask about fees, "
-            "eligibility, or available programs."
+    if lead_ask:
+        logger.info(
+            "[%s] LEAD ASK TRIGGERED | reason=%s | msg=%r",
+            session_id,
+            lead_ask_triggered_by,
+            message[:80],
         )
 
-    # BACKGROUND LEAD SCORING (Non-blocking)
+    if not reply_text:
+        # Contact path should already have set reply via state; fallback safety
+        if lead_ask and (final_state or {}).get("triage_intent") == "contact":
+            reply_text = CONTACT_REPLY
+            yield {"event": "token", "data": {"text": reply_text}}
+        else:
+            await log_unanswered(session_id, message, None, None)
+            reply_text = (
+                "I don't have that detail on file yet — I've logged this so the "
+                "DegreeBaba team can fill the gap. Feel free to ask about fees, "
+                "eligibility, or available programs."
+            )
+
+    # BACKGROUND LEAD SCORING (analytics only — does not control this turn's lead_ask)
     asyncio.create_task(
-        background_lead_scoring(session_id, message, final_state.get("messages", []))
+        background_lead_scoring(session_id, message, final_state.get("messages", []) if final_state else [])
     )
 
     # Output security scan

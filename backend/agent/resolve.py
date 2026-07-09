@@ -8,6 +8,7 @@ from rapidfuzz import fuzz
 
 from db import queries
 from db.pool import get_pool
+from leads.scoring import is_contact_intent
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +50,11 @@ def is_greeting(message: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# In-memory entity cache
+# In-memory entity cache + canonical university alias index
 # ---------------------------------------------------------------------------
-# Each row in ENTITY_CACHE[etype] is:
-#   {entity_id, search_text, university_id?, course_id?}
-# The FK columns are loaded alongside entity_search so we can do hierarchical
-# filtering entirely in RAM without extra DB queries at request time.
+# Each university row:
+#   {entity_id, search_text, canonical_slug, name?, full_name?}
+# Course / specialization rows keep university_id / course_id for scoping.
 
 ENTITY_CACHE: dict[str, list[dict[str, Any]]] = {
     "university": [],
@@ -62,47 +62,239 @@ ENTITY_CACHE: dict[str, list[dict[str, Any]]] = {
     "specialization": [],
 }
 
+# alias (lowercase) → {entity_id, canonical_slug}
+UNIVERSITY_ALIAS_INDEX: dict[str, dict[str, Any]] = {}
+
+# Sorted (alias, meta) longest-first for catalog scan
+_UNIVERSITY_ALIASES_SORTED: list[tuple[str, dict[str, Any]]] = []
+
+# Tokens that should never be treated as university aliases. This is the
+# baseline stopword set; COURSE_HINTS / SPECIALIZATION_HINTS / generic
+# education vocabulary are merged into this further down, once those lists
+# exist (see "Structural hint extraction" section below).
+_ALIAS_BLOCKLIST = {
+    "university", "college", "institute", "online", "distance", "the", "and",
+    "of", "for", "in", "to", "a", "an", "mba", "bca", "mca", "bba", "pgdm",
+    "course", "courses", "program", "programs", "degree", "edu", "education",
+}
+
+
+def _register_alias(alias: str, entity_id: int, canonical_slug: str) -> None:
+    alias = alias.lower().strip()
+    alias = re.sub(r"\s+", " ", alias)
+    if not alias or len(alias) < 2:
+        return
+    if alias in _ALIAS_BLOCKLIST:
+        return
+    # Prefer longer / already-registered only if same entity; allow overwrite of weaker
+    existing = UNIVERSITY_ALIAS_INDEX.get(alias)
+    if existing and existing["entity_id"] != entity_id:
+        # Keep first registered (stable); log once at debug
+        return
+    UNIVERSITY_ALIAS_INDEX[alias] = {
+        "entity_id": entity_id,
+        "canonical_slug": canonical_slug,
+    }
+
+
+def _tokenize_for_freq(text: str) -> list[str]:
+    text = str(text).lower()
+    text = re.sub(r"[^\w\s\-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return [t for t in text.replace("-", " ").split() if t]
+
+
+def _compute_alias_token_frequencies(
+    rows: list[dict[str, Any]]
+) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+    """
+    First pass over the catalog: for every candidate single-token and bigram
+    alias, track which entity_ids it appears under.
+
+    This exists because Indian university names share huge amounts of
+    vocabulary ("management", "professional", "global", "education", ...).
+    Registering those as single-token aliases means whichever university
+    happens to be processed first silently "wins" that word forever, and
+    every other university sharing it becomes unreachable by that token.
+    Instead we only allow a single-token or bigram alias through when it is
+    DISTINCTIVE — i.e. it belongs to exactly one university in the whole
+    catalog. Full name / full_name / search_text phrases are registered
+    unconditionally since a full phrase is specific enough to be safe.
+    """
+    token_freq: dict[str, set[int]] = {}
+    bigram_freq: dict[str, set[int]] = {}
+
+    for row in rows:
+        entity_id = row["entity_id"]
+        row_tokens: set[str] = set()
+        row_bigrams: set[str] = set()
+        for field in ("name", "full_name", "search_text"):
+            raw = row.get(field)
+            if not raw:
+                continue
+            tokens = _tokenize_for_freq(raw)
+            for tok in tokens:
+                if len(tok) >= 2 and tok not in _ALIAS_BLOCKLIST:
+                    row_tokens.add(tok)
+            for i in range(len(tokens) - 1):
+                if tokens[i] in _ALIAS_BLOCKLIST:
+                    continue
+                row_bigrams.add(f"{tokens[i]} {tokens[i + 1]}")
+        for tok in row_tokens:
+            token_freq.setdefault(tok, set()).add(entity_id)
+        for bg in row_bigrams:
+            bigram_freq.setdefault(bg, set()).add(entity_id)
+
+    return token_freq, bigram_freq
+
+
+def _rebuild_university_alias_index() -> None:
+    """Build alias → canonical_slug map from ENTITY_CACHE university rows.
+
+    Single-token and bigram aliases are only registered when they are
+    DISTINCTIVE (unique to exactly one university across the whole catalog).
+    See _compute_alias_token_frequencies for why.
+    """
+    UNIVERSITY_ALIAS_INDEX.clear()
+    rows = ENTITY_CACHE["university"]
+    token_freq, bigram_freq = _compute_alias_token_frequencies(rows)
+
+    for row in rows:
+        entity_id = row["entity_id"]
+        canonical = row.get("canonical_slug") or row.get("slug")
+        if not canonical:
+            continue
+
+        # Canonical slug + hyphen variant + brand head are derived from the
+        # slug itself (already unique), so these are always safe to register.
+        _register_alias(canonical, entity_id, canonical)
+        if "-" in canonical:
+            _register_alias(canonical.replace("-", " "), entity_id, canonical)
+            head = canonical.split("-")[0]
+            if head and head not in _ALIAS_BLOCKLIST:
+                _register_alias(head, entity_id, canonical)
+
+        for field in ("name", "full_name", "search_text"):
+            raw = row.get(field)
+            if not raw:
+                continue
+            text = str(raw).lower()
+            text = re.sub(r"[^\w\s\-]", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            if not text:
+                continue
+
+            # Full normalized phrase is specific enough to register unconditionally.
+            _register_alias(text, entity_id, canonical)
+
+            tokens = text.replace("-", " ").split()
+            for tok in tokens:
+                if tok in _ALIAS_BLOCKLIST or len(tok) < 2:
+                    continue
+                if len(token_freq.get(tok, set())) == 1:
+                    _register_alias(tok, entity_id, canonical)
+
+            for i in range(len(tokens) - 1):
+                if tokens[i] in _ALIAS_BLOCKLIST:
+                    continue
+                bigram = f"{tokens[i]} {tokens[i + 1]}"
+                if len(bigram_freq.get(bigram, set())) == 1:
+                    _register_alias(bigram, entity_id, canonical)
+
+    global _UNIVERSITY_ALIASES_SORTED
+    _UNIVERSITY_ALIASES_SORTED = sorted(
+        UNIVERSITY_ALIAS_INDEX.items(),
+        key=lambda kv: len(kv[0]),
+        reverse=True,
+    )
+    logger.info(
+        "University alias index rebuilt: %d aliases for %d universities (distinctiveness-filtered)",
+        len(UNIVERSITY_ALIAS_INDEX),
+        len(ENTITY_CACHE["university"]),
+    )
+
+
+def resolve_university_alias(slug_or_alias: str | None) -> str | None:
+    """Map any alias / brand / slug to the canonical university slug."""
+    if not slug_or_alias:
+        return None
+    key = slug_or_alias.lower().strip()
+    meta = UNIVERSITY_ALIAS_INDEX.get(key)
+    if meta:
+        return meta["canonical_slug"]
+    # Try hyphen/space variants
+    meta = UNIVERSITY_ALIAS_INDEX.get(key.replace("-", " "))
+    if meta:
+        return meta["canonical_slug"]
+    meta = UNIVERSITY_ALIAS_INDEX.get(key.replace(" ", "-"))
+    if meta:
+        return meta["canonical_slug"]
+    return None
+
 
 async def load_entity_cache() -> None:
-    """Fetch entity_search rows plus FK columns from Postgres into RAM.
+    """Fetch entity_search rows plus FK columns and university slugs into RAM.
 
     Called once at lifespan startup and on-demand via admin cache-refresh endpoint.
     """
     pool = await get_pool()
 
-    # Universities
+    # Universities — include canonical slug + names for alias index
     uni_rows = await pool.fetch(
-        "SELECT es.entity_id, es.search_text "
-        "FROM entity_search es WHERE es.entity_type = 'university'"
+        """
+        SELECT es.entity_id, es.search_text, u.slug, u.name, u.full_name
+        FROM entity_search es
+        JOIN universities u ON u.id = es.entity_id
+        WHERE es.entity_type = 'university'
+        """
     )
     ENTITY_CACHE["university"] = [
-        {"entity_id": r["entity_id"], "search_text": r["search_text"]}
+        {
+            "entity_id": r["entity_id"],
+            "search_text": r["search_text"],
+            "canonical_slug": r["slug"],
+            "slug": r["slug"],
+            "name": r["name"],
+            "full_name": r["full_name"],
+        }
         for r in uni_rows
     ]
+    _rebuild_university_alias_index()
 
     # Courses — include university_id for hierarchical filtering
     course_rows = await pool.fetch(
-        "SELECT es.entity_id, es.search_text, c.university_id "
-        "FROM entity_search es "
-        "JOIN courses c ON c.id = es.entity_id "
-        "WHERE es.entity_type = 'course'"
+        """
+        SELECT es.entity_id, es.search_text, c.university_id
+        FROM entity_search es
+        JOIN courses c ON c.id = es.entity_id
+        WHERE es.entity_type = 'course'
+        """
     )
     ENTITY_CACHE["course"] = [
-        {"entity_id": r["entity_id"], "search_text": r["search_text"],
-         "university_id": r["university_id"]}
+        {
+            "entity_id": r["entity_id"],
+            "search_text": r["search_text"],
+            "university_id": r["university_id"],
+        }
         for r in course_rows
     ]
 
     # Specializations — include university_id and course_id
     spec_rows = await pool.fetch(
-        "SELECT es.entity_id, es.search_text, s.university_id, s.course_id "
-        "FROM entity_search es "
-        "JOIN specializations s ON s.id = es.entity_id "
-        "WHERE es.entity_type = 'specialization'"
+        """
+        SELECT es.entity_id, es.search_text, s.university_id, s.course_id
+        FROM entity_search es
+        JOIN specializations s ON s.id = es.entity_id
+        WHERE es.entity_type = 'specialization'
+        """
     )
     ENTITY_CACHE["specialization"] = [
-        {"entity_id": r["entity_id"], "search_text": r["search_text"],
-         "university_id": r["university_id"], "course_id": r["course_id"]}
+        {
+            "entity_id": r["entity_id"],
+            "search_text": r["search_text"],
+            "university_id": r["university_id"],
+            "course_id": r["course_id"],
+        }
         for r in spec_rows
     ]
 
@@ -110,8 +302,32 @@ async def load_entity_cache() -> None:
     logger.info("Entity cache loaded: %d rows across %d types", total, len(ENTITY_CACHE))
 
 
+def seed_university_cache_for_tests(rows: list[dict[str, Any]]) -> None:
+    """Test helper: set university cache + rebuild alias index.
+
+    Each row needs entity_id, search_text, and preferably canonical_slug/slug.
+    """
+    normalized = []
+    for r in rows:
+        slug = r.get("canonical_slug") or r.get("slug")
+        if not slug:
+            # Infer from first token of search_text for legacy tests
+            tokens = (r.get("search_text") or "").lower().split()
+            slug = tokens[0] if tokens else f"uni-{r['entity_id']}"
+        normalized.append({
+            "entity_id": r["entity_id"],
+            "search_text": r.get("search_text", ""),
+            "canonical_slug": slug,
+            "slug": slug,
+            "name": r.get("name"),
+            "full_name": r.get("full_name"),
+        })
+    ENTITY_CACHE["university"] = normalized
+    _rebuild_university_alias_index()
+
+
 # ---------------------------------------------------------------------------
-# Structural hint extraction
+# Structural hint extraction (courses / specs / fees — not universities)
 # ---------------------------------------------------------------------------
 
 COURSE_HINTS = [
@@ -128,7 +344,51 @@ SPECIALIZATION_HINTS = [
     "healthcare", "media", "digital marketing",
 ]
 
-# Keywords that indicate the user needs factual catalog data
+# Course / specialization vocabulary should never become a university alias,
+# and should never be counted as a "university-like" token when guessing how
+# many institutions a message names — asking about "data science" or "MBA"
+# is not the same as naming an institution.
+_COURSE_SPEC_TOKENS: set[str] = set()
+for _hint in COURSE_HINTS + SPECIALIZATION_HINTS:
+    _COURSE_SPEC_TOKENS.update(_hint.split())
+
+# Generic words that recur across dozens of Indian university names. Even
+# with the distinctiveness filter in _rebuild_university_alias_index, keeping
+# these out of alias generation entirely avoids noisy near-miss fuzzy matches.
+_GENERIC_EDU_WORDS = {
+    "global", "international", "national", "professional", "management",
+    "studies", "science", "sciences", "technology", "technologies",
+    "education", "programme", "programmes", "group", "campus", "centre",
+    "center", "indian", "academy", "institution", "deemed", "autonomous",
+    "private", "public", "state", "central", "school", "faculty", "world",
+    "institute", "institutes", "university", "universities", "college",
+    "colleges", "open", "correspondence", "regional", "society", "trust",
+    "foundation", "research", "advanced", "higher", "learning", "knowledge",
+}
+
+# Common verbs/adjectives that show up in ordinary factual questions
+# ("which college OFFERS data science", "is it AFFORDABLE") — these must not
+# be mistaken for a leftover university name once real stopwords are removed.
+_FACTUAL_VERB_NOISE = {
+    "offer", "offers", "offering", "provide", "provides", "providing",
+    "give", "gives", "giving", "have", "has", "having",
+    "recognized", "recognised", "reputed", "approved", "accredited",
+    "affordable", "cheap", "expensive", "available", "apply", "applying",
+    "enroll", "enrolled", "enrolling", "join", "joining",
+    "study", "studying", "learn", "learning", "teach", "teaches",
+    "located", "location", "near", "nearby", "city", "state", "country",
+    "india", "seat", "seats", "intake", "batch", "semester", "year",
+    "years", "month", "months", "fulltime", "parttime", "weekend",
+    "weekday", "exam", "exams", "syllabus", "curriculum", "faculty",
+    "package", "salary", "job", "jobs", "career", "careers", "good",
+    "better", "best", "top", "reviews", "review", "rated", "rating",
+}
+
+# Merge into the alias blocklist now that all three word-lists exist. This
+# must happen BEFORE _UNIVERSITY_LIKE_BLOCKLIST is defined further down,
+# since that set is built as `{...} | _ALIAS_BLOCKLIST` at import time.
+_ALIAS_BLOCKLIST.update(_COURSE_SPEC_TOKENS | _GENERIC_EDU_WORDS | _FACTUAL_VERB_NOISE)
+
 _FACTUAL_KEYWORDS = {
     "fee", "fees", "cost", "price", "emi", "eligib", "admission",
     "placement", "ranking", "course", "program", "specializ", "duration",
@@ -137,25 +397,6 @@ _FACTUAL_KEYWORDS = {
     "ugc", "naac", "approve", "accredit", "recogni",
     "this", "current", "here", "page", "about", "university", "college", "school",
     "more", "it",
-}
-
-# Stop words — stripped before isolating the entity name
-_STOP_WORDS = {
-    "tell", "me", "about", "what", "is", "the", "for", "of", "and", "in", "to",
-    "a", "an", "i", "want", "know", "please", "can", "you", "get", "give",
-    "details", "info", "information", "much", "does", "cost", "fee", "fees",
-    "university", "college", "institute", "program", "degree",
-    "at", "from", "with", "by", "on", "under", "above", "below",
-    "show", "list", "find", "search", "explore",
-    # Additional common words that are not university names
-    "more", "this", "here", "there", "are", "available", "courses", "how",
-    "do", "which", "any", "all", "its", "their", "my", "your", "our",
-    "has", "have", "had", "will", "would", "could", "should", "may", "might",
-    "some", "many", "best", "good", "great", "top", "right", "need",
-    "these", "those", "that", "been", "they", "them", "we", "he", "she",
-    "good", "better", "new", "look", "also", "currently", "now", "today",
-    "provide", "support", "help", "assist", "available", "get", "take",
-    "currently", "popular", "well", "known", "check", "see", "view",
 }
 
 
@@ -169,31 +410,26 @@ def _local_extract(message: str) -> dict[str, Any]:
     text = message.lower()
     result: dict[str, Any] = {}
 
-    # Course type hint (exact word boundary)
     for course in COURSE_HINTS:
         if re.search(rf"\b{re.escape(course)}\b", text):
             result["course"] = course
             break
 
-    # Specialization hint (look for known specialization names)
     for spec in SPECIALIZATION_HINTS:
         if re.search(rf"\b{re.escape(spec)}\b", text):
             result["specialization_hint"] = spec
             break
 
-    # Fee constraint
     fee_match = re.search(
         r"(?:under|below|less than|max(?:imum)?)\s*(?:rs\.?|₹)?\s*([\d,]+)", text
     )
     if fee_match:
         result["max_fee"] = float(fee_match.group(1).replace(",", ""))
 
-    # Sort preference
     if "cheapest" in text or "lowest" in text:
         result["sort_by"] = "fee"
         result["order"] = "asc"
 
-    # Mode
     if "online" in text:
         result["mode"] = "online"
     elif "distance" in text:
@@ -202,56 +438,207 @@ def _local_extract(message: str) -> dict[str, Any]:
     return result
 
 
-def _extract_university_name(message: str, local_hints: dict[str, Any]) -> str | None:
-    """
-    Strip all known structural words and return whatever is left as the likely
-    university/brand name.  Returns None if nothing meaningful remains.
-    """
+# ---------------------------------------------------------------------------
+# Catalog-first university detection
+# ---------------------------------------------------------------------------
+
+def _normalize_message_for_scan(message: str) -> str:
     text = message.lower()
-    text = re.sub(r"[^\w\s]", "", text)  # remove punctuation
-    words = text.split()
-
-    ignore = set(_STOP_WORDS)
-    ignore.update(COURSE_HINTS)
-    ignore.update(SPECIALIZATION_HINTS)
-    ignore.update(_FACTUAL_KEYWORDS)
-    # Also drop whatever local_hints already captured as strings
-    for v in local_hints.values():
-        if isinstance(v, str):
-            for tok in v.lower().split():
-                ignore.add(tok)
-
-    remaining = [w for w in words if w not in ignore and len(w) > 1]
-    return " ".join(remaining) if remaining else None
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def _extract_university_queries(message: str, local_hints: dict[str, Any]) -> list[str]:
+def find_universities_in_message(message: str) -> list[dict[str, Any]]:
     """
-    Split the message by comparison or coordinate separators and extract university names
-    from each part individually to support comparison and multi-entity queries.
+    Scan the message for known catalog aliases (longest-first).
+
+    Returns a de-duplicated list of:
+      {entity_id, canonical_slug, matched_alias, method}
+    in left-to-right message order.
     """
-    hints = {k: v for k, v in local_hints.items() if k != "university_query"}
-    parts = re.split(r"\b(?:and|vs|versus|with|or)\b|,", message, flags=re.IGNORECASE)
-    queries = []
-    for part in parts:
-        uni_name = _extract_university_name(part, hints)
-        if uni_name:
-            queries.append(uni_name)
-    return queries
+    if not _UNIVERSITY_ALIASES_SORTED and ENTITY_CACHE["university"]:
+        _rebuild_university_alias_index()
+
+    text = _normalize_message_for_scan(message)
+    if not text:
+        return []
+
+    occupied: list[tuple[int, int]] = []
+    matches: list[tuple[int, dict[str, Any]]] = []
+
+    def _overlaps(start: int, end: int) -> bool:
+        for a, b in occupied:
+            if start < b and end > a:
+                return True
+        return False
+
+    for alias, meta in _UNIVERSITY_ALIASES_SORTED:
+        if " " in alias:
+            pattern = re.escape(alias)
+        else:
+            pattern = rf"\b{re.escape(alias)}\b"
+        for m in re.finditer(pattern, text):
+            start, end = m.start(), m.end()
+            if _overlaps(start, end):
+                continue
+            occupied.append((start, end))
+            matches.append((
+                start,
+                {
+                    "entity_id": meta["entity_id"],
+                    "canonical_slug": meta["canonical_slug"],
+                    "matched_alias": alias,
+                    "method": "catalog",
+                },
+            ))
+            logger.info(
+                "CATALOG MATCH FOUND | alias=%r -> CANONICAL SLUG=%s id=%s",
+                alias, meta["canonical_slug"], meta["entity_id"],
+            )
+
+    matches.sort(key=lambda x: x[0])
+    # Deduplicate by entity_id preserving order
+    seen: set[int] = set()
+    result: list[dict[str, Any]] = []
+    for _, item in matches:
+        eid = item["entity_id"]
+        if eid in seen:
+            continue
+        seen.add(eid)
+        result.append(item)
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Intent-based entity extraction (no fan-out)
-# ---------------------------------------------------------------------------
+def _fuzzy_find_universities_in_message(
+    message: str,
+    already: list[dict[str, Any]],
+    threshold: int = 82,
+) -> list[dict[str, Any]]:
+    """
+    Spelling-correction pass: fuzzy-match message tokens against catalog aliases
+    when catalog-first scan found nothing (or to catch typos of unmatched tokens).
+    """
+    if not UNIVERSITY_ALIAS_INDEX:
+        return []
+
+    already_ids = {m["entity_id"] for m in already}
+    text = _normalize_message_for_scan(message)
+    tokens = [t for t in text.split() if len(t) >= 3 and t not in _ALIAS_BLOCKLIST]
+    # Also try bigrams for multi-word brands
+    candidates = list(tokens)
+    for i in range(len(tokens) - 1):
+        candidates.append(f"{tokens[i]} {tokens[i + 1]}")
+
+    found: list[dict[str, Any]] = []
+    for cand in candidates:
+        best_alias = None
+        best_score = 0.0
+        best_meta = None
+        for alias, meta in UNIVERSITY_ALIAS_INDEX.items():
+            if meta["entity_id"] in already_ids:
+                continue
+            # Prefer similar-length aliases
+            if abs(len(alias) - len(cand)) > max(3, len(cand) // 2):
+                continue
+            score = float(fuzz.ratio(cand, alias))
+            if len(cand) <= 3 and score < 90:
+                continue
+            if score > best_score:
+                best_score = score
+                best_alias = alias
+                best_meta = meta
+        if best_meta and best_score >= threshold:
+            already_ids.add(best_meta["entity_id"])
+            item = {
+                "entity_id": best_meta["entity_id"],
+                "canonical_slug": best_meta["canonical_slug"],
+                "matched_alias": best_alias,
+                "method": "fuzzy",
+                "score": best_score,
+            }
+            found.append(item)
+            logger.info(
+                "CATALOG MATCH FOUND | fuzzy query=%r alias=%r score=%.1f -> CANONICAL SLUG=%s",
+                cand, best_alias, best_score, best_meta["canonical_slug"],
+            )
+    return found
+
+
+# Tokens that look like university brand names (short, not stop words, not course hints)
+# Used to detect user-intended entity count even when catalog misses
+_UNIVERSITY_LIKE_BLOCKLIST = {
+    "tell", "me", "about", "what", "is", "the", "for", "of", "and", "in", "to",
+    "a", "an", "i", "want", "know", "please", "can", "you", "get", "give",
+    "details", "info", "much", "does", "cost", "fee", "fees", "how", "best",
+    "university", "college", "institute", "program", "degree", "online",
+    "compare", "comparison", "vs", "versus", "or", "with", "show", "list",
+    "that", "this", "are", "have", "has", "do", "which", "any", "all",
+    "will", "would", "could", "should", "may", "more", "yes", "no", "okey",
+    "okay", "ok", "hi", "hello", "hey", "thats", "coures", "courses",
+    # Additional common non-entity words
+    "check", "emi", "price", "eligib", "eligibility", "eligible", "admission",
+    "placement", "ranking", "brochure", "duration", "mode", "naac", "ugc",
+    "its", "them", "they", "our", "your", "my", "new", "also", "now", "top",
+    "right", "need", "some", "many", "these", "those", "been", "look", "see",
+    "not", "but", "just", "very", "from", "where", "when", "why", "who",
+    # Back-reference words (not university names)
+    "uni", "talking", "referring", "said", "asking", "mentioned", "above",
+    "that", "same", "one", "other", "another", "both", "either",
+} | _ALIAS_BLOCKLIST
+
+
+def _count_intended_universities(message: str) -> int:
+    """
+    Estimate how many distinct university names the user intended to mention.
+
+    Two independent signals are combined per comparison-connector-delimited
+    segment; either is sufficient:
+
+      1. Capitalization — a token that is capitalized and is NOT the first
+         word of its segment is very likely a proper noun ("NMIMS", "Sharda",
+         "FakeUniversity") in an otherwise lowercase chat message.
+      2. Leftover vocabulary — after stripping stopwords, course names,
+         specialization names, and common factual/query verbs, any token
+         that still remains and is long enough (>=4 chars) to plausibly be a
+         brand name. This catches all-lowercase mentions of universities that
+         may not be in the catalog at all (which is the whole point — we
+         still need to know the user *intended* one, e.g. Rule 2).
+
+    This deliberately trades a little recall for much lower false-positive
+    rates on generic catalog-wide questions like
+    "which college offers data science online" (no capitalized words, and
+    every leftover token is blocklisted noise → count stays 0).
+    """
+    raw_parts = re.split(r"\b(?:and|vs|versus|or|with)\b|,", message, flags=re.IGNORECASE)
+    count = 0
+    for part in raw_parts:
+        words = part.strip().split()
+        if not words:
+            continue
+        has_candidate = False
+        for idx, word in enumerate(words):
+            cleaned = re.sub(r"[^\w\-]", "", word)
+            if not cleaned:
+                continue
+            lower = cleaned.lower()
+            if lower in _UNIVERSITY_LIKE_BLOCKLIST:
+                continue
+            is_cap_signal = idx > 0 and cleaned[0].isupper()
+            is_leftover_signal = len(cleaned) >= 4
+            if is_cap_signal or is_leftover_signal:
+                has_candidate = True
+                break
+        if has_candidate:
+            count += 1
+    return count
+
 
 def extract_intent(message: str) -> dict[str, Any]:
     """
-    Parse the message into typed entity hints WITHOUT assigning one token to
-    all three categories.  Returns only keys for which evidence was found:
-      university_query   – free-text that likely refers to a university brand
-      course_query       – one of the COURSE_HINTS tokens
-      specialization_query – one of the SPECIALIZATION_HINTS tokens
-      mode, max_fee, sort_by, order
+    Parse structural hints (course / specialization / fee / mode).
+
+    University entities come from catalog-first detection in resolve_entities().
+    This function only sets university_query for logging/test compatibility.
     """
     local = _local_extract(message)
     result: dict[str, Any] = {
@@ -259,32 +646,59 @@ def extract_intent(message: str) -> dict[str, Any]:
         if k not in ("course", "specialization_hint")
     }
 
-    # Course evidence — from the COURSE_HINTS regex match
     if "course" in local:
         result["course_query"] = local["course"]
-
-    # Specialization evidence — from SPECIALIZATION_HINTS
     if "specialization_hint" in local:
         result["specialization_query"] = local["specialization_hint"]
 
-    # University evidence — whatever is left after stripping everything else
-    uni_name = _extract_university_name(message, local)
-    if uni_name:
-        result["university_query"] = uni_name
+    # NOTE: catalog scan is intentionally NOT done here to avoid double-calling.
+    # resolve_entities() runs the full catalog scan and populates university_matches.
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Snapping: exact-match-first, then token_set_ratio fuzzy, NO partial_ratio
+# Query classification helpers (comparison vs. multi-mention, catalog-wide)
+# ---------------------------------------------------------------------------
+
+_COMPARISON_PATTERN = re.compile(
+    r"\b(?:compare|comparison|vs\.?|versus|difference\s+between|"
+    r"which\s+is\s+better|better\s+than)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_comparison_query(message: str) -> bool:
+    """True when the user is explicitly asking to compare named universities,
+    as opposed to merely mentioning more than one in passing."""
+    return bool(_COMPARISON_PATTERN.search(message))
+
+
+_CATALOG_WIDE_PATTERN = re.compile(
+    r"\b(?:which|what|list|show\s+me|top|best)\b[^.?!]{0,25}"
+    r"\b(?:universit(?:y|ies)|colleges?|institutes?)\b"
+    r"|\buniversit(?:y|ies)\b[^.?!]{0,25}\b(?:offer|offering|have|provide|provides|give|giving)\b"
+    r"|\ball\s+universit(?:y|ies)\b"
+    r"|\buniversit(?:y|ies)\s+(?:list|options)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_catalog_wide_query(message: str) -> bool:
+    """
+    True for questions about the catalog in general — "which university
+    offers BTech?", "list of universities for MBA" — where no *specific*
+    institution should be assumed from session or page context, even if one
+    was discussed earlier in the conversation or is currently on-screen.
+    """
+    return bool(_CATALOG_WIDE_PATTERN.search(message))
+
+
+# ---------------------------------------------------------------------------
+# Snapping (courses / specializations still use exact + fuzzy)
 # ---------------------------------------------------------------------------
 
 def _exact_match(normalized_name: str, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """
-    Check if normalized_name matches any whitespace-delimited token in any
-    row's search_text exactly.  This catches "nmims", "lpu", "ignou", "mba"
-    without any fuzzy risk.
-    """
     for row in rows:
         tokens = row["search_text"].lower().split()
         if normalized_name in tokens:
@@ -293,11 +707,6 @@ def _exact_match(normalized_name: str, rows: list[dict[str, Any]]) -> dict[str, 
 
 
 def token_aware_similarity(query: str, target: str) -> float:
-    """
-    Computes a token-aware similarity score between query and target.
-    For each query token, finds the maximum ratio score against any target token.
-    For short tokens (<= 2 chars), requires very high similarity to avoid false positives.
-    """
     q_tokens = query.lower().split()
     t_tokens = target.lower().split()
     if not q_tokens or not t_tokens:
@@ -308,7 +717,6 @@ def token_aware_similarity(query: str, target: str) -> float:
         best_tok_score = 0.0
         for t_tok in t_tokens:
             score = fuzz.ratio(q_tok, t_tok)
-            # For short tokens (<= 2 chars), require a very high similarity
             if len(q_tok) <= 2 and score < 95:
                 score = 0.0
             if score > best_tok_score:
@@ -321,9 +729,6 @@ def token_aware_similarity(query: str, target: str) -> float:
 def _fuzzy_snap(
     normalized_name: str, rows: list[dict[str, Any]], threshold: int
 ) -> dict[str, Any] | None:
-    """
-    Fuzzy match against a list of rows using token_aware_similarity.
-    """
     best_score = 0.0
     best_row = None
     for row in rows:
@@ -342,35 +747,52 @@ def _fuzzy_snap(
     return best_row if (best_row and best_score >= threshold) else None
 
 
-
 async def _to_slug(entity_type: str, row: dict[str, Any]) -> str | None:
+    if entity_type == "university":
+        # Prefer in-cache canonical slug — avoids extra DB round-trip
+        if row.get("canonical_slug"):
+            return row["canonical_slug"]
+        if row.get("slug"):
+            return row["slug"]
     pool = await get_pool()
     return await queries.slug_for_entity_id(pool, entity_type, row["entity_id"])
 
 
 async def snap_university(name: str | None) -> tuple[str | None, int | None]:
-    """Returns (slug, entity_id) or (None, None)."""
+    """Resolve a free-text name/alias to (canonical_slug, entity_id)."""
     if not name:
         return None, None
 
     normalized = name.lower().strip()
+
+    # 1. Alias index (canonical system)
+    meta = UNIVERSITY_ALIAS_INDEX.get(normalized)
+    if not meta:
+        meta = UNIVERSITY_ALIAS_INDEX.get(normalized.replace("-", " "))
+    if meta:
+        logger.info(
+            "SNAP university | alias | %r -> CANONICAL SLUG=%s id=%d",
+            normalized, meta["canonical_slug"], meta["entity_id"],
+        )
+        return meta["canonical_slug"], meta["entity_id"]
+
     rows = ENTITY_CACHE["university"]
     if not rows:
         logger.warning("University cache empty — falling back to DB")
         pool = await get_pool()
         rows = await queries.find_entity_search(pool, "university")
 
-    # 1. Exact token match (handles "nmims", "ignou", "lpu" with zero false-positive risk)
     row = _exact_match(normalized, rows)
     if row:
-        logger.info("SNAP university | exact | %r -> id=%d", normalized, row["entity_id"])
-        return await _to_slug("university", row), row["entity_id"]
+        slug = await _to_slug("university", row)
+        logger.info("SNAP university | exact | %r -> CANONICAL SLUG=%s id=%d", normalized, slug, row["entity_id"])
+        return slug, row["entity_id"]
 
-    # 2. Fuzzy fallback — threshold 82 (university names are fairly unique)
     row = _fuzzy_snap(normalized, rows, threshold=82)
     if row:
-        logger.info("SNAP university | fuzzy | %r -> id=%d", normalized, row["entity_id"])
-        return await _to_slug("university", row), row["entity_id"]
+        slug = await _to_slug("university", row)
+        logger.info("SNAP university | fuzzy | %r -> CANONICAL SLUG=%s id=%d", normalized, slug, row["entity_id"])
+        return slug, row["entity_id"]
 
     logger.info("SNAP university | MISS | %r", normalized)
     return None, None
@@ -380,8 +802,6 @@ async def snap_course(
     name: str | None,
     university_entity_id: int | None = None,
 ) -> tuple[str | None, int | None]:
-    """Returns (slug, entity_id) or (None, None).
-    Searches university-scoped courses first; falls back to global."""
     if not name:
         return None, None
 
@@ -408,7 +828,7 @@ async def snap_course(
             logger.info("SNAP course | %s | %r -> id=%d", label, normalized, row["entity_id"])
             return await _to_slug("course", row), row["entity_id"]
         if label == "scoped" and candidate_rows is all_rows:
-            break  # scoped == global, no point repeating
+            break
 
     logger.info("SNAP course | MISS | %r", normalized)
     return None, None
@@ -419,8 +839,6 @@ async def snap_specialization(
     university_entity_id: int | None = None,
     course_entity_id: int | None = None,
 ) -> str | None:
-    """Hierarchically scoped specialization snap.
-    Tries: course-scoped → university-scoped → global (in that order)."""
     if not name:
         return None
 
@@ -454,7 +872,6 @@ async def snap_specialization(
                 label, normalized, course_entity_id, university_entity_id, row["entity_id"],
             )
             return await _to_slug("specialization", row)
-        # Only fall through to wider scope if this scope didn't match
         if scope_rows is all_rows:
             break
 
@@ -466,66 +883,88 @@ async def snap_specialization(
 # Public entry point: hierarchical entity resolution
 # ---------------------------------------------------------------------------
 
+_EMPTY_RESOLUTION = {
+    "raw": {},
+    "university_slug": None,
+    "course_slug": None,
+    "specialization_slug": None,
+    "mode": None,
+    "max_fee": None,
+    "sort_by": None,
+    "order": "asc",
+    "comparison_targets": [],
+    "resolution_status": "none",
+    "requested_entity": None,
+    "comparison_found": [],
+    "comparison_missing": [],
+    "intent_type": None,
+    "mention_type": None,
+}
+
+
 async def resolve_entities(
     message: str,
     context: dict[str, Any],
     page_university_slug: str | None = None,
 ) -> dict[str, Any]:
     """
-    Resolve named entities from the user's message using a strict hierarchy:
-      0. Short-circuit immediately for greetings (no entity needed)
-      1. Extract typed intent signals (no fan-out)
-      2. Snap university → get entity_id for downstream scoping
-      3. Snap course ONLY if course evidence exists, scoped to university
-      4. Snap specialization ONLY if spec evidence exists, scoped to course+uni
-      5. Session context fallback ONLY when user did NOT name a university explicitly
-      6. Page context ONLY when user did NOT name a university explicitly
-
-    POLICY: If the user explicitly names a university (university_query is present)
-    and it misses the catalog, the result is entity_not_found — page context and
-    session context are NOT used as silent substitutes. The agent is expected to
-    tell the user the university isn't in the catalog.
+    Resolve named entities from the user's message:
+      0. Contact intent → skip entity extraction entirely
+      1. Greeting short-circuit
+      2. Catalog-first university detection (+ fuzzy spelling)
+      3. Course / specialization snap when structural evidence exists
+      4. Session / page context only when no university was named in catalog
+         AND the message isn't a catalog-wide question
     """
-    # ── Step 0: Greeting short-circuit ─────────────────────────────────
+    # ── Step 0a: Contact intent short-circuit ──────────────────────────────
+    if is_contact_intent(message):
+        logger.info("CONTACT INTENT DETECTED | msg=%r", message[:80])
+        return {
+            **_EMPTY_RESOLUTION,
+            "resolution_status": "contact",
+            "intent_type": "contact",
+            "raw": {"intent_type": "contact"},
+        }
+
+    # ── Step 0b: Greeting short-circuit ────────────────────────────────────
     if is_greeting(message):
         logger.info("RESOLVE | greeting detected, skipping entity resolution: %r", message[:60])
-        return {
-            "raw": {},
-            "university_slug": None,
-            "course_slug": None,
-            "specialization_slug": None,
-            "mode": None,
-            "max_fee": None,
-            "sort_by": None,
-            "order": "asc",
-            "comparison_targets": [],
-            "resolution_status": "none",
-            "requested_entity": None,
-        }
+        return {**_EMPTY_RESOLUTION, "resolution_status": "none"}
 
     intent = extract_intent(message)
     logger.info("INTENT | msg=%r -> %r", message[:80], intent)
 
-    university_queries = _extract_university_queries(message, intent)
-    explicit_university_requested = bool(university_queries)
+    # ── Step 1: Catalog-first universities ─────────────────────────────────
+    catalog_hits = find_universities_in_message(message)
+    if not catalog_hits:
+        catalog_hits = _fuzzy_find_universities_in_message(message, [])
 
-    # ── Step 1: University ──────────────────────────────────────────────────
-    resolved_slugs = []
-    resolved_ids = []
-    missing_queries = []
-    for q in university_queries:
-        slug, entity_id = await snap_university(q)
-        if slug:
+    resolved_slugs: list[str] = []
+    resolved_ids: list[int] = []
+    matched_aliases: list[str] = []
+    for hit in catalog_hits:
+        slug = hit["canonical_slug"]
+        if slug not in resolved_slugs:
             resolved_slugs.append(slug)
-            resolved_ids.append(entity_id)
-        else:
-            missing_queries.append(q)
+            resolved_ids.append(hit["entity_id"])
+            matched_aliases.append(hit.get("matched_alias") or slug)
+            logger.info(
+                "CANONICAL SLUG | matched=%r -> %s (method=%s)",
+                hit.get("matched_alias"), slug, hit.get("method"),
+            )
 
-    # Use the first resolved university for scoping course and specialization resolution
+    # How many university-like names did the user intend to mention?
+    # This is used to detect partial matches and entity_not_found when
+    # catalog scan found fewer hits than the user intended.
+    intended_count = _count_intended_universities(message)
+
+    # explicit_university_requested: user mentioned at least one university-like
+    # name, regardless of whether it was in the catalog.
+    explicit_university_requested = bool(resolved_slugs) or intended_count > 0
     university_slug = resolved_slugs[0] if resolved_slugs else None
     university_entity_id = resolved_ids[0] if resolved_ids else None
 
-    # ── Step 2: Course (scoped to university) ───────────────────────────────
+    # ── Step 2: Course (scoped to university) ──────────────────────────────
     course_slug: str | None = None
     course_entity_id: int | None = None
     if "course_query" in intent:
@@ -534,7 +973,7 @@ async def resolve_entities(
             university_entity_id=university_entity_id,
         )
 
-    # ── Step 3: Specialization (scoped to course + university) ───────────────
+    # ── Step 3: Specialization ─────────────────────────────────────────────
     specialization_slug: str | None = None
     if "specialization_query" in intent:
         specialization_slug = await snap_specialization(
@@ -543,59 +982,102 @@ async def resolve_entities(
             course_entity_id=course_entity_id,
         )
 
-    # ── Step 4: Session + Page context fallbacks ─────────────────────────────
-    # CRITICAL POLICY: Only apply fallbacks when the user did NOT explicitly name
-    # a university. An explicit miss means the named entity is not in the catalog —
-    # silently substituting page/session context would answer about the wrong entity.
+    # ── Step 4: Status determination + session/page fallbacks ─────────────
     resolution_status: str
     requested_entity: str | None = None
     comparison_targets: list[str] = []
     comparison_found: list[str] = []
     comparison_missing: list[str] = []
+    mention_type: str | None = None
 
     if explicit_university_requested:
-        requested_entity = ", ".join(university_queries)
-        if len(university_queries) > 1:
-            # Comparison or multi-entity query
-            if missing_queries:
-                resolution_status = "partial_match"
-                comparison_found = resolved_slugs
-                comparison_missing = missing_queries
-                logger.info(
-                    "PARTIAL MATCH DETECTED | found=%r | missing=%r | RESOLVED | uni=%s",
-                    resolved_slugs,
-                    missing_queries,
-                    university_slug,
+        found_count = len(resolved_slugs)
+
+        if found_count == 0:
+            # User explicitly named university/universities but NONE are in catalog.
+            resolution_status = "entity_not_found"
+            university_slug = None
+            # Try to extract a readable name from the message for the error message
+            text_normalized = _normalize_message_for_scan(message)
+            tokens = [
+                t for t in text_normalized.split()
+                if len(t) >= 3 and t not in _UNIVERSITY_LIKE_BLOCKLIST
+            ]
+            requested_entity = " ".join(tokens[:3]) if tokens else message[:40]
+            logger.info(
+                "EXPLICIT ENTITY NOT FOUND | requested=%r | RESOLVED | uni=None",
+                requested_entity,
+            )
+
+        elif intended_count > 1 and found_count < intended_count:
+            # Multi-university query but only some resolved → partial match
+            resolution_status = "partial_match"
+            comparison_found = resolved_slugs
+            mention_type = "comparison" if _is_comparison_query(message) else "multiple"
+            # Build missing list: segments that had tokens but yielded no catalog hit
+            text_normalized = _normalize_message_for_scan(message)
+            parts = re.split(r"\b(?:and|vs|versus|or|with)\b|,", text_normalized, flags=re.IGNORECASE)
+            for part in parts:
+                tokens = [
+                    t for t in part.split()
+                    if len(t) >= 3 and t not in _UNIVERSITY_LIKE_BLOCKLIST
+                ]
+                if not tokens:
+                    continue
+                candidate = " ".join(tokens[:2])
+                # Is this segment already covered by a resolved slug's matched alias?
+                covered = any(
+                    candidate in (a.lower() for a in matched_aliases)
+                    or any(t in a.lower() for t in tokens for a in matched_aliases)
+                    for _ in [None]  # single iteration
                 )
-            else:
-                resolution_status = "resolved"
-                comparison_targets = resolved_slugs
+                if not covered:
+                    comparison_missing.append(candidate)
+            requested_entity = ", ".join(matched_aliases)
+            logger.info(
+                "PARTIAL MATCH DETECTED | found=%r | missing=%r | RESOLVED | uni=%s",
+                resolved_slugs, comparison_missing, university_slug,
+            )
+
+        elif found_count > 1:
+            # Multi-university query, all resolved
+            resolution_status = "resolved"
+            comparison_targets = resolved_slugs
+            comparison_found = resolved_slugs
+            requested_entity = ", ".join(matched_aliases)
+            mention_type = "comparison" if _is_comparison_query(message) else "multiple"
+
         else:
-            # Single named entity requested
-            if missing_queries:
-                resolution_status = "entity_not_found"
-                university_slug = None
-                requested_entity = university_queries[0]
-                logger.info(
-                    "EXPLICIT ENTITY NOT FOUND | requested=%r | RESOLVED | uni=None",
-                    requested_entity,
-                )
-            else:
-                resolution_status = "resolved"
-                requested_entity = resolved_slugs[0]
+            # Single university found
+            resolution_status = "resolved"
+            requested_entity = resolved_slugs[0]
+            mention_type = "single"
+
     else:
-        # User did NOT name a university — implicit query ("What courses?", "Tell me more")
-        # Try session context first, then page context.
+        # User did NOT mention any university-like name.
+        catalog_wide = _is_catalog_wide_query(message)
+        page_canonical = resolve_university_alias(page_university_slug) or page_university_slug
         session_uni = context.get("current_university_slug")
-        if session_uni:
-            university_slug = session_uni
+
+        if catalog_wide:
+            # Explicit catalog-wide question ("which university offers BTech?",
+            # "list of universities for MBA") must never be silently narrowed
+            # to whatever university was discussed earlier in the session or
+            # is currently shown on the page.
+            resolution_status = "catalog_query"
+            logger.info(
+                "CATALOG-WIDE QUERY DETECTED | msg=%r | SESSION/PAGE CONTEXT SKIPPED",
+                message[:80],
+            )
+        elif session_uni:
+            university_slug = resolve_university_alias(session_uni) or session_uni
             resolution_status = "session_context"
             logger.info(
                 "NO EXPLICIT ENTITY DETECTED | SESSION CONTEXT APPLIED | uni=%s",
                 university_slug,
             )
-        elif page_university_slug and _message_needs_entity(message):
-            university_slug = page_university_slug
+        elif page_canonical and _message_needs_entity(message):
+            university_slug = page_canonical
             resolution_status = "page_context"
             logger.info(
                 "NO EXPLICIT ENTITY DETECTED | PAGE CONTEXT APPLIED | uni=%s",
@@ -604,15 +1086,14 @@ async def resolve_entities(
         else:
             resolution_status = "none"
 
-        # Implicit course/spec fallbacks only apply when no explicit university either
         if not course_slug:
             course_slug = context.get("current_course_slug")
         if not specialization_slug:
             specialization_slug = context.get("current_specialization_slug")
 
     logger.info(
-        "RESOLVED | uni=%s course=%s spec=%s status=%s",
-        university_slug, course_slug, specialization_slug, resolution_status,
+        "RESOLVED | uni=%s course=%s spec=%s status=%s mention_type=%s",
+        university_slug, course_slug, specialization_slug, resolution_status, mention_type,
     )
 
     return {
@@ -624,9 +1105,11 @@ async def resolve_entities(
         "max_fee": intent.get("max_fee"),
         "sort_by": intent.get("sort_by"),
         "order": intent.get("order", "asc"),
-        "comparison_targets": comparison_targets or resolved_slugs,
+        "comparison_targets": comparison_targets or list(resolved_slugs),
         "resolution_status": resolution_status,
         "requested_entity": requested_entity,
         "comparison_found": comparison_found,
         "comparison_missing": comparison_missing,
+        "intent_type": None,
+        "mention_type": mention_type,
     }

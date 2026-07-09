@@ -327,6 +327,7 @@ async def get_fee_tool(university_slug: str, course_slug: str | None = None, spe
     v = await validate_university_slug(university_slug)
     if not v["is_valid"]:
         return _fail(v["error"], university_slug=university_slug)
+    university_slug = v.get("canonical_slug") or university_slug
 
     if course_slug:
         vc = await validate_course_slug(course_slug)
@@ -350,6 +351,7 @@ async def get_eligibility_tool(university_slug: str, course_slug: str) -> dict:
     v = await validate_university_slug(university_slug)
     if not v["is_valid"]:
         return _fail(v["error"], university_slug=university_slug)
+    university_slug = v.get("canonical_slug") or university_slug
 
     vc = await validate_course_slug(course_slug)
     if not vc["is_valid"]:
@@ -370,6 +372,7 @@ async def get_university_overview_tool(university_slug: str) -> dict:
     v = await validate_university_slug(university_slug)
     if not v["is_valid"]:
         return _fail(v["error"], university_slug=university_slug)
+    university_slug = v.get("canonical_slug") or university_slug
     return await get_university_overview(university_slug)
 
 
@@ -383,6 +386,7 @@ async def get_university_programs_tool(university_slug: str, limit: int = DEFAUL
     v = await validate_university_slug(university_slug)
     if not v["is_valid"]:
         return _fail(v["error"], university_slug=university_slug)
+    university_slug = v.get("canonical_slug") or university_slug
     return await get_university_programs(university_slug, limit=limit)
 
 
@@ -401,6 +405,7 @@ async def get_program_details_tool(course_slug: str, university_slug: str | None
         vu = await validate_university_slug(university_slug)
         if not vu["is_valid"]:
             return _fail(vu["error"], university_slug=university_slug)
+        university_slug = vu.get("canonical_slug") or university_slug
 
     return await get_program_details(course_slug, university_slug)
 
@@ -419,6 +424,7 @@ async def get_specializations_tool(course_slug: str, university_slug: str | None
         vu = await validate_university_slug(university_slug)
         if not vu["is_valid"]:
             return _fail(vu["error"], university_slug=university_slug)
+        university_slug = vu.get("canonical_slug") or university_slug
 
     return await get_specializations(course_slug, university_slug, limit=limit)
 
@@ -487,7 +493,7 @@ async def compare_entities_tool(entity_type: str, slugs: list[str], fields: list
     for slug in slugs:
         v = await validator(slug)
         if v["is_valid"]:
-            valid_slugs.append(slug)
+            valid_slugs.append(v.get("canonical_slug") or slug)
 
     if len(valid_slugs) < 2:
         return _fail(

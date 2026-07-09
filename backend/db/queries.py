@@ -105,7 +105,43 @@ async def get_session_history(
 
 
 
-async def update_session_context(pool, session_id: str, university_slug: str | None, course_slug: str | None, specialization_slug: str | None) -> None:
+async def update_session_context(
+    pool,
+    session_id: str,
+    university_slug: str | None,
+    course_slug: str | None,
+    specialization_slug: str | None,
+    *,
+    replace_dependents: bool = False,
+) -> None:
+    """
+    Persist conversational entity context for the session.
+
+    Default (replace_dependents=False): COALESCE — only overwrite non-null fields
+    (legacy behaviour for partial updates).
+
+    When replace_dependents=True (university newly resolved): write the university
+    slug and set course/spec to the provided values (None clears previous course/spec
+    so a switch NMIMS → Sharda does not leave a stale NMIMS course).
+    """
+    if replace_dependents and university_slug:
+        await pool.execute(
+            """
+            INSERT INTO session_context(session_id, current_university_slug, current_course_slug, current_specialization_slug)
+            VALUES($1::uuid, $2, $3, $4)
+            ON CONFLICT (session_id) DO UPDATE SET
+                current_university_slug = $2,
+                current_course_slug = $3,
+                current_specialization_slug = $4,
+                last_updated = now()
+            """,
+            session_id,
+            university_slug,
+            course_slug,
+            specialization_slug,
+        )
+        return
+
     await pool.execute(
         """
         INSERT INTO session_context(session_id, current_university_slug, current_course_slug, current_specialization_slug)
