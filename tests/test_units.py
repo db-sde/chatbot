@@ -451,7 +451,6 @@ async def test_catalog_superlative_does_not_inherit_session_university(monkeypat
         "Online universities",
         "Best online MBA",
         "Top MBA programs",
-        "Which MBA is best",
     ],
 )
 async def test_catalog_discovery_never_snaps_or_inherits_one_course(monkeypatch, message):
@@ -543,6 +542,41 @@ async def test_subjective_recommendation_collects_only_real_catalog_filters(monk
     )
     assert third["qualification"]["status"] == "ready"
     assert third["qualification"]["specialization"] == "finance"
+
+
+@pytest.mark.asyncio
+async def test_which_mba_is_best_enters_guided_recommendation(monkeypatch):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    result = await resolve.resolve_entities("Which MBA is best", {})
+
+    assert result["resolution_status"] == "subjective_recommendation"
+    assert result["qualification"]["awaiting"] == "budget"
+
+
+@pytest.mark.asyncio
+async def test_generic_university_recommendation_collects_program_first(monkeypatch):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    result = await resolve.resolve_entities("Which university should I choose?", {})
+
+    assert result["resolution_status"] == "subjective_recommendation"
+    assert result["qualification"]["awaiting"] == "course_type"
+
+
+@pytest.mark.asyncio
+async def test_recommend_online_mba_enters_guided_recommendation(monkeypatch):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    result = await resolve.resolve_entities("Can you recommend an online MBA?", {})
+
+    assert result["resolution_status"] == "subjective_recommendation"
+    assert result["qualification"]["course_type"] == "mba"
+    assert result["qualification"]["mode"] == "online"
+    assert result["qualification"]["awaiting"] == "budget"
 
 
 @pytest.mark.asyncio

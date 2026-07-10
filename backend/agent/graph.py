@@ -34,9 +34,11 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from security.output_scan import scan_output
 from agent.constants import quick_replies_for
+from agent.deterministic import run_deterministic_route
 from agent.llm_client import SYSTEM_PROMPT, llm_client
 from agent.resolve import is_greeting, resolve_entities as _resolve_entities
 from agent.tools import TOOLS, list_courses as list_courses_catalog, log_anonymous_signal, log_unanswered
+from agent.v2_routes import context_class_for
 from db import queries
 from db.pool import get_pool
 from observability import (
@@ -104,6 +106,8 @@ class ChatState(TypedDict, total=False):
     profile_context_update: dict[str, Any]
     progressive_lead_field: str
     deterministic_route: str
+    deterministic_metric: dict[str, Any]
+    ui_cards: list[dict[str, Any]]
 
 
 def _make_state(
@@ -450,24 +454,78 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
                 "reply": reply,
                 "tool_ms_total": state.get("tool_ms_total", 0.0) + lookup_ms,
                 "deterministic_route": "program_overview",
+                "ui_cards": [{
+                    "type": "actions",
+                    "eyebrow": "Continue your journey",
+                    "title": "What would you like to check next?",
+                    "actions": [
+                        {"label": "Eligibility", "message": "Eligibility"},
+                        {"label": "Specializations", "message": "Specializations"},
+                        {"label": "Talk to a counsellor", "message": "Talk to a counsellor"},
+                    ],
+                }],
             }
 
     if resolution_status == "subjective_recommendation":
         qualification = dict(resolved.get("qualification") or {})
         profile_context = dict(resolved.get("profile_context_update") or {})
         awaiting = qualification.get("awaiting")
-        if awaiting == "budget":
+        if awaiting == "course_type":
+            reply = "Which program are you considering?"
+            ui_cards = [{
+                "type": "choices",
+                "eyebrow": "Continue your journey",
+                "title": "Choose the program you want to explore",
+                "actions": [
+                    {"label": "MBA", "message": "MBA"},
+                    {"label": "BBA", "message": "BBA"},
+                    {"label": "MCA", "message": "MCA"},
+                    {"label": "BCA", "message": "BCA"},
+                ],
+            }]
+        elif awaiting == "budget":
             reply = (
                 "To narrow this down using the catalog, what is your maximum total "
                 "program budget (for example, ₹2 lakh)?"
             )
+            ui_cards = [{
+                "type": "range",
+                "eyebrow": "Continue your journey",
+                "title": "What is your maximum program budget?",
+                "min": 50_000,
+                "max": 500_000,
+                "step": 25_000,
+                "value": 200_000,
+                "unit": "₹",
+                "submit_label": "Confirm budget",
+            }]
         elif awaiting == "mode":
             reply = "Which study mode do you prefer: online or distance?"
+            ui_cards = [{
+                "type": "choices",
+                "eyebrow": "Continue your journey",
+                "title": "Choose your preferred learning mode",
+                "actions": [
+                    {"label": "Online", "message": "online"},
+                    {"label": "Distance", "message": "distance"},
+                ],
+            }]
         elif awaiting == "specialization":
             reply = (
                 "Which specialization interests you most (for example, finance, marketing, "
                 "or analytics)? You can also say ‘no preference’."
             )
+            ui_cards = [{
+                "type": "choices",
+                "eyebrow": "Continue your journey",
+                "title": "Choose a specialization preference",
+                "actions": [
+                    {"label": "Finance", "message": "finance"},
+                    {"label": "Marketing", "message": "marketing"},
+                    {"label": "Analytics", "message": "analytics"},
+                    {"label": "No preference", "message": "no preference"},
+                ],
+            }]
         else:
             matches = await list_courses_catalog(
                 course_type=qualification.get("course_type"),
@@ -490,6 +548,7 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
                     "lead_ask": True,
                     "lead_ask_triggered_by": "No Answer Available",
                     "profile_context_update": profile_context,
+                    "deterministic_route": "recommendation",
                 }
 
             bullets = []
@@ -501,15 +560,17 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
                     f"{row.get('university_name') or row.get('university_slug')} · {fee_text} · "
                     f"{row.get('mode') or qualification.get('mode')}"
                 )
-            offer_email = not state.get("context", {}).get("has_lead") and not (
-                (profile_context.get("lead") or {}).get("email")
+            lead_profile = profile_context.get("lead") or {}
+            next_lead_field = None if state.get("context", {}).get("has_lead") else next(
+                (field for field in ("name", "phone", "email") if not lead_profile.get(field)),
+                None,
             )
             reply = (
                 "I've found verified programs matching the filters you shared:\n"
                 + "\n".join(bullets)
                 + (
-                    "\n\nWould you like to optionally share your email so you can keep these options?"
-                    if offer_email else ""
+                    "\n\nWould you like to optionally save these recommendations for follow-up?"
+                    if next_lead_field else ""
                 )
             )
             qualification["status"] = "complete"
@@ -518,15 +579,28 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
                 "messages": [AIMessage(content=reply)],
                 "reply": reply,
                 "profile_context_update": profile_context,
+                "deterministic_route": "recommendation",
+                "ui_cards": [{
+                    "type": "actions",
+                    "eyebrow": "Your matched options",
+                    "title": "What would you like to do next?",
+                    "actions": [
+                        {"label": "Compare options", "message": "Compare these programs"},
+                        {"label": "Check eligibility", "message": "Eligibility"},
+                        {"label": "Talk to a counsellor", "message": "Talk to a counsellor"},
+                    ],
+                }],
             }
-            if offer_email:
-                result["progressive_lead_field"] = "email"
+            if next_lead_field:
+                result["progressive_lead_field"] = next_lead_field
             return result
 
         return {
             "messages": [AIMessage(content=reply)],
             "reply": reply,
             "profile_context_update": profile_context,
+            "deterministic_route": "recommendation",
+            "ui_cards": ui_cards,
         }
 
     # Unknown/partial catalog entities are a deterministic gap, not a prompt
@@ -571,6 +645,10 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
             "lead_ask": True,
             "lead_ask_triggered_by": "No Answer Available",
         }
+
+    deterministic_result = await run_deterministic_route(state, get_pool)
+    if deterministic_result is not None:
+        return deterministic_result
 
     if not llm_client.enabled:
         return {"messages": [AIMessage(content="I can help with DegreeBaba course fees, eligibility, and admissions.")]}
@@ -1182,7 +1260,8 @@ async def _run_chat_turn_unlocked(
         yield {
             "event": "final",
             "data": {
-                "lead_ask": contact,
+                "lead_ask": False,
+                "progressive_lead_field": "name" if contact else None,
                 "route": "contact" if contact else "greeting",
                 "quick_replies": quick_replies_for(message),
                 "metrics": {
@@ -1215,14 +1294,24 @@ async def _run_chat_turn_unlocked(
         value = await coro
         return value, (time.perf_counter() - started) * 1000
 
+    context_class = context_class_for(message)
+    history_limit = 0 if context_class == "A" else (
+        min(6, settings.max_conversation_messages)
+        if context_class in {"B", "C"}
+        else settings.max_conversation_messages
+    )
+
+    async def _history_snapshot():
+        if history_limit == 0:
+            return {"messages": []}
+        return await queries.get_session_history(pool, session_id, limit=history_limit)
+
     pre_graph_started = time.perf_counter()
     (__, ensure_session_ms), (history_result, history_ms), (context, session_context_ms) = await asyncio.gather(
         _timed(queries.ensure_session(
             pool, session_id, site_id, page_university_slug, ip_address, user_agent
         )),
-        _timed(queries.get_session_history(
-            pool, session_id, limit=settings.max_conversation_messages
-        )),
+        _timed(_history_snapshot()),
         _timed(queries.get_session_context(pool, session_id)),
     )
     history_messages: list[BaseMessage] = []
@@ -1406,19 +1495,27 @@ async def _run_chat_turn_unlocked(
     agent_ttft_ms = int((t_first - metadata["t_start"]) * 1000)
     ttft_ms = int((t_first - (request_started_at or metadata["t_start"])) * 1000)
     
-    deterministic_lookup_ms = float(
-        (((final_state or {}).get("resolved") or {}).get("_program_lookup_ms")) or 0.0
-    )
-    if deterministic_lookup_ms and not any(
-        metric.get("name") == "deterministic_program_lookup"
+    deterministic_metric = (final_state or {}).get("deterministic_metric") or {}
+    if not deterministic_metric:
+        program_lookup_ms = float(
+            (((final_state or {}).get("resolved") or {}).get("_program_lookup_ms")) or 0.0
+        )
+        if program_lookup_ms:
+            deterministic_metric = {
+                "name": "deterministic_program_lookup",
+                "duration_ms": program_lookup_ms,
+                "status": "SUCCESS"
+                if (((final_state or {}).get("resolved") or {}).get("_program_details"))
+                else "FAILURE",
+            }
+    if deterministic_metric and not any(
+        metric.get("name") == deterministic_metric.get("name")
         for metric in (tool_metrics_var.get() or [])
     ):
         record_tool_metric(
-            "deterministic_program_lookup",
-            deterministic_lookup_ms,
-            "SUCCESS"
-            if (((final_state or {}).get("resolved") or {}).get("_program_details"))
-            else "FAILURE",
+            deterministic_metric["name"],
+            float(deterministic_metric.get("duration_ms") or 0.0),
+            deterministic_metric.get("status") or "SUCCESS",
         )
     tools_executed = tool_metrics_var.get() or []
     tool_exec_time = sum(m.get("duration_ms", 0) for m in tools_executed)
@@ -1524,6 +1621,8 @@ async def _run_chat_turn_unlocked(
             "lead_ask": lead_ask,
             "progressive_lead_field": progressive_lead_field,
             "route": (final_state or {}).get("deterministic_route") or "agent",
+            "context_class": context_class,
+            "ui_cards": (final_state or {}).get("ui_cards") or [],
             "quick_replies": quick_replies_for(message),
             "metrics": {
                 "response_time_ms": response_time_ms,

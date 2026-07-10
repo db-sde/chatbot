@@ -7,7 +7,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager, suppress
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Body
@@ -476,7 +476,7 @@ async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[
 async def progressive_lead_webhook(
     request: Request,
     body: ProgressiveLeadRequest = Body(...),
-) -> dict[str, bool]:
+) -> dict[str, Any]:
     """Persist one optional lead field without gating continued chat access."""
     validate_site_request(
         body.site_key,
@@ -499,13 +499,18 @@ async def progressive_lead_webhook(
         await queries.ensure_session(pool, body.session_id, body.site_key, None)
     except queries.SessionSiteMismatchError as exc:
         raise HTTPException(status_code=403, detail="Session does not belong to this site") from exc
-    await queries.save_progressive_lead_field(
+    profile = await queries.save_progressive_lead_field(
         pool,
         body.session_id,
         body.field,
         value,
     )
-    return {"ok": True}
+    lead_profile = profile.get("lead") or {}
+    next_field = next(
+        (field for field in ("name", "phone", "email") if not lead_profile.get(field)),
+        None,
+    )
+    return {"ok": True, "next_field": next_field}
 
 
 @app.get("/api/session/history")

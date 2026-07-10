@@ -829,7 +829,11 @@ _CATALOG_DISCOVERY_PATTERN = re.compile(
 _SUBJECTIVE_RECOMMENDATION_PATTERN = re.compile(
     r"\b(?:best|right|ideal|suitable)\b[^.?!]{0,55}\b(?:for\s+me|suits?\s+me)\b"
     r"|\b(?:which|what)\b[^.?!]{0,45}\b(?:should\s+i\s+choose|suits?\s+me)\b"
-    r"|\bhelp\s+me\s+(?:choose|pick|find)\b",
+    r"|\bhelp\s+me\s+(?:choose|pick|find)\b"
+    r"|\b(?:recommend|suggest)\b[^.?!]{0,45}\b"
+    r"(?:mba|bba|bca|mca|pgdm|courses?|programs?|universit(?:y|ies))\b"
+    r"|\bwhich\b[^.?!]{0,40}\b(?:mba|course|program|university)\b"
+    r"[^.?!]{0,25}\b(?:is\s+(?:the\s+)?best|should\s+i\s+choose)\b",
     re.IGNORECASE,
 )
 
@@ -892,7 +896,11 @@ def _qualification_resolution(
         }
     else:
         awaiting = qualification.get("awaiting")
-        if awaiting == "budget":
+        if awaiting == "course_type":
+            course_type = intent.get("course_query")
+            if course_type:
+                qualification["course_type"] = course_type
+        elif awaiting == "budget":
             budget = _qualification_budget(message, intent)
             if budget is not None:
                 qualification["max_fee"] = budget
@@ -917,7 +925,9 @@ def _qualification_resolution(
                 qualification["specialization"] = specialization
                 qualification["specialization_answered"] = True
 
-    if qualification.get("max_fee") is None:
+    if not qualification.get("course_type"):
+        qualification["awaiting"] = "course_type"
+    elif qualification.get("max_fee") is None:
         qualification["awaiting"] = "budget"
     elif not qualification.get("mode"):
         qualification["awaiting"] = "mode"
@@ -945,6 +955,8 @@ def _is_qualification_answer(
     intent: dict[str, Any],
     awaiting: str | None,
 ) -> bool:
+    if awaiting == "course_type":
+        return bool(intent.get("course_query"))
     if awaiting == "budget":
         return _qualification_budget(message, intent) is not None
     if awaiting == "mode":

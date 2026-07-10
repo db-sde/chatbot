@@ -158,7 +158,7 @@ def patch_llm(monkeypatch):
 # ── Graph-level tests ──────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_graph_direct_reply_no_tool_calls(patch_llm):
+async def test_graph_deterministic_fee_reply_bypasses_llm_tools(patch_llm):
     """
     When the LLM returns no tool_calls the graph should:
     - Skip execute_tools
@@ -170,7 +170,7 @@ async def test_graph_direct_reply_no_tool_calls(patch_llm):
     async for event in graph_mod.run_chat_turn(
         session_id="11111111-1111-4111-8111-111111111111",
         site_id="test",
-        message="What is the NMIMS MBA fee?",
+        message="Check fees",
         page_university_slug="nmims",
     ):
         events.append(event)
@@ -182,6 +182,43 @@ async def test_graph_direct_reply_no_tool_calls(patch_llm):
     final_data = events[-1]["data"]
     assert "lead_ask" in final_data
     assert "quick_replies" in final_data
+    assert final_data["route"] == "fee"
+    assert final_data["ui_cards"][0]["type"] == "actions"
+
+
+@pytest.mark.asyncio
+async def test_generic_recommendation_renders_program_choice_without_llm(monkeypatch):
+    import agent.graph as graph_mod
+
+    model = MagicMock()
+    model.ainvoke = AsyncMock(side_effect=AssertionError("LLM must not run"))
+    monkeypatch.setattr(
+        graph_mod,
+        "llm_client",
+        SimpleNamespace(enabled=True, chat_model=model),
+    )
+
+    qualification = {
+        "status": "collecting",
+        "course_type": None,
+        "awaiting": "course_type",
+    }
+    result = await graph_mod.node_agent({
+        "messages": [],
+        "raw_message": "Which university should I choose?",
+        "resolved": {
+            "resolution_status": "subjective_recommendation",
+            "qualification": qualification,
+            "profile_context_update": {"qualification": qualification},
+        },
+    })
+
+    assert result["deterministic_route"] == "recommendation"
+    assert result["ui_cards"][0]["type"] == "choices"
+    assert [action["label"] for action in result["ui_cards"][0]["actions"]] == [
+        "MBA", "BBA", "MCA", "BCA",
+    ]
+    model.ainvoke.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -423,6 +460,35 @@ async def test_pre_graph_session_reads_start_concurrently(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_class_a_route_skips_history_query(monkeypatch):
+    from langchain_core.messages import AIMessage
+    import agent.graph as graph_mod
+
+    async def unexpected_history(*_args, **_kwargs):
+        raise AssertionError("Class A deterministic routes must not load chat history")
+
+    class FinalGraph:
+        async def astream_events(self, _state, version):
+            yield {
+                "event": "on_chain_end",
+                "name": "LangGraph",
+                "data": {"output": {"messages": [AIMessage(content="Fee response")] }},
+            }
+
+    monkeypatch.setattr(graph_mod.queries, "get_session_history", unexpected_history)
+    monkeypatch.setattr(graph_mod, "_graph", FinalGraph())
+
+    events = [event async for event in graph_mod.run_chat_turn(
+        session_id="35353535-3535-4535-8535-353535353535",
+        site_id="test",
+        message="Check fees",
+        page_university_slug=None,
+    )]
+
+    assert events[-1]["data"]["context_class"] == "A"
+
+
+@pytest.mark.asyncio
 async def test_graph_emits_replace_when_final_output_scan_rejects_stream(monkeypatch):
     from langchain_core.messages import AIMessage, AIMessageChunk
     import agent.graph as graph_mod
@@ -553,7 +619,7 @@ async def test_ready_qualification_uses_filtered_catalog_results(monkeypatch):
     })
 
     assert "NMIMS" in result["reply"]
-    assert result["progressive_lead_field"] == "email"
+    assert result["progressive_lead_field"] == "name"
     assert result["profile_context_update"]["qualification"]["status"] == "complete"
     lookup.assert_awaited_once_with(
         course_type="mba",
@@ -711,6 +777,7 @@ async def test_graph_loop_iteration_cap(monkeypatch):
     """
     from langchain_core.messages import AIMessage
     import agent.graph as graph_mod
+    monkeypatch.setattr(graph_mod, "run_deterministic_route", AsyncMock(return_value=None))
 
     # Mock DB trigram lookup to return NMIMS
     async def mock_trgm(pool, message, limit=3):

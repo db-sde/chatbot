@@ -207,6 +207,31 @@
       .lead-card .lead-submit:disabled { opacity: 0.65; cursor: wait; }
       .lead-card .skip-btn { background: transparent; border: 0; color: var(--text-muted); font-size: 12px; cursor: pointer; text-decoration: underline; padding: 4px; }
 
+      .journey-card {
+        align-self: stretch; background: #f4f8f7; background: color-mix(in srgb, var(--primary-color) 7%, white);
+        border: 1px solid #dce8e6;
+        border: 1px solid color-mix(in srgb, var(--primary-color) 16%, white);
+        border-radius: 16px; padding: 16px; display: flex; flex-direction: column;
+        gap: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.04); animation: msgIn 0.3s ease;
+      }
+      .journey-eyebrow { color: var(--primary-color); font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+      .journey-title { margin: 0; color: var(--text-main); font-size: 16px; line-height: 1.35; }
+      .journey-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      .journey-action {
+        border: 1px solid color-mix(in srgb, var(--primary-color) 28%, white);
+        background: white; color: var(--primary-color); border-radius: 999px;
+        padding: 9px 13px; font-size: 13px; font-weight: 600; cursor: pointer;
+      }
+      .journey-action:hover { background: var(--primary-color); color: white; }
+      .journey-action:disabled, .journey-confirm:disabled { opacity: 0.6; cursor: wait; }
+      .journey-range-value { color: var(--primary-color); font-size: 14px; font-weight: 700; }
+      .journey-range { width: 100%; accent-color: var(--primary-color); }
+      .journey-range-labels { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 11px; }
+      .journey-confirm {
+        width: 100%; border: 0; border-radius: 10px; padding: 12px;
+        color: white; background: var(--primary-color); font-weight: 700; cursor: pointer;
+      }
+
       @media (max-width: 768px) {
         .panel { right: 0; bottom: 0; width: 100vw; height: 100vh; max-height: 100vh; border-radius: 0; }
         .bubble { right: 20px; bottom: 20px; }
@@ -304,6 +329,7 @@
     input.disabled = busy;
     sendBtn.disabled = busy;
     chips.querySelectorAll('.chip').forEach((chip) => { chip.disabled = busy; });
+    msgs.querySelectorAll('.journey-action, .journey-confirm').forEach((button) => { button.disabled = busy; });
   }
 
   function isAtBottom() {
@@ -515,7 +541,8 @@
     scrollToBottom(true);
   }
 
-  function renderProgressiveLeadField(field) {
+  function renderProgressiveLeadField(field, force = false) {
+    if (force) progressiveFormsShown.delete(field);
     if (!settings.lead_capture_enabled || progressiveFormsShown.has(field)) return;
     progressiveFormsShown.add(field);
     const copy = {
@@ -552,6 +579,8 @@
           body: JSON.stringify({ session_id: sessionId, site_key: siteKey, field, value })
         });
         if (!response.ok) throw new Error("lead field was not saved");
+        const result = await response.json();
+        box.dataset.nextField = result.next_field || "";
       } catch (_) {
         const hint = box.querySelector("p");
         if (hint) hint.textContent = "That value doesn't look valid yet. Please check it or skip for now.";
@@ -561,9 +590,82 @@
         return;
       }
       box.innerHTML = `<p style="text-align:center;color:var(--primary-color);font-weight:500;">✓ Saved — you can keep chatting.</p>`;
-      setTimeout(() => box.remove(), 1800);
+      const nextField = box.dataset.nextField;
+      setTimeout(() => {
+        box.remove();
+        if (nextField) renderProgressiveLeadField(nextField);
+      }, 900);
     });
     msgs.appendChild(box);
+    scrollToBottom(true);
+  }
+
+  function formatCurrency(value, unit = "₹") {
+    return `${unit}${Number(value || 0).toLocaleString("en-IN")}`;
+  }
+
+  function renderUICards(cards) {
+    (cards || []).forEach((card) => {
+      if (!card || !card.type) return;
+      const node = document.createElement("section");
+      node.className = "journey-card";
+
+      if (card.eyebrow) {
+        const eyebrow = document.createElement("div");
+        eyebrow.className = "journey-eyebrow";
+        eyebrow.textContent = card.eyebrow;
+        node.appendChild(eyebrow);
+      }
+      const title = document.createElement("h4");
+      title.className = "journey-title";
+      title.textContent = card.title || "Continue";
+      node.appendChild(title);
+
+      if (card.type === "range") {
+        const value = document.createElement("div");
+        value.className = "journey-range-value";
+        const range = document.createElement("input");
+        range.className = "journey-range";
+        range.type = "range";
+        range.min = String(card.min || 0);
+        range.max = String(card.max || 500000);
+        range.step = String(card.step || 25000);
+        range.value = String(card.value || card.min || 0);
+        value.textContent = formatCurrency(range.value, card.unit);
+        range.addEventListener("input", () => { value.textContent = formatCurrency(range.value, card.unit); });
+
+        const labels = document.createElement("div");
+        labels.className = "journey-range-labels";
+        const minLabel = document.createElement("span");
+        minLabel.textContent = formatCurrency(range.min, card.unit);
+        const maxLabel = document.createElement("span");
+        maxLabel.textContent = formatCurrency(range.max, card.unit);
+        labels.append(minLabel, maxLabel);
+
+        const confirm = document.createElement("button");
+        confirm.className = "journey-confirm";
+        confirm.type = "button";
+        confirm.textContent = card.submit_label || "Confirm selection";
+        confirm.addEventListener("click", () => {
+          confirm.disabled = true;
+          send(`${card.unit || "₹"}${range.value}`);
+        });
+        node.append(value, range, labels, confirm);
+      } else {
+        const actions = document.createElement("div");
+        actions.className = "journey-actions";
+        (card.actions || []).forEach((action) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "journey-action";
+          button.textContent = action.label;
+          button.addEventListener("click", () => send(action.message || action.label));
+          actions.appendChild(button);
+        });
+        node.appendChild(actions);
+      }
+      msgs.appendChild(node);
+    });
     scrollToBottom(true);
   }
 
@@ -632,7 +734,8 @@
                 chips.appendChild(chip);
               });
             }
-            if (data.progressive_lead_field) renderProgressiveLeadField(data.progressive_lead_field);
+            if (data.ui_cards && data.ui_cards.length) renderUICards(data.ui_cards);
+            if (data.progressive_lead_field) renderProgressiveLeadField(data.progressive_lead_field, data.route === "contact");
             if (data.lead_ask && settings.lead_trigger !== "before_chat") renderLeadForm(message);
             bot.innerHTML = formatMarkdown(rawText);
           } else if (eventType === "replace") {

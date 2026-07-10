@@ -466,7 +466,12 @@ async def list_courses(
                     AND (s.spec_name ILIKE '%' || $5 || '%' OR s.slug ILIKE '%' || $5 || '%')
               )
           )
-        ORDER BY {sort_expr} {order_dir} NULLS LAST
+        ORDER BY
+          CASE
+            WHEN $1::text IS NOT NULL AND lower(c.program_name) = lower($1) THEN 0
+            ELSE 1
+          END,
+          {sort_expr} {order_dir} NULLS LAST
         LIMIT $6
         """,
         course_type,
@@ -571,7 +576,8 @@ async def get_university_programs(pool, university_slug: str, limit: int = 20) -
     """All courses offered by one specific, already-known university."""
     rows = await pool.fetch(
         """
-        SELECT c.slug, c.program_name, c.duration, c.mode, c.total_fee, c.starting_fee, c.naac_grade
+        SELECT c.slug, c.program_name, c.duration, c.mode, c.total_fee, c.starting_fee,
+               c.naac_grade, u.slug AS university_slug, u.name AS university_name
         FROM courses c
         JOIN universities u ON u.id = c.university_id
         WHERE u.slug = $1
