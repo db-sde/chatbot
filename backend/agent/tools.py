@@ -202,15 +202,21 @@ async def capture_lead(
 ) -> dict:
     try:
         pool = await get_pool()
-        # Ensure session exists in DB before inserting lead to avoid foreign key constraint issues (e.g. after truncation)
-        session_exists = await pool.fetchval("SELECT 1 FROM sessions WHERE id = $1::uuid", session_id)
-        if not session_exists:
-            await pool.execute(
-                "INSERT INTO sessions (id, site_id, page_university_slug) VALUES ($1::uuid, $2, $3) ON CONFLICT DO NOTHING",
-                session_id,
-                site_id,
-                None
-            )
+        # Create the session if needed, but never attach a lead submitted from
+        # one configured site to a session owned by another site.
+        result = await pool.execute(
+            """
+            INSERT INTO sessions (id, site_id, page_university_slug)
+            VALUES ($1::uuid, $2, $3)
+            ON CONFLICT (id) DO UPDATE SET last_active_at = now()
+            WHERE sessions.site_id = EXCLUDED.site_id
+            """,
+            session_id,
+            site_id,
+            None,
+        )
+        if result == "INSERT 0 0":
+            return _fail("session_site_mismatch", session_id=session_id)
         if trigger_reason == "widget_form":
             sess_trigger = await pool.fetchval("SELECT lead_ask_triggered_by FROM sessions WHERE id = $1::uuid", session_id)
             if sess_trigger:

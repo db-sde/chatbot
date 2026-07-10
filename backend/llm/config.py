@@ -16,6 +16,10 @@ PROVIDER_MODELS = {
     "openai": {
         "main_agent": "gpt-4.1-mini",
         "lead_intent": "gpt-4.1-nano",
+    },
+    "deepseek": {
+        "main_agent": "deepseek-chat",
+        "lead_intent": "deepseek-chat",
     }
 }
 

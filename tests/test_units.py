@@ -26,6 +26,8 @@ class FakeDBPool:
         self.rows = []
 
     async def fetch(self, sql, *args):
+        if "SELECT slug FROM universities" in sql:
+            return [{"slug": "nmims"}]
         if "FROM courses" in sql:
             return [{"slug": "mba-course", "name": "MBA", "total_fee": 100000}]
         if "FROM entity_search" in sql:
@@ -291,23 +293,23 @@ def test_local_extract():
 
 
 def test_extract_intent_university_only():
-    """A bare university name should produce only university_query."""
+    """University extraction belongs to the catalog-first scan, not this parser."""
     intent = resolve.extract_intent("nmims")
-    assert intent.get("university_query") == "nmims"
+    assert "university_query" not in intent
     assert "course_query" not in intent
     assert "specialization_query" not in intent
 
 
 def test_extract_intent_university_and_course():
     intent = resolve.extract_intent("nmims mba")
-    assert intent.get("university_query") == "nmims"
+    assert "university_query" not in intent
     assert intent.get("course_query") == "mba"
     assert "specialization_query" not in intent
 
 
 def test_extract_intent_all_three():
     intent = resolve.extract_intent("nmims mba marketing")
-    assert intent.get("university_query") == "nmims"
+    assert "university_query" not in intent
     assert intent.get("course_query") == "mba"
     assert intent.get("specialization_query") == "marketing"
 
@@ -318,7 +320,7 @@ def test_extract_intent_greeting():
     This test documents that boundary by checking the actual resolve layer."""
     # Sanity: extraction on a real query still works
     intent = resolve.extract_intent("nmims mba")
-    assert intent.get("university_query") is not None
+    assert "university_query" not in intent
     assert intent.get("course_query") == "mba"
 
 
@@ -332,9 +334,13 @@ def test_is_greeting():
 @pytest.mark.asyncio
 async def test_resolve_entities(monkeypatch):
     """University + course should resolve via cache snapping."""
-    resolve.ENTITY_CACHE["university"] = [
-        {"entity_id": 1, "search_text": "nmims narsee monjee institute nmims"}
-    ]
+    resolve.seed_university_cache_for_tests([
+        {
+            "entity_id": 1,
+            "search_text": "nmims narsee monjee institute nmims",
+            "slug": "resolved-university-slug",
+        }
+    ])
     resolve.ENTITY_CACHE["course"] = [
         {"entity_id": 1, "search_text": "online mba nmims-online-mba", "university_id": 1}
     ]
@@ -372,7 +378,7 @@ async def test_resolve_entities_short_disambiguation(monkeypatch):
 @pytest.mark.asyncio
 async def test_resolve_entities_indirect_context():
     """When no entity in message, should fall back to session context."""
-    resolve.ENTITY_CACHE["university"] = []
+    resolve.seed_university_cache_for_tests([])
     resolve.ENTITY_CACHE["course"] = []
     resolve.ENTITY_CACHE["specialization"] = []
 
@@ -387,10 +393,10 @@ async def test_resolve_entities_indirect_context():
 
 @pytest.mark.asyncio
 async def test_resolve_entities_typos(monkeypatch):
-    """Typo 'nims' should fuzzy-snap to NMIMS via token_set_ratio."""
-    resolve.ENTITY_CACHE["university"] = [
-        {"entity_id": 1, "search_text": "nmims narsee monjee institute nmims"}
-    ]
+    """Prefix-preserving typo 'nmis' should fuzzy-snap to NMIMS."""
+    resolve.seed_university_cache_for_tests([
+        {"entity_id": 1, "search_text": "nmims narsee monjee institute nmims", "slug": "nmims"}
+    ])
     resolve.ENTITY_CACHE["course"] = []
     resolve.ENTITY_CACHE["specialization"] = []
 
@@ -399,8 +405,30 @@ async def test_resolve_entities_typos(monkeypatch):
 
     monkeypatch.setattr(resolve.queries, "slug_for_entity_id", mock_slug)
 
-    res = await resolve.resolve_entities("nims", {})
+    res = await resolve.resolve_entities("nmis", {})
     assert res["university_slug"] == "nmims"
+
+
+@pytest.mark.asyncio
+async def test_contracted_fee_follow_up_uses_session_context():
+    resolve.ENTITY_CACHE["university"] = []
+    resolve.ENTITY_CACHE["course"] = []
+    resolve.ENTITY_CACHE["specialization"] = []
+
+    res = await resolve.resolve_entities(
+        "what's the fee?",
+        {"current_university_slug": "nmims", "current_course_slug": "online-mba"},
+    )
+
+    assert res["resolution_status"] == "session_context"
+    assert res["university_slug"] == "nmims"
+    assert res["course_slug"] == "online-mba"
+
+
+def test_pronoun_it_is_not_a_specialization():
+    assert "specialization_query" not in resolve.extract_intent("How much does it cost?")
+    assert "specialization_query" not in resolve.extract_intent("Is it eligible?")
+    assert resolve.extract_intent("IT specialization")["specialization_query"] == "it"
 
 
 @pytest.mark.asyncio
@@ -502,6 +530,34 @@ async def test_comparison_slug_validation_uses_one_batched_query(monkeypatch):
         {"is_valid": True, "error": None, "canonical_slug": "nmims-online-mba"},
         {"is_valid": False, "error": "Course 'missing-mba' not found in catalog", "canonical_slug": None},
     ]
+
+
+@pytest.mark.asyncio
+async def test_single_university_validation_uses_one_existence_query(monkeypatch):
+    """Canonical university validation must not query existence twice."""
+    resolve.seed_university_cache_for_tests([
+        {"entity_id": 1, "search_text": "nmims narsee monjee", "slug": "nmims"}
+    ])
+
+    class RecordingPool:
+        def __init__(self):
+            self.fetch_calls = 0
+
+        async def fetch(self, _sql, slugs):
+            self.fetch_calls += 1
+            return [{"slug": slug} for slug in slugs if slug == "nmims"]
+
+    pool = RecordingPool()
+
+    async def _pool():
+        return pool
+
+    monkeypatch.setattr(tool_validator, "get_pool", _pool)
+    result = await tool_validator.validate_university_slug("nmims")
+
+    assert result["is_valid"] is True
+    assert result["canonical_slug"] == "nmims"
+    assert pool.fetch_calls == 1
 
 
 
@@ -609,6 +665,106 @@ async def test_tool_decorator_wrappers():
 
     res_faq = await tools.get_faq_tool.ainvoke({"entity_type": "course", "entity_slug": "mba"})
     assert res_faq[0]["question"] == "What is the fee?"
+
+
+@pytest.mark.asyncio
+async def test_session_site_mismatch_is_rejected_atomically():
+    from db import queries as queries_mod
+
+    class MismatchPool:
+        async def execute(self, _sql, *_args):
+            return "INSERT 0 0"
+
+    with pytest.raises(queries_mod.SessionSiteMismatchError):
+        await queries_mod.ensure_session(
+            MismatchPool(), "session-id", "site-b", None
+        )
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_has_one_write_round_trip():
+    from db import queries as queries_mod
+
+    class RecordingPool:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, _sql, *_args):
+            self.calls += 1
+            return "INSERT 0 1"
+
+    pool = RecordingPool()
+    await queries_mod.ensure_session(pool, "session-id", "site-a", None)
+    assert pool.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_public_history_query_is_scoped_to_site():
+    from db import queries as queries_mod
+
+    class RecordingPool:
+        def __init__(self):
+            self.sql = ""
+            self.args = ()
+
+        async def fetch(self, sql, *args):
+            self.sql = sql
+            self.args = args
+            return []
+
+    pool = RecordingPool()
+    await queries_mod.get_session_history(
+        pool, "session-id", limit=8, site_id="site-a"
+    )
+
+    assert "JOIN sessions" in pool.sql
+    assert pool.args[-1] == "site-a"
+
+    await queries_mod.get_session_history(
+        pool, "session-id", limit=-10, site_id="site-a"
+    )
+    assert pool.args[2] == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_lead_rejects_cross_site_session(monkeypatch):
+    class MismatchPool:
+        async def execute(self, _sql, *_args):
+            return "INSERT 0 0"
+
+    async def _pool():
+        return MismatchPool()
+
+    monkeypatch.setattr(tools, "get_pool", _pool)
+    result = await tools.capture_lead(
+        "session-id", "John", "9999999999", None, None,
+        "widget_form", "site-b",
+    )
+
+    assert result["not_found"] is True
+    assert result["reason"] == "session_site_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_tool_not_found_is_recorded_as_failure():
+    from observability import init_observability_context, timed_tool_execution, tool_metrics_var
+
+    @timed_tool_execution
+    async def missing_tool():
+        return {"not_found": True, "reason": "missing"}
+
+    init_observability_context()
+    await missing_tool()
+    assert tool_metrics_var.get()[-1]["status"] == "FAILURE"
+
+
+def test_deepseek_uses_supported_model_names():
+    from llm import config
+
+    assert config.PROVIDER_MODELS["deepseek"] == {
+        "main_agent": "deepseek-chat",
+        "lead_intent": "deepseek-chat",
+    }
 
 
 # ── Comparison remediation tests ──────────────────────────────────────────

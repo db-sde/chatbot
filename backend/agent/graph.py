@@ -25,7 +25,7 @@ from settings import settings
 import json
 import logging
 import time
-from typing import Annotated, Any, AsyncIterator, TypedDict
+from typing import Annotated, Any, AsyncIterator, Awaitable, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
@@ -49,6 +49,10 @@ from observability import (
 
 
 logger = logging.getLogger(__name__)
+
+# asyncio keeps only weak references to scheduled tasks. Retain active
+# analytics tasks until completion so they cannot disappear mid-execution.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 from leads.scoring import (
     classify_score_events,
@@ -733,6 +737,7 @@ def route_after_agent(state: ChatState) -> str:
 
 def _observe_background_task(task: asyncio.Task[Any]) -> None:
     """Ensure an unexpected analytics-task failure is logged and observed."""
+    _BACKGROUND_TASKS.discard(task)
     try:
         task.result()
     except asyncio.CancelledError:
@@ -741,17 +746,23 @@ def _observe_background_task(task: asyncio.Task[Any]) -> None:
         logger.exception("Background analytics task failed")
 
 
+def _create_background_task(awaitable: Awaitable[Any], *, name: str) -> asyncio.Task[Any]:
+    task = asyncio.create_task(awaitable, name=name)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_observe_background_task)
+    return task
+
+
 def _schedule_anonymous_signal(
     session_id: str,
     university_slug: str | None,
     course_slug: str | None,
     question_type: str,
 ) -> None:
-    task = asyncio.create_task(
+    _create_background_task(
         log_anonymous_signal(session_id, university_slug, course_slug, question_type),
         name="anonymous-signal",
     )
-    task.add_done_callback(_observe_background_task)
 
 async def background_lead_scoring(session_id: str, message: str, messages: list[BaseMessage]):
     """Runs lead scoring asynchronously after the user has received their response."""
@@ -907,15 +918,14 @@ async def run_chat_turn(
     async for event in _graph.astream_events(initial_state, version="v2"):
         event_kind = event["event"]
         
-        # Capture real LLM tokens as they are generated
+        # Buffer model chunks. Output security scanning must inspect the full
+        # response before any generated text is emitted to the client.
         if event_kind == "on_chat_model_stream":
             chunk = event["data"]["chunk"]
             if isinstance(chunk, AIMessage) and chunk.content:
                 node_name = event.get("metadata", {}).get("langgraph_node")
                 if node_name in ("agent", "chitchat_reply"):
                     reply_text += chunk.content
-                    mark_first_sse_event()
-                    yield {"event": "token", "data": {"text": chunk.content}}
                     
         # Capture the final state updates
         if event_kind == "on_chain_end" and event["name"] == "LangGraph":
@@ -938,15 +948,9 @@ async def run_chat_turn(
             if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
                 reply_text = str(last_msg.content)
         
-        if reply_text:
-            mark_first_sse_event()
-            yield {"event": "token", "data": {"text": reply_text}}
-
-    # Handle Cache Hits
+    # Handle cache hits.
     if final_state.get("cache_hit") and not reply_text:
         reply_text = final_state.get("reply", "")
-        mark_first_sse_event()
-        yield {"event": "token", "data": {"text": reply_text}}
 
     # P0: request-time lead decision (must be in SSE final before client disconnects)
     lead_ask = bool(final_state.get("lead_ask")) if final_state else False
@@ -969,8 +973,6 @@ async def run_chat_turn(
         # Contact path should already have set reply via state; fallback safety
         if lead_ask and (final_state or {}).get("triage_intent") == "contact":
             reply_text = CONTACT_REPLY
-            mark_first_sse_event()
-            yield {"event": "token", "data": {"text": reply_text}}
         else:
             await log_unanswered(session_id, message, None, None)
             reply_text = (
@@ -980,16 +982,28 @@ async def run_chat_turn(
             )
 
     # BACKGROUND LEAD SCORING (analytics only — does not control this turn's lead_ask)
-    asyncio.create_task(
-        background_lead_scoring(session_id, message, final_state.get("messages", []) if final_state else [])
+    _create_background_task(
+        background_lead_scoring(session_id, message, final_state.get("messages", []) if final_state else []),
+        name="lead-scoring",
     )
 
     # Output security scan
     scan = scan_output(reply_text)
     if not scan["clean"]:
         logger.warning("Output scan blocked response (reason=%s) for session=%s", scan["reason"], session_id)
-        await queries.insert_flagged_message(pool, session_id, reply_text[:500], f"output_scan:{scan['reason']}")
+        await queries.insert_flagged_message(
+            pool,
+            session_id,
+            reply_text[:500],
+            layer=f"output_scan:{scan['reason']}",
+            risk_score=1.0,
+            reason=scan["reason"] or "output_scan",
+        )
         reply_text = scan["safe_reply"]
+
+    # This is the first point at which generated text is known to be safe.
+    mark_first_sse_event()
+    yield {"event": "token", "data": {"text": reply_text}}
 
     # Observability stats
     metadata = request_metadata_var.get()

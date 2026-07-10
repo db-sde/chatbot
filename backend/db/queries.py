@@ -7,6 +7,10 @@ from typing import Any
 from settings import settings
 
 
+class SessionSiteMismatchError(Exception):
+    """Raised when a session UUID is reused from a different configured site."""
+
+
 def _clean_row(d: dict[str, Any]) -> dict[str, Any]:
     for k, v in d.items():
         if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
@@ -30,7 +34,7 @@ async def ensure_session(
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> None:
-    await pool.execute(
+    result = await pool.execute(
         """
         INSERT INTO sessions(id, site_id, page_university_slug, ip_address, user_agent)
         VALUES($1::uuid, $2, $3, $4::inet, $5)
@@ -41,6 +45,7 @@ async def ensure_session(
             -- so the stored metadata reflects where the session was originally opened.
             ip_address = COALESCE(sessions.ip_address, EXCLUDED.ip_address),
             user_agent = COALESCE(sessions.user_agent, EXCLUDED.user_agent)
+        WHERE sessions.site_id = EXCLUDED.site_id
         """,
         session_id,
         site_id,
@@ -48,17 +53,8 @@ async def ensure_session(
         ip_address,
         user_agent,
     )
-    # Insert a blank session_context row — conversational slugs start as NULL.
-    # The page_university_slug is intentionally NOT written here; it is a
-    # passive page hint, not evidence of user intent.
-    await pool.execute(
-        """
-        INSERT INTO session_context(session_id)
-        VALUES($1::uuid)
-        ON CONFLICT (session_id) DO NOTHING
-        """,
-        session_id,
-    )
+    if result == "INSERT 0 0":
+        raise SessionSiteMismatchError("Session belongs to a different site")
 
 
 async def get_session_context(pool, session_id: str) -> dict[str, Any]:
@@ -79,6 +75,7 @@ async def get_session_history(
     session_id: str,
     limit: int | None = None,
     before_id: int | None = None,
+    site_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Return previous messages for a session in ascending chronological order.
@@ -89,19 +86,22 @@ async def get_session_history(
     """
     if limit is None:
         limit = settings.max_conversation_messages
-    limit = min(limit, 50)  # cap at 50 regardless of caller
+    limit = max(1, min(limit, 50))  # reject negative/zero SQL LIMIT behavior by clamping
     rows = await pool.fetch(
         """
-        SELECT id, role, content, created_at
-        FROM messages
-        WHERE session_id = $1::uuid
-          AND ($2::int IS NULL OR id < $2)
-        ORDER BY id DESC
+        SELECT m.id, m.role, m.content, m.created_at
+        FROM messages m
+        JOIN sessions s ON s.id = m.session_id
+        WHERE m.session_id = $1::uuid
+          AND ($2::int IS NULL OR m.id < $2)
+          AND ($4::text IS NULL OR s.site_id = $4)
+        ORDER BY m.id DESC
         LIMIT $3
         """,
         session_id,
         before_id,
         limit,
+        site_id,
     )
     messages = list(reversed(dict_rows(rows)))  # ascending order for rendering
     has_more = len(rows) == limit

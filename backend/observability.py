@@ -46,6 +46,8 @@ def timed_tool_execution(func: F) -> F:
         status = "SUCCESS"
         try:
             result = await func(*args, **kwargs)
+            if isinstance(result, dict) and result.get("not_found"):
+                status = "FAILURE"
         except Exception as exc:
             status = "FAILURE"
             result = {"not_found": True, "reason": "internal_error", "error_detail": str(exc)}
@@ -130,4 +132,3 @@ def record_llm_call_duration(duration_ms: int) -> None:
     metadata.setdefault("llm_duration_ms", 0)
     metadata["llm_duration_ms"] += duration_ms
     request_metadata_var.set(metadata)
-

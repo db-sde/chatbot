@@ -92,24 +92,10 @@ async def validate_university_slug(slug: str) -> ToolValidationResult:
     fmt = _check_slug_format(slug, "university_slug")
     if fmt:
         return fmt
-
-    canonical = await normalize_university_slug(slug)
-    pool = await get_pool()
-    exists = await pool.fetchval("SELECT 1 FROM universities WHERE slug = $1", canonical)
-    if not exists:
-        # One more attempt: original slug as-is (cache cold)
-        if canonical != slug:
-            exists = await pool.fetchval("SELECT 1 FROM universities WHERE slug = $1", slug)
-            if exists:
-                return ToolValidationResult(is_valid=True, error=None, canonical_slug=slug)
-        return ToolValidationResult(
-            is_valid=False,
-            error=f"University '{slug}' not found in catalog",
-            canonical_slug=None,
-        )
-    if canonical != slug:
-        logger.info("CANONICAL SLUG | validated %r as %s", slug, canonical)
-    return ToolValidationResult(is_valid=True, error=None, canonical_slug=canonical)
+    # The batch validator checks canonical alias, original slug, and brand-head
+    # fallback together in one query. The prior normalize-then-validate chain
+    # issued the same university existence query twice for canonical slugs.
+    return (await validate_entity_slugs("university", [slug]))[0]
 
 
 async def validate_course_slug(slug: str) -> ToolValidationResult:

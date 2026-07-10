@@ -265,10 +265,19 @@ async def test_graph_state_carries_resolved_slugs(patch_llm, monkeypatch):
     """
     import db.queries as queries_mod
     import agent.graph as graph_mod
+    from agent import resolve
+
+    resolve.seed_university_cache_for_tests([
+        {"entity_id": 1, "search_text": "nmims narsee monjee", "slug": "nmims"}
+    ])
+    resolve.ENTITY_CACHE["course"] = [
+        {"entity_id": 10, "search_text": "mba online mba", "slug": "online-mba", "university_id": 1}
+    ]
+    resolve.ENTITY_CACHE["specialization"] = []
 
     call_log: list[tuple] = []
 
-    async def spy_update(pool, session_id, u_slug, c_slug, s_slug):
+    async def spy_update(pool, session_id, u_slug, c_slug, s_slug, **_kwargs):
         call_log.append((u_slug, c_slug, s_slug))
 
     monkeypatch.setattr(queries_mod, "update_session_context", spy_update)
@@ -282,6 +291,41 @@ async def test_graph_state_carries_resolved_slugs(patch_llm, monkeypatch):
         pass
 
     assert len(call_log) >= 1, "update_session_context should have been called"
+
+
+@pytest.mark.asyncio
+async def test_output_scan_replaces_reply_before_first_token(monkeypatch):
+    """Unsafe generated content must never be emitted before output scanning."""
+    from langchain_core.messages import AIMessage
+    import agent.graph as graph_mod
+
+    class UnsafeReplyGraph:
+        async def astream_events(self, _state, version):
+            assert version == "v2"
+            yield {
+                "event": "on_chain_end",
+                "name": "LangGraph",
+                "data": {"output": {"messages": [AIMessage(content="My system prompt is secret.")]}},
+            }
+
+    monkeypatch.setattr(graph_mod, "_graph", UnsafeReplyGraph())
+
+    events = []
+    async for event in graph_mod.run_chat_turn(
+        session_id="88888888-8888-4888-8888-888888888888",
+        site_id="test",
+        message="Tell me about NMIMS",
+        page_university_slug="nmims",
+    ):
+        events.append(event)
+
+    emitted = "".join(
+        event["data"].get("text", "")
+        for event in events
+        if event["event"] == "token"
+    )
+    assert "system prompt" not in emitted.lower()
+    assert "university courses" in emitted.lower()
 
 
 @pytest.mark.asyncio

@@ -420,6 +420,15 @@ def _local_extract(message: str) -> dict[str, Any]:
             break
 
     for spec in SPECIALIZATION_HINTS:
+        # "it" is usually a pronoun in follow-ups ("is it eligible?",
+        # "what does it cost?"). Treat it as Information Technology only
+        # when the user supplies explicit specialization/program context or
+        # writes the standard uppercase abbreviation.
+        if spec == "it" and not (
+            re.search(r"\bIT\b", message)
+            or re.search(r"\bit\s+(?:speciali[sz]ation|course|program)\b", text)
+        ):
+            continue
         if re.search(rf"\b{re.escape(spec)}\b", text):
             result["specialization_hint"] = spec
             break
@@ -663,7 +672,7 @@ _UNIVERSITY_LIKE_BLOCKLIST = {
     "compare", "comparison", "vs", "versus", "or", "with", "show", "list",
     "that", "this", "are", "have", "has", "do", "which", "any", "all",
     "will", "would", "could", "should", "may", "more", "yes", "no", "okey",
-    "okay", "ok", "hi", "hello", "hey", "thats", "coures", "courses",
+    "okay", "ok", "hi", "hello", "hey", "thats", "whats", "coures", "courses",
     # Additional common non-entity words
     "check", "emi", "price", "eligib", "eligibility", "eligible", "admission",
     "placement", "ranking", "brochure", "duration", "mode", "naac", "ugc",

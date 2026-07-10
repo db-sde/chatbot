@@ -424,7 +424,7 @@ async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[
             raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
 
     validate_site_request(body.site_key, request.headers.get("origin"), request.headers.get("referer"))
-    await capture_lead(
+    lead = await capture_lead(
         body.session_id,
         body.name,
         body.phone,
@@ -433,6 +433,10 @@ async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[
         "widget_form",
         body.site_key,
     )
+    if lead.get("not_found"):
+        if lead.get("reason") == "session_site_mismatch":
+            raise HTTPException(status_code=403, detail="Session does not belong to this site")
+        raise HTTPException(status_code=503, detail="Lead capture is temporarily unavailable")
     if settings.crm_webhook_url:
         async with httpx.AsyncClient(timeout=8) as client:
             await client.post(settings.crm_webhook_url, json=body.model_dump())
@@ -456,7 +460,13 @@ async def session_history(
     """
     validate_site_request(site_key, request.headers.get("origin"), request.headers.get("referer"))
     pool = await get_pool()
-    return await queries.get_session_history(pool, session_id, limit=limit, before_id=before_id)
+    return await queries.get_session_history(
+        pool,
+        session_id,
+        limit=limit,
+        before_id=before_id,
+        site_id=site_key,
+    )
 
 
 # ── Single Page Application Static Files Routing for built React app ──
