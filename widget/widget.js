@@ -204,6 +204,7 @@
       .lead-card input { background: white; }
       .lead-card .lead-submit { background: var(--primary-color); color: white; border: 0; border-radius: 8px; padding: 10px; font-weight: 500; cursor: pointer; transition: background 0.2s; font-size: 14px; }
       .lead-card .lead-submit:hover { background: var(--primary-hover); }
+      .lead-card .lead-submit:disabled { opacity: 0.65; cursor: wait; }
       .lead-card .skip-btn { background: transparent; border: 0; color: var(--text-muted); font-size: 12px; cursor: pointer; text-decoration: underline; padding: 4px; }
 
       @media (max-width: 768px) {
@@ -533,19 +534,30 @@
       <button type="submit" class="lead-submit">Save</button>
       <button type="button" class="skip-btn">Skip for now</button>
     `;
+    let isSaving = false;
     box.querySelector(".skip-btn").addEventListener("click", () => box.remove());
     box.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (isSaving) return;
       const value = String(new FormData(box).get("value") || "").trim();
       if (!value) return;
-      const response = await fetch(`${apiBase}/webhook/lead/progressive`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, site_key: siteKey, field, value })
-      });
-      if (!response.ok) {
+      const submitButton = box.querySelector(".lead-submit");
+      isSaving = true;
+      submitButton.disabled = true;
+      submitButton.textContent = "Saving...";
+      try {
+        const response = await fetch(`${apiBase}/webhook/lead/progressive`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId, site_key: siteKey, field, value })
+        });
+        if (!response.ok) throw new Error("lead field was not saved");
+      } catch (_) {
         const hint = box.querySelector("p");
         if (hint) hint.textContent = "That value doesn't look valid yet. Please check it or skip for now.";
+        isSaving = false;
+        submitButton.disabled = false;
+        submitButton.textContent = "Save";
         return;
       }
       box.innerHTML = `<p style="text-align:center;color:var(--primary-color);font-weight:500;">✓ Saved — you can keep chatting.</p>`;

@@ -6,7 +6,7 @@ import logging.config
 import os
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Literal
 
 import httpx
@@ -208,13 +208,41 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
         body.page_pathname or body.page_university_slug or "(none)",
         len(body.message), body.message[:120],
     )
+    request_started = time.perf_counter()
 
-    pool = await get_pool()
-    blocked_ip, messages_today = await asyncio.gather(
-        queries.is_ip_blocked(pool, client_ip) if client_ip else asyncio.sleep(0, result=False),
-        queries.count_site_messages_today(pool, body.site_key),
-    )
+    validate_site_request(body.site_key, request.headers.get("origin"), request.headers.get("referer"))
+
+    async def _timed_prompt_guard():
+        started = time.perf_counter()
+        result = await check_prompt_safety(body.message, body.session_id)
+        return result, (time.perf_counter() - started) * 1000
+
+    logger.info("[%s] Running Prompt Guard...", body.session_id)
+    prompt_guard_task = asyncio.create_task(_timed_prompt_guard())
+
+    async def _cancel_prompt_guard() -> None:
+        if not prompt_guard_task.done():
+            prompt_guard_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await prompt_guard_task
+
+    # Policy is local and independent; evaluate it while the guard and DB
+    # prechecks are allowed to make progress concurrently.
+    policy_started = time.perf_counter()
+    policy = check_policy(body.message)
+    policy_ms = (time.perf_counter() - policy_started) * 1000
+
+    try:
+        pool = await get_pool()
+        blocked_ip, messages_today = await asyncio.gather(
+            queries.is_ip_blocked(pool, client_ip) if client_ip else asyncio.sleep(0, result=False),
+            queries.count_site_messages_today(pool, body.site_key),
+        )
+    except Exception:
+        await _cancel_prompt_guard()
+        raise
     if blocked_ip:
+        await _cancel_prompt_guard()
         logger.warning("Blocked IP attempted chat: %s session=%s", client_ip, body.session_id)
         await queries.insert_security_event(
             pool,
@@ -230,8 +258,8 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
         )
         raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
 
-    validate_site_request(body.site_key, request.headers.get("origin"), request.headers.get("referer"))
     if messages_today >= settings.daily_message_cap_per_site:
+        await _cancel_prompt_guard()
         raise HTTPException(status_code=429, detail="Daily site message cap exceeded")
 
     _PROMPT_GUARD_BLOCKED = (
@@ -241,25 +269,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
 
     async def event_stream():
         try:
-            request_started = time.perf_counter()
             pool = await get_pool()
 
-            # Prompt Guard is remote while policy is a local independent check.
-            # Start the remote work first and evaluate policy while it is in flight.
-            logger.info("[%s] Running Prompt Guard...", body.session_id)
-            prompt_guard_started = time.perf_counter()
-            prompt_guard_task = asyncio.create_task(
-                check_prompt_safety(body.message, body.session_id)
-            )
-            # Let the remote classifier reach its first await before running
-            # the cheap synchronous policy check in this event-loop thread.
-            await asyncio.sleep(0)
-            logger.info("[%s] Running policy check...", body.session_id)
-            policy_started = time.perf_counter()
-            policy = check_policy(body.message)
-            policy_ms = (time.perf_counter() - policy_started) * 1000
-            safety = await prompt_guard_task
-            prompt_guard_ms = (time.perf_counter() - prompt_guard_started) * 1000
+            safety, prompt_guard_ms = await prompt_guard_task
             logger.info(
                 "[%s] Prompt Guard result: safe=%s score=%.4f reason=%s source=%s",
                 body.session_id, safety["safe"], safety["risk_score"],

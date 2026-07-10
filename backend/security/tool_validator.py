@@ -50,6 +50,32 @@ def _check_slug_format(slug: str, label: str) -> ToolValidationResult | None:
     return None
 
 
+def validate_entity_slug_format(entity_type: str, slug: str) -> ToolValidationResult:
+    """Validate slug syntax without an extra database existence round-trip.
+
+    Use this when the immediately following parameterized, entity-scoped data
+    query is itself the authoritative existence check.
+    """
+    labels = {
+        "university": "university_slug",
+        "course": "course_slug",
+        "specialization": "specialization_slug",
+    }
+    label = labels.get(entity_type)
+    if label is None:
+        return ToolValidationResult(
+            is_valid=False,
+            error=f"unsupported entity type: {entity_type}",
+            canonical_slug=None,
+        )
+    error = _check_slug_format(slug, label)
+    return error or ToolValidationResult(
+        is_valid=True,
+        error=None,
+        canonical_slug=slug,
+    )
+
+
 async def normalize_university_slug(slug: str) -> str:
     """
     Map alias / brand / alternate slug to the catalog canonical slug.

@@ -324,6 +324,20 @@ async def test_resolved_program_overview_names_actual_catalog_match(monkeypatch)
     model.ainvoke.assert_not_called()
 
 
+def test_deterministic_overview_does_not_capture_specific_information_topics():
+    import agent.graph as graph_mod
+
+    assert graph_mod._is_program_overview_request("Tell me about NMIMS Online MBA")
+    for message in (
+        "Tell me about NMIMS MBA placements",
+        "Tell me about its syllabus",
+        "Details about the admission process",
+        "Tell me about certificate validity",
+        "Tell me about MBA exams",
+    ):
+        assert not graph_mod._is_program_overview_request(message), message
+
+
 @pytest.mark.asyncio
 async def test_graph_forwards_model_chunks_before_final(monkeypatch):
     from langchain_core.messages import AIMessage, AIMessageChunk

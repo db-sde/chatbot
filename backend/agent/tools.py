@@ -2,8 +2,10 @@
 
 Design contract
 ----------------
-- Every tool validates its slug / entity_type arguments via
-  `security.tool_validator` BEFORE touching the database.
+- Every tool validates slug syntax / entity type before touching the database.
+- Single-entity tools use their immediately following parameterized, scoped
+  data query as the authoritative existence check, avoiding a redundant lookup.
+- Multi-entity comparison tools batch existence validation before retrieval.
 - Every failure path (validation error, empty result, or unexpected
   exception) returns the SAME envelope shape:
       {"not_found": True, "reason": "<short_code>", ...context}
@@ -22,7 +24,6 @@ Design contract
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -31,11 +32,9 @@ from langchain_core.tools import tool
 from db import queries
 from db.pool import get_pool
 from security.tool_validator import (
-    validate_course_slug,
     validate_entity_slugs,
+    validate_entity_slug_format,
     validate_entity_type,
-    validate_specialization_slug,
-    validate_university_slug,
 )
 from observability import timed_tool_execution
 
@@ -77,9 +76,20 @@ def _fail(reason: str | None, **extra: Any) -> dict[str, Any]:
     return payload
 
 
-async def _valid_optional_slug() -> dict[str, Any]:
-    """No-op awaitable used to keep optional validations in one gather call."""
-    return {"is_valid": True, "error": None, "canonical_slug": None}
+def _canonical_university_slug(slug: str) -> str:
+    """Use the warm resolver cache; the scoped data query verifies existence."""
+    from agent.resolve import resolve_university_alias
+
+    return resolve_university_alias(slug) or slug
+
+
+def _slug_format_error(entity_type: str, slug: str | None) -> dict[str, Any] | None:
+    if slug is None:
+        return None
+    validation = validate_entity_slug_format(entity_type, slug)
+    if validation["is_valid"]:
+        return None
+    return _fail(validation["error"], **{f"{entity_type}_slug": slug})
 
 
 def _clamp_limit(limit: int | None, default: int = DEFAULT_LIMIT, maximum: int = MAX_LIMIT) -> int:
@@ -363,21 +373,14 @@ async def get_fee_tool(university_slug: str, course_slug: str | None = None, spe
     Use ONLY for cost/fee/price questions.
     Do NOT use this to list programs (use get_university_programs_tool) or to check
     eligibility (use get_eligibility_tool)."""
-    validations = await asyncio.gather(
-        validate_university_slug(university_slug),
-        validate_course_slug(course_slug) if course_slug else _valid_optional_slug(),
-        validate_specialization_slug(specialization_slug) if specialization_slug else _valid_optional_slug(),
-    )
-    v, vc, vs = validations
-    if not v["is_valid"]:
-        return _fail(v["error"], university_slug=university_slug)
-    university_slug = v.get("canonical_slug") or university_slug
-
-    if course_slug and not vc["is_valid"]:
-        return _fail(vc["error"], course_slug=course_slug)
-
-    if specialization_slug and not vs["is_valid"]:
-        return _fail(vs["error"], specialization_slug=specialization_slug)
+    for entity_type, slug in (
+        ("university", university_slug),
+        ("course", course_slug),
+        ("specialization", specialization_slug),
+    ):
+        if error := _slug_format_error(entity_type, slug):
+            return error
+    university_slug = _canonical_university_slug(university_slug)
 
     return await get_fee(university_slug, course_slug, specialization_slug)
 
@@ -388,16 +391,11 @@ async def get_eligibility_tool(university_slug: str, course_slug: str) -> dict:
     """Return eligibility criteria for a specific course at a specific university.
     Use ONLY for eligibility / admission-criteria questions.
     Do NOT use this for fee questions — use get_fee_tool instead."""
-    v, vc = await asyncio.gather(
-        validate_university_slug(university_slug),
-        validate_course_slug(course_slug),
-    )
-    if not v["is_valid"]:
-        return _fail(v["error"], university_slug=university_slug)
-    university_slug = v.get("canonical_slug") or university_slug
-
-    if not vc["is_valid"]:
-        return _fail(vc["error"], course_slug=course_slug)
+    if error := _slug_format_error("university", university_slug):
+        return error
+    if error := _slug_format_error("course", course_slug):
+        return error
+    university_slug = _canonical_university_slug(university_slug)
 
     return await get_eligibility(university_slug, course_slug)
 
@@ -411,10 +409,9 @@ async def get_university_overview_tool(university_slug: str) -> dict:
     refers to 'this university' / 'this page' — the resolver fills in the correct
     slug from page context before this tool is called.
     Do NOT use this for a specific course's details — use get_program_details_tool."""
-    v = await validate_university_slug(university_slug)
-    if not v["is_valid"]:
-        return _fail(v["error"], university_slug=university_slug)
-    university_slug = v.get("canonical_slug") or university_slug
+    if error := _slug_format_error("university", university_slug):
+        return error
+    university_slug = _canonical_university_slug(university_slug)
     return await get_university_overview(university_slug)
 
 
@@ -425,10 +422,9 @@ async def get_university_programs_tool(university_slug: str, limit: int = DEFAUL
     Use for 'what programs/courses does X offer' questions.
     Do NOT use this for filtering or ranking across MANY universities —
     use list_courses_tool for that instead."""
-    v = await validate_university_slug(university_slug)
-    if not v["is_valid"]:
-        return _fail(v["error"], university_slug=university_slug)
-    university_slug = v.get("canonical_slug") or university_slug
+    if error := _slug_format_error("university", university_slug):
+        return error
+    university_slug = _canonical_university_slug(university_slug)
     return await get_university_programs(university_slug, limit=limit)
 
 
@@ -439,17 +435,12 @@ async def get_program_details_tool(course_slug: str, university_slug: str | None
     for ONE specific, already-known course.
     Use for 'tell me about X's Y program' questions.
     Do NOT use this for fee-only questions — use get_fee_tool for a faster, focused answer."""
-    vc, vu = await asyncio.gather(
-        validate_course_slug(course_slug),
-        validate_university_slug(university_slug) if university_slug else _valid_optional_slug(),
-    )
-    if not vc["is_valid"]:
-        return _fail(vc["error"], course_slug=course_slug)
-
+    if error := _slug_format_error("course", course_slug):
+        return error
+    if error := _slug_format_error("university", university_slug):
+        return error
     if university_slug:
-        if not vu["is_valid"]:
-            return _fail(vu["error"], university_slug=university_slug)
-        university_slug = vu.get("canonical_slug") or university_slug
+        university_slug = _canonical_university_slug(university_slug)
 
     return await get_program_details(course_slug, university_slug)
 
@@ -460,17 +451,12 @@ async def get_specializations_tool(course_slug: str, university_slug: str | None
     """List all specializations available under ONE specific, already-known course
     (e.g. all MBA specializations at NMIMS).
     Use for 'what specializations does X offer' questions."""
-    vc, vu = await asyncio.gather(
-        validate_course_slug(course_slug),
-        validate_university_slug(university_slug) if university_slug else _valid_optional_slug(),
-    )
-    if not vc["is_valid"]:
-        return _fail(vc["error"], course_slug=course_slug)
-
+    if error := _slug_format_error("course", course_slug):
+        return error
+    if error := _slug_format_error("university", university_slug):
+        return error
     if university_slug:
-        if not vu["is_valid"]:
-            return _fail(vu["error"], university_slug=university_slug)
-        university_slug = vu.get("canonical_slug") or university_slug
+        university_slug = _canonical_university_slug(university_slug)
 
     return await get_specializations(course_slug, university_slug, limit=limit)
 
@@ -584,14 +570,10 @@ async def get_faq_tool(entity_type: str, entity_slug: str, query_text: str | Non
     if not vt["is_valid"]:
         return _fail(vt["error"], entity_type=entity_type)
 
-    validator = {
-        "university": validate_university_slug,
-        "course": validate_course_slug,
-        "specialization": validate_specialization_slug,
-    }[entity_type]
-    v = await validator(entity_slug)
-    if not v["is_valid"]:
-        return _fail(v["error"], entity_type=entity_type, entity_slug=entity_slug)
+    if error := _slug_format_error(entity_type, entity_slug):
+        return error
+    if entity_type == "university":
+        entity_slug = _canonical_university_slug(entity_slug)
 
     return await get_faq(entity_type, entity_slug, query_text)
 
@@ -609,16 +591,11 @@ async def get_reviews_tool(
     vt = await validate_entity_type(entity_type)
     if not vt["is_valid"]:
         return _fail(vt["error"], entity_type=entity_type)
-    validator = {
-        "university": validate_university_slug,
-        "course": validate_course_slug,
-        "specialization": validate_specialization_slug,
-    }[entity_type]
-    validated = await validator(entity_slug)
-    if not validated["is_valid"]:
-        return _fail(validated["error"], entity_type=entity_type, entity_slug=entity_slug)
-    canonical = validated.get("canonical_slug") or entity_slug
-    return await get_reviews(entity_type, canonical, limit=limit)
+    if error := _slug_format_error(entity_type, entity_slug):
+        return error
+    if entity_type == "university":
+        entity_slug = _canonical_university_slug(entity_slug)
+    return await get_reviews(entity_type, entity_slug, limit=limit)
 
 
 # ---------------------------------------------------------------------------

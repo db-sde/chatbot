@@ -132,3 +132,17 @@ def record_llm_call_duration(duration_ms: int) -> None:
     metadata.setdefault("llm_duration_ms", 0)
     metadata["llm_duration_ms"] += duration_ms
     request_metadata_var.set(metadata)
+
+
+def record_tool_metric(name: str, duration_ms: float, status: str = "SUCCESS") -> None:
+    """Record an instrumented deterministic catalog operation."""
+    completed = datetime.now(timezone.utc)
+    started = completed.timestamp() - (duration_ms / 1000)
+    metric = {
+        "name": name,
+        "started_at": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+        "completed_at": completed.isoformat(),
+        "duration_ms": int(duration_ms),
+        "status": status,
+    }
+    tool_metrics_var.set(tool_metrics_var.get() + [metric])

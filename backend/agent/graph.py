@@ -46,6 +46,7 @@ from observability import (
     mark_llm_start,
     mark_first_token,
     record_llm_call_duration,
+    record_tool_metric,
 )
 
 
@@ -102,6 +103,7 @@ class ChatState(TypedDict, total=False):
     tool_ms_total: float
     profile_context_update: dict[str, Any]
     progressive_lead_field: str
+    deterministic_route: str
 
 
 def _make_state(
@@ -156,7 +158,11 @@ def _is_program_overview_request(message: str) -> bool:
         for phrase in ("tell me about", "details about", "overview of", "information about")
     ) and not any(
         term in text
-        for term in ("fee", "cost", "eligib", "specialization", "review", "rating", "accredit")
+        for term in (
+            "fee", "cost", "emi", "eligib", "specialization", "review", "rating",
+            "accredit", "placement", "salary", "job", "syllabus", "curriculum",
+            "admission", "apply", "certificate", "validity", "faculty", "exam",
+        )
     )
 
 
@@ -284,15 +290,21 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
             replace_dependents=True,
         )
         if resolved.get("course_slug") and _is_program_overview_request(message):
-            _, prefetched_program = await asyncio.gather(
-                context_update,
-                queries.get_program_details(
+            async def _timed_program_lookup():
+                started = time.perf_counter()
+                value = await queries.get_program_details(
                     pool,
                     resolved["course_slug"],
                     resolved["university_slug"],
-                ),
+                )
+                return value, (time.perf_counter() - started) * 1000
+
+            _, (prefetched_program, program_lookup_ms) = await asyncio.gather(
+                context_update,
+                _timed_program_lookup(),
             )
             resolved["_program_details"] = prefetched_program
+            resolved["_program_lookup_ms"] = program_lookup_ms
         else:
             await context_update
         logger.info(
@@ -395,9 +407,10 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
         and resolved.get("university_slug")
         and overview_request
     ):
+        program_prefetched = "_program_details" in resolved
         program = resolved.get("_program_details")
-        lookup_ms = 0.0
-        if program is None:
+        lookup_ms = float(resolved.get("_program_lookup_ms") or 0.0)
+        if program is None and not program_prefetched:
             pool = await get_pool()
             started = time.perf_counter()
             program = await queries.get_program_details(
@@ -436,6 +449,7 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
                 "messages": [AIMessage(content=reply)],
                 "reply": reply,
                 "tool_ms_total": state.get("tool_ms_total", 0.0) + lookup_ms,
+                "deterministic_route": "program_overview",
             }
 
     if resolution_status == "subjective_recommendation":
@@ -591,14 +605,22 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
     page_hint_only = resolved.get("_page_hint_only", False)
     context_parts = []
     if not page_hint_only:
-        comp_targets = resolved.get("comparison_targets", [])
-        if len(comp_targets) > 1:
-            context_parts.append(f"comparison_targets={comp_targets}")
-        elif resolved.get("university_slug"):
-            context_parts.append(f"university_slug={resolved['university_slug']}")
-            
-        if resolved.get("course_slug"): context_parts.append(f"course_slug={resolved['course_slug']}")
-        if resolved.get("specialization_slug"): context_parts.append(f"specialization_slug={resolved['specialization_slug']}")
+        if resolution_status == "catalog_query":
+            context_parts.append("catalog_scope=true")
+            raw_intent = resolved.get("raw") or {}
+            if raw_intent.get("course_query"):
+                context_parts.append(f"course_type={raw_intent['course_query']}")
+            if resolved.get("mode"):
+                context_parts.append(f"mode={resolved['mode']}")
+        else:
+            comp_targets = resolved.get("comparison_targets", [])
+            if len(comp_targets) > 1:
+                context_parts.append(f"comparison_targets={comp_targets}")
+            elif resolved.get("university_slug"):
+                context_parts.append(f"university_slug={resolved['university_slug']}")
+
+            if resolved.get("course_slug"): context_parts.append(f"course_slug={resolved['course_slug']}")
+            if resolved.get("specialization_slug"): context_parts.append(f"specialization_slug={resolved['specialization_slug']}")
 
     if context_parts:
         context_note = (
@@ -1161,6 +1183,7 @@ async def _run_chat_turn_unlocked(
             "event": "final",
             "data": {
                 "lead_ask": contact,
+                "route": "contact" if contact else "greeting",
                 "quick_replies": quick_replies_for(message),
                 "metrics": {
                     "response_time_ms": 0,
@@ -1383,6 +1406,20 @@ async def _run_chat_turn_unlocked(
     agent_ttft_ms = int((t_first - metadata["t_start"]) * 1000)
     ttft_ms = int((t_first - (request_started_at or metadata["t_start"])) * 1000)
     
+    deterministic_lookup_ms = float(
+        (((final_state or {}).get("resolved") or {}).get("_program_lookup_ms")) or 0.0
+    )
+    if deterministic_lookup_ms and not any(
+        metric.get("name") == "deterministic_program_lookup"
+        for metric in (tool_metrics_var.get() or [])
+    ):
+        record_tool_metric(
+            "deterministic_program_lookup",
+            deterministic_lookup_ms,
+            "SUCCESS"
+            if (((final_state or {}).get("resolved") or {}).get("_program_details"))
+            else "FAILURE",
+        )
     tools_executed = tool_metrics_var.get() or []
     tool_exec_time = sum(m.get("duration_ms", 0) for m in tools_executed)
 
@@ -1486,6 +1523,7 @@ async def _run_chat_turn_unlocked(
         "data": {
             "lead_ask": lead_ask,
             "progressive_lead_field": progressive_lead_field,
+            "route": (final_state or {}).get("deterministic_route") or "agent",
             "quick_replies": quick_replies_for(message),
             "metrics": {
                 "response_time_ms": response_time_ms,

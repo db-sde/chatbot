@@ -817,6 +817,15 @@ _CATALOG_SUPERLATIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_CATALOG_DISCOVERY_PATTERN = re.compile(
+    r"\b(?:online|distance)\s+(?:universit(?:y|ies)|colleges?|institutes?)\b"
+    r"|\b(?:online|distance)\s+(?:mba|bba|bca|mca|pgdm|courses?|programs?)"
+    r"\s+(?:courses?|programs?|options?)\b"
+    r"|\b(?:compare|comparison\s+of|list|show\s+me)\b[^.?!]{0,35}"
+    r"\b(?:mba|bba|bca|mca|pgdm)\s+(?:courses?|programs?|options?)\b",
+    re.IGNORECASE,
+)
+
 _SUBJECTIVE_RECOMMENDATION_PATTERN = re.compile(
     r"\b(?:best|right|ideal|suitable)\b[^.?!]{0,55}\b(?:for\s+me|suits?\s+me)\b"
     r"|\b(?:which|what)\b[^.?!]{0,45}\b(?:should\s+i\s+choose|suits?\s+me)\b"
@@ -840,6 +849,7 @@ def _is_catalog_wide_query(message: str) -> bool:
     return bool(
         _CATALOG_WIDE_PATTERN.search(message)
         or _CATALOG_SUPERLATIVE_PATTERN.search(message)
+        or _CATALOG_DISCOVERY_PATTERN.search(message)
     )
 
 
@@ -1219,6 +1229,10 @@ async def resolve_entities(
                 hit.get("matched_alias"), slug, hit.get("method"),
             )
 
+    # Scope must be decided before course snapping. A catalog request carries
+    # a course TYPE (MBA) rather than one arbitrary course entity slug.
+    catalog_wide_requested = not resolved_slugs and _is_catalog_wide_query(message)
+
     if not resolved_slugs and is_subjective_recommendation(message):
         logger.info(
             "SUBJECTIVE RECOMMENDATION | active=False msg=%r", message[:80]
@@ -1250,7 +1264,7 @@ async def resolve_entities(
     # ── Step 2: Course (scoped to university) ──────────────────────────────
     course_slug: str | None = None
     course_entity_id: int | None = None
-    if "course_query" in intent:
+    if "course_query" in intent and not catalog_wide_requested:
         course_slug, course_entity_id = await snap_course(
             intent["course_query"],
             university_entity_id=university_entity_id,
@@ -1338,7 +1352,7 @@ async def resolve_entities(
 
     else:
         # User did NOT mention any university-like name.
-        catalog_wide = _is_catalog_wide_query(message)
+        catalog_wide = catalog_wide_requested
         page_canonical = resolve_university_alias(page_university_slug) or page_university_slug
         session_uni = context.get("current_university_slug")
         comparison_context = saved_comparison_context
@@ -1380,9 +1394,9 @@ async def resolve_entities(
         else:
             resolution_status = "none"
 
-        if not course_slug:
+        if not catalog_wide and not course_slug:
             course_slug = context.get("current_course_slug")
-        if not specialization_slug:
+        if not catalog_wide and not specialization_slug:
             specialization_slug = context.get("current_specialization_slug")
 
     logger.info(

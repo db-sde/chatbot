@@ -283,21 +283,31 @@ async def insert_message(
 ) -> int | None:
     row = await pool.fetchrow(
         """
-        INSERT INTO messages(
-            session_id, role, content, tool_calls,
-            response_time_ms, ttft_ms, model_name,
-            input_tokens, output_tokens, total_tokens,
-            estimated_cost_usd, tool_execution_time_ms,
-            started_at, completed_at
+        WITH inserted AS (
+            INSERT INTO messages(
+                session_id, role, content, tool_calls,
+                response_time_ms, ttft_ms, model_name,
+                input_tokens, output_tokens, total_tokens,
+                estimated_cost_usd, tool_execution_time_ms,
+                started_at, completed_at
+            )
+            VALUES(
+                $1::uuid, $2, $3, $4::jsonb,
+                $5, $6, $7,
+                $8, $9, $10,
+                $11, $12,
+                $13, $14
+            )
+            RETURNING id
+        ), touched_session AS (
+            UPDATE sessions
+            SET message_count = message_count + 1, last_active_at = now()
+            WHERE id = $1::uuid
+            RETURNING id
         )
-        VALUES(
-            $1::uuid, $2, $3, $4::jsonb,
-            $5, $6, $7,
-            $8, $9, $10,
-            $11, $12,
-            $13, $14
-        )
-        RETURNING id
+        SELECT inserted.id
+        FROM inserted
+        JOIN touched_session ON TRUE
         """,
         session_id,
         role,
@@ -314,7 +324,6 @@ async def insert_message(
         started_at,
         completed_at,
     )
-    await pool.execute("UPDATE sessions SET message_count = message_count + 1, last_active_at = now() WHERE id = $1::uuid", session_id)
     return row["id"] if row else None
 
 async def count_site_messages_today(pool, site_id: str) -> int:

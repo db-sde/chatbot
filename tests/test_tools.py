@@ -121,3 +121,53 @@ async def test_list_courses_passes_specialization_filter(monkeypatch):
     )
 
     assert query.await_args.args[-1] == "finance"
+
+
+@pytest.mark.asyncio
+async def test_university_programs_tool_uses_one_scoped_catalog_query(monkeypatch):
+    from observability import init_observability_context
+
+    class OneQueryPool:
+        def __init__(self):
+            self.fetch_calls = 0
+
+        async def fetch(self, sql, *_args):
+            self.fetch_calls += 1
+            assert "JOIN universities" in sql
+            return [{"slug": "executive-mba", "program_name": "Executive MBA"}]
+
+        async def fetchval(self, *_args):
+            raise AssertionError("existence validation must not add a DB round-trip")
+
+    pool = OneQueryPool()
+
+    async def _pool():
+        return pool
+
+    monkeypatch.setattr(tools, "get_pool", _pool)
+    init_observability_context()
+    result = await tools.get_university_programs_tool.ainvoke({
+        "university_slug": "nmims-online",
+        "limit": 5,
+    })
+
+    assert result[0]["program_name"] == "Executive MBA"
+    assert pool.fetch_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_university_programs_tool_rejects_bad_slug_before_db(monkeypatch):
+    from observability import init_observability_context
+
+    async def unexpected_pool():
+        raise AssertionError("malformed slugs must be rejected before DB access")
+
+    monkeypatch.setattr(tools, "get_pool", unexpected_pool)
+    init_observability_context()
+    result = await tools.get_university_programs_tool.ainvoke({
+        "university_slug": "NMIMS'; DROP TABLE universities;--",
+        "limit": 5,
+    })
+
+    assert result["not_found"] is True
+    assert "invalid characters" in result["reason"] or "too long" in result["reason"]

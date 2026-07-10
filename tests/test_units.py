@@ -438,6 +438,42 @@ async def test_catalog_superlative_does_not_inherit_session_university(monkeypat
 
     assert res["resolution_status"] == "catalog_query"
     assert res["university_slug"] is None
+    assert res["course_slug"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Tell me about online MBA courses",
+        "Online MBA programs",
+        "Compare MBA programs",
+        "Online universities",
+        "Best online MBA",
+        "Top MBA programs",
+        "Which MBA is best",
+    ],
+)
+async def test_catalog_discovery_never_snaps_or_inherits_one_course(monkeypatch, message):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    async def unexpected_course_snap(*_args, **_kwargs):
+        raise AssertionError("catalog-wide queries must retain a course type, not snap one entity")
+
+    monkeypatch.setattr(resolve, "snap_course", unexpected_course_snap)
+    result = await resolve.resolve_entities(
+        message,
+        {
+            "current_university_slug": "nmims-online",
+            "current_course_slug": "executive-mba-nmims-online",
+        },
+    )
+
+    assert result["resolution_status"] == "catalog_query"
+    assert result["university_slug"] is None
+    assert result["course_slug"] is None
+    assert result["raw"].get("course_query") == "mba" or "universit" in message.lower()
 
 
 @pytest.mark.asyncio
@@ -847,6 +883,28 @@ async def test_session_context_decodes_asyncpg_json_strings():
     assert context["comparison_context"]["university_slugs"] == [
         "nmims-online", "amity-online"
     ]
+
+
+@pytest.mark.asyncio
+async def test_insert_message_updates_session_in_one_round_trip():
+    class OneRoundTripPool:
+        def __init__(self):
+            self.fetchrow_calls = 0
+
+        async def fetchrow(self, sql, *_args):
+            self.fetchrow_calls += 1
+            assert "WITH inserted AS" in sql
+            assert "UPDATE sessions" in sql
+            return {"id": 42}
+
+        async def execute(self, *_args):
+            raise AssertionError("message persistence must not issue a second write")
+
+    pool = OneRoundTripPool()
+    message_id = await queries.insert_message(pool, "session-id", "user", "hello")
+
+    assert message_id == 42
+    assert pool.fetchrow_calls == 1
 
 
 @pytest.mark.asyncio
