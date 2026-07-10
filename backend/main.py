@@ -1,11 +1,13 @@
 
 import json
+import asyncio
 import logging
 import logging.config
 import os
+import re
 import time
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Body
@@ -150,6 +152,13 @@ class LeadRequest(BaseModel):
     course_interest: str | None = None
 
 
+class ProgressiveLeadRequest(BaseModel):
+    session_id: str
+    site_key: str
+    field: Literal["name", "phone", "email"]
+    value: str = Field(min_length=1, max_length=120)
+
+
 class WidgetSettingsUpdate(BaseModel):
     # Branding
     primary_color: str | None = None
@@ -200,28 +209,29 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
         len(body.message), body.message[:120],
     )
 
-    # ── IP Block Check ──
-    if client_ip:
-        pool = await get_pool()
-        if await queries.is_ip_blocked(pool, client_ip):
-            logger.warning("Blocked IP attempted chat: %s session=%s", client_ip, body.session_id)
-            await queries.insert_security_event(
-                pool,
-                ip_address=client_ip,
-                user_agent=client_ua,
-                session_id=body.session_id,
-                event_type="blocked_ip_access",
-                severity="high",
-                payload=body.message[:500],
-                source="system",
-                action_taken="blocked",
-                blocked=True,
-            )
-            raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
+    pool = await get_pool()
+    blocked_ip, messages_today = await asyncio.gather(
+        queries.is_ip_blocked(pool, client_ip) if client_ip else asyncio.sleep(0, result=False),
+        queries.count_site_messages_today(pool, body.site_key),
+    )
+    if blocked_ip:
+        logger.warning("Blocked IP attempted chat: %s session=%s", client_ip, body.session_id)
+        await queries.insert_security_event(
+            pool,
+            ip_address=client_ip,
+            user_agent=client_ua,
+            session_id=body.session_id,
+            event_type="blocked_ip_access",
+            severity="high",
+            payload=body.message[:500],
+            source="system",
+            action_taken="blocked",
+            blocked=True,
+        )
+        raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
 
     validate_site_request(body.site_key, request.headers.get("origin"), request.headers.get("referer"))
-    pool = await get_pool()
-    if await queries.count_site_messages_today(pool, body.site_key) >= settings.daily_message_cap_per_site:
+    if messages_today >= settings.daily_message_cap_per_site:
         raise HTTPException(status_code=429, detail="Daily site message cap exceeded")
 
     _PROMPT_GUARD_BLOCKED = (
@@ -234,11 +244,22 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
             request_started = time.perf_counter()
             pool = await get_pool()
 
-            # ── Layer 1: Prompt Guard 2 ──
+            # Prompt Guard is remote while policy is a local independent check.
+            # Start the remote work first and evaluate policy while it is in flight.
             logger.info("[%s] Running Prompt Guard...", body.session_id)
-            stage_started = time.perf_counter()
-            safety = await check_prompt_safety(body.message, body.session_id)
-            prompt_guard_ms = (time.perf_counter() - stage_started) * 1000
+            prompt_guard_started = time.perf_counter()
+            prompt_guard_task = asyncio.create_task(
+                check_prompt_safety(body.message, body.session_id)
+            )
+            # Let the remote classifier reach its first await before running
+            # the cheap synchronous policy check in this event-loop thread.
+            await asyncio.sleep(0)
+            logger.info("[%s] Running policy check...", body.session_id)
+            policy_started = time.perf_counter()
+            policy = check_policy(body.message)
+            policy_ms = (time.perf_counter() - policy_started) * 1000
+            safety = await prompt_guard_task
+            prompt_guard_ms = (time.perf_counter() - prompt_guard_started) * 1000
             logger.info(
                 "[%s] Prompt Guard result: safe=%s score=%.4f reason=%s source=%s",
                 body.session_id, safety["safe"], safety["risk_score"],
@@ -272,13 +293,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 yield f"event: token\ndata: {json.dumps({'text': _PROMPT_GUARD_BLOCKED})}\n\n"
                 yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
                 return
-
-
             # ── Layer 2: DegreeBaba Policy ──
-            logger.info("[%s] Running policy check...", body.session_id)
-            stage_started = time.perf_counter()
-            policy = check_policy(body.message)
-            policy_ms = (time.perf_counter() - stage_started) * 1000
             logger.info("[%s] Policy result: passed=%s rule=%s", body.session_id, policy["passed"], policy.get("rule"))
             if not policy["passed"]:
                 logger.warning(
@@ -351,8 +366,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 user_agent=client_ua,
                 request_started_at=request_started,
             ):
-                if event["event"] == "token":
-                    token_count += 1
+                if event["event"] in {"token", "replace"}:
+                    if event["event"] == "token":
+                        token_count += 1
                     if first_sse_event_at is None:
                         first_sse_event_at = time.perf_counter()
                 elif event["event"] == "final":
@@ -402,7 +418,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                 yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
 
         except Exception as exc:  # noqa: BLE001
-            logger.error("event_stream error: %s", exc)
+            logger.exception("event_stream error: %s", exc)
             error_msg = "I'm temporarily unavailable. Please try again in a moment."
             yield f"event: token\ndata: {json.dumps({'text': error_msg})}\n\n"
             yield f"event: final\ndata: {json.dumps({'lead_ask': False, 'quick_replies': []})}\n\n"
@@ -440,6 +456,43 @@ async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[
     if settings.crm_webhook_url:
         async with httpx.AsyncClient(timeout=8) as client:
             await client.post(settings.crm_webhook_url, json=body.model_dump())
+    return {"ok": True}
+
+
+@app.post("/webhook/lead/progressive")
+@limiter.limit("6/minute")
+async def progressive_lead_webhook(
+    request: Request,
+    body: ProgressiveLeadRequest = Body(...),
+) -> dict[str, bool]:
+    """Persist one optional lead field without gating continued chat access."""
+    validate_site_request(
+        body.site_key,
+        request.headers.get("origin"),
+        request.headers.get("referer"),
+    )
+    value = body.value.strip()
+    if body.field == "phone":
+        digits = re.sub(r"\D", "", value)
+        if not 7 <= len(digits) <= 15:
+            raise HTTPException(status_code=422, detail="Enter a valid phone number")
+    elif body.field == "email":
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            raise HTTPException(status_code=422, detail="Enter a valid email address")
+    elif len(value) < 2:
+        raise HTTPException(status_code=422, detail="Enter a valid name")
+
+    pool = await get_pool()
+    try:
+        await queries.ensure_session(pool, body.session_id, body.site_key, None)
+    except queries.SessionSiteMismatchError as exc:
+        raise HTTPException(status_code=403, detail="Session does not belong to this site") from exc
+    await queries.save_progressive_lead_field(
+        pool,
+        body.session_id,
+        body.field,
+        value,
+    )
     return {"ok": True}
 
 

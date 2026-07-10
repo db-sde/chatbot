@@ -22,6 +22,7 @@ Design contract
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -74,6 +75,11 @@ def _fail(reason: str | None, **extra: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {"not_found": True, "reason": reason or "unknown_error"}
     payload.update(extra)
     return payload
+
+
+async def _valid_optional_slug() -> dict[str, Any]:
+    """No-op awaitable used to keep optional validations in one gather call."""
+    return {"is_valid": True, "error": None, "canonical_slug": None}
 
 
 def _clamp_limit(limit: int | None, default: int = DEFAULT_LIMIT, maximum: int = MAX_LIMIT) -> int:
@@ -155,15 +161,22 @@ async def list_courses(
     sort_by: str | None = None,
     order: str = "asc",
     limit: int = DEFAULT_LIMIT,
+    specialization_query: str | None = None,
 ) -> list[dict] | dict:
     try:
         pool = await get_pool()
-        rows = await queries.list_courses(pool, course_type, mode, max_fee, min_naac, sort_by, order, _clamp_limit(limit))
+        rows = await queries.list_courses(
+            pool, course_type, mode, max_fee, min_naac, sort_by, order,
+            _clamp_limit(limit), specialization_query,
+        )
     except Exception:
         logger.exception("list_courses failed (type=%s mode=%s max_fee=%s)", course_type, mode, max_fee)
         return _fail("internal_error")
     if not rows:
-        return _fail("no_matching_courses", course_type=course_type, mode=mode, max_fee=max_fee)
+        return _fail(
+            "no_matching_courses", course_type=course_type, mode=mode,
+            max_fee=max_fee, specialization_query=specialization_query,
+        )
     return rows
 
 
@@ -188,6 +201,24 @@ async def get_faq(entity_type: str, entity_slug: str, query_text: str | None = N
         return _fail("internal_error")
     if not rows:
         return _fail("no_faqs_found", entity_type=entity_type, entity_slug=entity_slug)
+    return rows
+
+
+async def get_reviews(
+    entity_type: str,
+    entity_slug: str,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict] | dict:
+    try:
+        pool = await get_pool()
+        rows = await queries.get_reviews(
+            pool, entity_type, entity_slug, limit=_clamp_limit(limit, maximum=10)
+        )
+    except Exception:
+        logger.exception("get_reviews failed (type=%s slug=%s)", entity_type, entity_slug)
+        return _fail("internal_error")
+    if not rows:
+        return _fail("no_reviews_found", entity_type=entity_type, entity_slug=entity_slug)
     return rows
 
 
@@ -332,20 +363,21 @@ async def get_fee_tool(university_slug: str, course_slug: str | None = None, spe
     Use ONLY for cost/fee/price questions.
     Do NOT use this to list programs (use get_university_programs_tool) or to check
     eligibility (use get_eligibility_tool)."""
-    v = await validate_university_slug(university_slug)
+    validations = await asyncio.gather(
+        validate_university_slug(university_slug),
+        validate_course_slug(course_slug) if course_slug else _valid_optional_slug(),
+        validate_specialization_slug(specialization_slug) if specialization_slug else _valid_optional_slug(),
+    )
+    v, vc, vs = validations
     if not v["is_valid"]:
         return _fail(v["error"], university_slug=university_slug)
     university_slug = v.get("canonical_slug") or university_slug
 
-    if course_slug:
-        vc = await validate_course_slug(course_slug)
-        if not vc["is_valid"]:
-            return _fail(vc["error"], course_slug=course_slug)
+    if course_slug and not vc["is_valid"]:
+        return _fail(vc["error"], course_slug=course_slug)
 
-    if specialization_slug:
-        vs = await validate_specialization_slug(specialization_slug)
-        if not vs["is_valid"]:
-            return _fail(vs["error"], specialization_slug=specialization_slug)
+    if specialization_slug and not vs["is_valid"]:
+        return _fail(vs["error"], specialization_slug=specialization_slug)
 
     return await get_fee(university_slug, course_slug, specialization_slug)
 
@@ -356,12 +388,14 @@ async def get_eligibility_tool(university_slug: str, course_slug: str) -> dict:
     """Return eligibility criteria for a specific course at a specific university.
     Use ONLY for eligibility / admission-criteria questions.
     Do NOT use this for fee questions — use get_fee_tool instead."""
-    v = await validate_university_slug(university_slug)
+    v, vc = await asyncio.gather(
+        validate_university_slug(university_slug),
+        validate_course_slug(course_slug),
+    )
     if not v["is_valid"]:
         return _fail(v["error"], university_slug=university_slug)
     university_slug = v.get("canonical_slug") or university_slug
 
-    vc = await validate_course_slug(course_slug)
     if not vc["is_valid"]:
         return _fail(vc["error"], course_slug=course_slug)
 
@@ -405,12 +439,14 @@ async def get_program_details_tool(course_slug: str, university_slug: str | None
     for ONE specific, already-known course.
     Use for 'tell me about X's Y program' questions.
     Do NOT use this for fee-only questions — use get_fee_tool for a faster, focused answer."""
-    vc = await validate_course_slug(course_slug)
+    vc, vu = await asyncio.gather(
+        validate_course_slug(course_slug),
+        validate_university_slug(university_slug) if university_slug else _valid_optional_slug(),
+    )
     if not vc["is_valid"]:
         return _fail(vc["error"], course_slug=course_slug)
 
     if university_slug:
-        vu = await validate_university_slug(university_slug)
         if not vu["is_valid"]:
             return _fail(vu["error"], university_slug=university_slug)
         university_slug = vu.get("canonical_slug") or university_slug
@@ -424,12 +460,14 @@ async def get_specializations_tool(course_slug: str, university_slug: str | None
     """List all specializations available under ONE specific, already-known course
     (e.g. all MBA specializations at NMIMS).
     Use for 'what specializations does X offer' questions."""
-    vc = await validate_course_slug(course_slug)
+    vc, vu = await asyncio.gather(
+        validate_course_slug(course_slug),
+        validate_university_slug(university_slug) if university_slug else _valid_optional_slug(),
+    )
     if not vc["is_valid"]:
         return _fail(vc["error"], course_slug=course_slug)
 
     if university_slug:
-        vu = await validate_university_slug(university_slug)
         if not vu["is_valid"]:
             return _fail(vu["error"], university_slug=university_slug)
         university_slug = vu.get("canonical_slug") or university_slug
@@ -447,13 +485,17 @@ async def list_courses_tool(
     sort_by: str | None = None,
     order: str = "asc",
     limit: int = DEFAULT_LIMIT,
+    specialization_query: str | None = None,
 ) -> list[dict] | dict:
     """Search and filter courses ACROSS THE WHOLE CATALOG — e.g. 'top 5 cheapest
     online MBAs', 'MBA programs under 2 lakh with NAAC A+'.
     Use for filtered / ranked / aggregate questions spanning multiple universities.
     Do NOT use this to list one already-known university's programs —
     use get_university_programs_tool for that instead."""
-    return await list_courses(course_type, mode, max_fee, min_naac, sort_by, order, limit)
+    return await list_courses(
+        course_type, mode, max_fee, min_naac, sort_by, order, limit,
+        specialization_query,
+    )
 
 
 @tool
@@ -554,6 +596,31 @@ async def get_faq_tool(entity_type: str, entity_slug: str, query_text: str | Non
     return await get_faq(entity_type, entity_slug, query_text)
 
 
+@tool
+@timed_tool_execution
+async def get_reviews_tool(
+    entity_type: str,
+    entity_slug: str,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict] | dict:
+    """Return catalog reviews for one known university, course, or specialization.
+    Use only for ratings/reviews questions. Do not infer a numeric rating when the
+    catalog provides review text without a score."""
+    vt = await validate_entity_type(entity_type)
+    if not vt["is_valid"]:
+        return _fail(vt["error"], entity_type=entity_type)
+    validator = {
+        "university": validate_university_slug,
+        "course": validate_course_slug,
+        "specialization": validate_specialization_slug,
+    }[entity_type]
+    validated = await validator(entity_slug)
+    if not validated["is_valid"]:
+        return _fail(validated["error"], entity_type=entity_type, entity_slug=entity_slug)
+    canonical = validated.get("canonical_slug") or entity_slug
+    return await get_reviews(entity_type, canonical, limit=limit)
+
+
 # ---------------------------------------------------------------------------
 # Agent-exposed tool list
 # ---------------------------------------------------------------------------
@@ -570,4 +637,5 @@ TOOLS = [
     compare_entities_tool,
     compare_programs_tool,
     get_faq_tool,
+    get_reviews_tool,
 ]

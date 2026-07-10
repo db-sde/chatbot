@@ -258,6 +258,346 @@ async def test_graph_guardrail_blocks_offtopic():
 
 
 @pytest.mark.asyncio
+async def test_entity_not_found_is_scripted_without_llm(monkeypatch):
+    """Unknown catalog entities get a deterministic gap response and same-turn lead ask."""
+    import agent.graph as graph_mod
+
+    model = MagicMock()
+    model.ainvoke = AsyncMock(side_effect=AssertionError("LLM must not run"))
+    monkeypatch.setattr(
+        graph_mod,
+        "llm_client",
+        SimpleNamespace(enabled=True, chat_model=model),
+    )
+
+    result = await graph_mod.node_agent({
+        "messages": [],
+        "resolved": {
+            "resolution_status": "entity_not_found",
+            "requested_entity": "FakeUniversity",
+        },
+    })
+
+    assert result["lead_ask"] is True
+    assert result["lead_ask_triggered_by"] == "No Answer Available"
+    assert "FakeUniversity" in result["reply"]
+    model.ainvoke.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolved_program_overview_names_actual_catalog_match(monkeypatch):
+    import agent.graph as graph_mod
+
+    program_lookup = AsyncMock(return_value={
+        "slug": "executive-mba-nmims-online",
+        "program_name": "Executive MBA",
+        "university_slug": "nmims-online",
+        "university_name": "NMIMS Online",
+        "duration": "15 Months",
+        "mode": "Online",
+        "total_fee": 392000,
+        "eligibility_summary": "Graduation with required work experience.",
+    })
+    model = MagicMock()
+    model.ainvoke = AsyncMock(side_effect=AssertionError("LLM planner must not run"))
+    monkeypatch.setattr(graph_mod.queries, "get_program_details", program_lookup)
+    monkeypatch.setattr(
+        graph_mod,
+        "llm_client",
+        SimpleNamespace(enabled=True, chat_model=model),
+    )
+
+    result = await graph_mod.node_agent({
+        "raw_message": "Tell me about nmims online mba",
+        "tool_ms_total": 0.0,
+        "resolved": {
+            "resolution_status": "resolved",
+            "university_slug": "nmims-online",
+            "course_slug": "executive-mba-nmims-online",
+            "raw": {"course_query": "mba"},
+        },
+    })
+
+    assert "catalog record for **MBA** is **Executive MBA**" in result["reply"]
+    assert "15 Months" in result["reply"]
+    assert "₹392,000" in result["reply"]
+    model.ainvoke.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_graph_forwards_model_chunks_before_final(monkeypatch):
+    from langchain_core.messages import AIMessage, AIMessageChunk
+    import agent.graph as graph_mod
+
+    class StreamingGraph:
+        async def astream_events(self, _state, version):
+            assert version == "v2"
+            for text in ("First ", "chunk"):
+                yield {
+                    "event": "on_chat_model_stream",
+                    "name": "agent",
+                    "metadata": {"langgraph_node": "agent"},
+                    "data": {"chunk": AIMessageChunk(content=text)},
+                }
+            yield {
+                "event": "on_chain_end",
+                "name": "LangGraph",
+                "data": {"output": {"messages": [AIMessage(content="First chunk")]}},
+            }
+
+        async def ainvoke(self, _state):
+            raise AssertionError("streaming final state must avoid fallback invocation")
+
+    monkeypatch.setattr(graph_mod, "_graph", StreamingGraph())
+    events = [event async for event in graph_mod.run_chat_turn(
+        session_id="33333333-3333-4333-8333-333333333333",
+        site_id="test",
+        message="Tell me about NMIMS",
+        page_university_slug="nmims",
+    )]
+
+    assert [event["data"]["text"] for event in events if event["event"] == "token"] == [
+        "First ", "chunk"
+    ]
+    assert events[-1]["event"] == "final"
+
+
+@pytest.mark.asyncio
+async def test_pre_graph_session_reads_start_concurrently(monkeypatch):
+    import asyncio
+    from langchain_core.messages import AIMessage
+    import agent.graph as graph_mod
+
+    starts = {}
+
+    async def delayed(name, result):
+        starts[name] = time.perf_counter()
+        await asyncio.sleep(0.02)
+        return result
+
+    async def ensure(*_args, **_kwargs):
+        return await delayed("ensure", None)
+
+    async def history(*_args, **_kwargs):
+        return await delayed("history", {"messages": []})
+
+    async def context(*_args, **_kwargs):
+        return await delayed("context", {})
+
+    class FinalGraph:
+        async def astream_events(self, _state, version):
+            yield {
+                "event": "on_chain_end",
+                "name": "LangGraph",
+                "data": {"output": {"messages": [AIMessage(content="Done")] }},
+            }
+
+    monkeypatch.setattr(graph_mod.queries, "ensure_session", ensure)
+    monkeypatch.setattr(graph_mod.queries, "get_session_history", history)
+    monkeypatch.setattr(graph_mod.queries, "get_session_context", context)
+    monkeypatch.setattr(graph_mod, "_graph", FinalGraph())
+
+    _ = [event async for event in graph_mod.run_chat_turn(
+        session_id="34343434-3434-4434-8434-343434343434",
+        site_id="test",
+        message="Tell me about NMIMS",
+        page_university_slug="nmims",
+    )]
+
+    assert set(starts) == {"ensure", "history", "context"}
+    assert max(starts.values()) - min(starts.values()) < 0.01
+
+
+@pytest.mark.asyncio
+async def test_graph_emits_replace_when_final_output_scan_rejects_stream(monkeypatch):
+    from langchain_core.messages import AIMessage, AIMessageChunk
+    import agent.graph as graph_mod
+
+    class UnsafeStreamingGraph:
+        async def astream_events(self, _state, version):
+            yield {
+                "event": "on_chat_model_stream",
+                "name": "agent",
+                "metadata": {"langgraph_node": "agent"},
+                "data": {"chunk": AIMessageChunk(content="Initially safe. ")},
+            }
+            yield {
+                "event": "on_chat_model_stream",
+                "name": "agent",
+                "metadata": {"langgraph_node": "agent"},
+                "data": {"chunk": AIMessageChunk(content="My system prompt is secret.")},
+            }
+            yield {
+                "event": "on_chain_end",
+                "name": "LangGraph",
+                "data": {"output": {"messages": [AIMessage(content="Initially safe. My system prompt is secret.")]}},
+            }
+
+    monkeypatch.setattr(graph_mod, "_graph", UnsafeStreamingGraph())
+    events = [event async for event in graph_mod.run_chat_turn(
+        session_id="44444444-4444-4444-8444-444444444444",
+        site_id="test",
+        message="Tell me about NMIMS",
+        page_university_slug="nmims",
+    )]
+
+    replacements = [event for event in events if event["event"] == "replace"]
+    assert replacements
+    assert "system prompt" not in replacements[-1]["data"]["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_fast_greeting_skips_history_and_context(monkeypatch):
+    import agent.graph as graph_mod
+
+    async def unexpected(*_args, **_kwargs):
+        raise AssertionError("fast path must skip conversational DB reads")
+
+    ensure = AsyncMock()
+    insert = AsyncMock()
+    monkeypatch.setattr(graph_mod.queries, "get_session_history", unexpected)
+    monkeypatch.setattr(graph_mod.queries, "get_session_context", unexpected)
+    monkeypatch.setattr(graph_mod.queries, "ensure_session", ensure)
+    monkeypatch.setattr(graph_mod.queries, "insert_message", insert)
+
+    events = [event async for event in graph_mod.run_chat_turn(
+        session_id="55555555-5555-4555-8555-555555555555",
+        site_id="test",
+        message="Hi",
+        page_university_slug=None,
+    )]
+
+    assert [event["event"] for event in events] == ["token", "final"]
+    assert events[-1]["data"]["metrics"]["timing_tree"]["fast_path"] is True
+    assert ensure.await_count == 1
+    assert insert.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_same_session_turns_are_serialized(monkeypatch):
+    import asyncio
+    import agent.graph as graph_mod
+
+    active = 0
+    maximum_active = 0
+
+    async def fake_turn(**_kwargs):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        yield {"event": "final", "data": {}}
+        active -= 1
+
+    monkeypatch.setattr(graph_mod, "_run_chat_turn_unlocked", fake_turn)
+
+    async def consume():
+        return [event async for event in graph_mod.run_chat_turn(
+            session_id="66666666-6666-4666-8666-666666666666",
+            site_id="test",
+            message="fees",
+            page_university_slug=None,
+        )]
+
+    await asyncio.gather(consume(), consume())
+    assert maximum_active == 1
+    assert "66666666-6666-4666-8666-666666666666" not in graph_mod._SESSION_LOCKS
+
+
+@pytest.mark.asyncio
+async def test_ready_qualification_uses_filtered_catalog_results(monkeypatch):
+    import agent.graph as graph_mod
+
+    lookup = AsyncMock(return_value=[{
+        "slug": "online-mba",
+        "program_name": "Online MBA",
+        "university_name": "NMIMS",
+        "total_fee": 180000,
+        "mode": "Online",
+    }])
+    monkeypatch.setattr(graph_mod, "list_courses_catalog", lookup)
+    profile = {
+        "qualification": {
+            "status": "ready",
+            "course_type": "mba",
+            "mode": "online",
+            "max_fee": 200000,
+            "specialization": "finance",
+            "specialization_answered": True,
+            "awaiting": None,
+        }
+    }
+
+    result = await graph_mod.node_agent({
+        "messages": [],
+        "context": {},
+        "resolved": {
+            "resolution_status": "subjective_recommendation",
+            "qualification": profile["qualification"],
+            "profile_context_update": profile,
+        },
+    })
+
+    assert "NMIMS" in result["reply"]
+    assert result["progressive_lead_field"] == "email"
+    assert result["profile_context_update"]["qualification"]["status"] == "complete"
+    lookup.assert_awaited_once_with(
+        course_type="mba",
+        mode="online",
+        max_fee=200000,
+        sort_by="fee",
+        order="asc",
+        limit=3,
+        specialization_query="finance",
+    )
+
+
+def test_progressive_lead_prompt_is_one_field_every_two_turns():
+    import agent.graph as graph_mod
+
+    field, profile, counter = graph_mod._plan_progressive_lead_field({}, {})
+    assert field is None
+    assert counter == 1
+
+    field, profile, counter = graph_mod._plan_progressive_lead_field(
+        {"factual_turns_since_profile_ask": counter}, profile
+    )
+    assert field == "name"
+    assert counter == 0
+    assert profile["lead_asked_fields"] == ["name"]
+
+    field, profile, counter = graph_mod._plan_progressive_lead_field(
+        {"factual_turns_since_profile_ask": 1}, profile
+    )
+    assert field == "phone"
+    assert counter == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_limit_gap_response_is_scripted_without_llm(monkeypatch):
+    import agent.graph as graph_mod
+
+    model = MagicMock()
+    model.ainvoke = AsyncMock(side_effect=AssertionError("LLM must not run"))
+    monkeypatch.setattr(
+        graph_mod,
+        "llm_client",
+        SimpleNamespace(enabled=True, chat_model=model),
+    )
+
+    result = await graph_mod.node_agent({
+        "messages": [],
+        "resolved": {"resolution_status": "resolved"},
+        "tool_call_limit_reached": True,
+        "tool_batch_completed": False,
+    })
+
+    assert result["lead_ask"] is True
+    assert "tool limit" in result["reply"]
+    model.ainvoke.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_graph_state_carries_resolved_slugs(patch_llm, monkeypatch):
     """
     resolve_entities should populate resolved slugs and update_session_context

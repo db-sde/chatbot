@@ -33,9 +33,10 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from security.output_scan import scan_output
+from agent.constants import quick_replies_for
 from agent.llm_client import SYSTEM_PROMPT, llm_client
-from agent.resolve import resolve_entities as _resolve_entities
-from agent.tools import TOOLS, log_anonymous_signal, log_unanswered
+from agent.resolve import is_greeting, resolve_entities as _resolve_entities
+from agent.tools import TOOLS, list_courses as list_courses_catalog, log_anonymous_signal, log_unanswered
 from db import queries
 from db.pool import get_pool
 from observability import (
@@ -53,6 +54,7 @@ logger = logging.getLogger(__name__)
 # asyncio keeps only weak references to scheduled tasks. Retain active
 # analytics tasks until completion so they cannot disappear mid-execution.
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+_SESSION_LOCKS: dict[str, dict[str, Any]] = {}
 
 from leads.scoring import (
     classify_score_events,
@@ -98,6 +100,8 @@ class ChatState(TypedDict, total=False):
     resolver_ms: float
     llm_ms_total: float
     tool_ms_total: float
+    profile_context_update: dict[str, Any]
+    progressive_lead_field: str
 
 
 def _make_state(
@@ -143,6 +147,17 @@ CONTACT_REPLY = (
     "I'd be happy to connect you with an admission counsellor. "
     "Please share your contact details."
 )
+
+
+def _is_program_overview_request(message: str) -> bool:
+    text = message.lower()
+    return any(
+        phrase in text
+        for phrase in ("tell me about", "details about", "overview of", "information about")
+    ) and not any(
+        term in text
+        for term in ("fee", "cost", "eligib", "specialization", "review", "rating", "accredit")
+    )
 
 
 async def node_triage(state: ChatState) -> dict[str, Any]:
@@ -260,7 +275,7 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
     # when the user switches university (NMIMS → Sharda).
     pool = await get_pool()
     if resolution_status == "resolved" and resolved.get("university_slug"):
-        await queries.update_session_context(
+        context_update = queries.update_session_context(
             pool,
             session_id,
             resolved.get("university_slug"),
@@ -268,6 +283,18 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
             resolved.get("specialization_slug"),
             replace_dependents=True,
         )
+        if resolved.get("course_slug") and _is_program_overview_request(message):
+            _, prefetched_program = await asyncio.gather(
+                context_update,
+                queries.get_program_details(
+                    pool,
+                    resolved["course_slug"],
+                    resolved["university_slug"],
+                ),
+            )
+            resolved["_program_details"] = prefetched_program
+        else:
+            await context_update
         logger.info(
             "[%s] SESSION CONTEXT UPDATED | uni=%s course=%s spec=%s",
             session_id,
@@ -322,7 +349,10 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
         "entity_not_found", "partial_match", "none", "contact",
     )
     resolved["_page_hint_only"] = page_hint_only
-    return {"resolved": resolved, "resolver_ms": resolver_ms}
+    result: dict[str, Any] = {"resolved": resolved, "resolver_ms": resolver_ms}
+    if resolved.get("profile_context_update") is not None:
+        result["profile_context_update"] = resolved["profile_context_update"]
+    return result
 
 
 def _clean_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -354,11 +384,184 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
     The main ReAct Agent. Handles both tool calling AND final response synthesis.
     This replaces the old agent_decide + synthesize_reply nodes.
     """
+    resolved = state.get("resolved", {})
+    resolution_status = resolved.get("resolution_status", "none")
+
+    raw_message = state.get("raw_message", "")
+    overview_request = _is_program_overview_request(raw_message)
+    if (
+        resolution_status == "resolved"
+        and resolved.get("course_slug")
+        and resolved.get("university_slug")
+        and overview_request
+    ):
+        program = resolved.get("_program_details")
+        lookup_ms = 0.0
+        if program is None:
+            pool = await get_pool()
+            started = time.perf_counter()
+            program = await queries.get_program_details(
+                pool,
+                resolved["course_slug"],
+                resolved["university_slug"],
+            )
+            lookup_ms = (time.perf_counter() - started) * 1000
+        if program:
+            requested_course = (resolved.get("raw") or {}).get("course_query")
+            program_name = program.get("program_name") or program.get("slug")
+            university_name = program.get("university_name") or resolved["university_slug"]
+            if requested_course and requested_course.casefold() != program_name.casefold():
+                intro = (
+                    f"The matching {university_name} catalog record for "
+                    f"**{requested_course.upper()}** is **{program_name}**:"
+                )
+            else:
+                intro = f"The matching catalog program is **{program_name}** at **{university_name}**:"
+
+            total_fee = program.get("total_fee")
+            fee_text = f"₹{float(total_fee):,.0f}" if total_fee is not None else "Not listed"
+            bullets = [
+                f"- **Program:** {program_name}",
+                f"- **Duration:** {program.get('duration') or 'Not listed'}",
+                f"- **Mode:** {program.get('mode') or 'Not listed'}",
+                f"- **Total fee:** {fee_text}",
+            ]
+            if program.get("eligibility_summary"):
+                bullets.append(f"- **Eligibility:** {program['eligibility_summary']}")
+            reply = (
+                intro + "\n" + "\n".join(bullets[:5])
+                + "\n\nWould you like to check eligibility next?"
+            )
+            return {
+                "messages": [AIMessage(content=reply)],
+                "reply": reply,
+                "tool_ms_total": state.get("tool_ms_total", 0.0) + lookup_ms,
+            }
+
+    if resolution_status == "subjective_recommendation":
+        qualification = dict(resolved.get("qualification") or {})
+        profile_context = dict(resolved.get("profile_context_update") or {})
+        awaiting = qualification.get("awaiting")
+        if awaiting == "budget":
+            reply = (
+                "To narrow this down using the catalog, what is your maximum total "
+                "program budget (for example, ₹2 lakh)?"
+            )
+        elif awaiting == "mode":
+            reply = "Which study mode do you prefer: online or distance?"
+        elif awaiting == "specialization":
+            reply = (
+                "Which specialization interests you most (for example, finance, marketing, "
+                "or analytics)? You can also say ‘no preference’."
+            )
+        else:
+            matches = await list_courses_catalog(
+                course_type=qualification.get("course_type"),
+                mode=qualification.get("mode"),
+                max_fee=qualification.get("max_fee"),
+                sort_by="fee",
+                order="asc",
+                limit=3,
+                specialization_query=qualification.get("specialization"),
+            )
+            if not isinstance(matches, list) or not matches:
+                reply = (
+                    "I couldn't find a verified catalog match for all of those preferences. "
+                    "I can broaden the budget or specialization, or optionally connect you "
+                    "with a counsellor."
+                )
+                return {
+                    "messages": [AIMessage(content=reply)],
+                    "reply": reply,
+                    "lead_ask": True,
+                    "lead_ask_triggered_by": "No Answer Available",
+                    "profile_context_update": profile_context,
+                }
+
+            bullets = []
+            for row in matches:
+                fee = row.get("total_fee")
+                fee_text = f"₹{float(fee):,.0f}" if fee is not None else "fee not listed"
+                bullets.append(
+                    f"- **{row.get('program_name') or row.get('slug')}:** "
+                    f"{row.get('university_name') or row.get('university_slug')} · {fee_text} · "
+                    f"{row.get('mode') or qualification.get('mode')}"
+                )
+            offer_email = not state.get("context", {}).get("has_lead") and not (
+                (profile_context.get("lead") or {}).get("email")
+            )
+            reply = (
+                "I've found verified programs matching the filters you shared:\n"
+                + "\n".join(bullets)
+                + (
+                    "\n\nWould you like to optionally share your email so you can keep these options?"
+                    if offer_email else ""
+                )
+            )
+            qualification["status"] = "complete"
+            profile_context["qualification"] = qualification
+            result = {
+                "messages": [AIMessage(content=reply)],
+                "reply": reply,
+                "profile_context_update": profile_context,
+            }
+            if offer_email:
+                result["progressive_lead_field"] = "email"
+            return result
+
+        return {
+            "messages": [AIMessage(content=reply)],
+            "reply": reply,
+            "profile_context_update": profile_context,
+        }
+
+    # Unknown/partial catalog entities are a deterministic gap, not a prompt
+    # for open-ended synthesis. Never give the model room to invent specifics.
+    if resolution_status == "entity_not_found":
+        requested = resolved.get("requested_entity") or "that university"
+        reply = (
+            f"I don't currently have verified information for {requested} in DegreeBaba's catalog. "
+            "I can still help with available universities, fees, eligibility, accreditations, "
+            "specializations, or connect you with a counsellor."
+        )
+        return {
+            "messages": [AIMessage(content=reply)],
+            "reply": reply,
+            "lead_ask": True,
+            "lead_ask_triggered_by": "No Answer Available",
+        }
+    if resolution_status == "partial_match":
+        found = ", ".join(resolved.get("comparison_found") or []) or "none"
+        missing = ", ".join(resolved.get("comparison_missing") or []) or "one requested university"
+        reply = (
+            f"I found {found}, but I couldn't verify {missing} in DegreeBaba's catalog, "
+            "so I can't make a reliable comparison yet. Please clarify the name, or optionally "
+            "ask me to connect you with a counsellor."
+        )
+        return {
+            "messages": [AIMessage(content=reply)],
+            "reply": reply,
+            "lead_ask": True,
+            "lead_ask_triggered_by": "No Answer Available",
+        }
+
+    if state.get("tool_call_limit_reached") and not state.get("tool_batch_completed"):
+        reply = (
+            "I couldn't complete a verified lookup within this turn's tool limit. "
+            "I can try a narrower fee, eligibility, accreditation, review, or program question, "
+            "or optionally connect you with a counsellor."
+        )
+        return {
+            "messages": [AIMessage(content=reply)],
+            "reply": reply,
+            "lead_ask": True,
+            "lead_ask_triggered_by": "No Answer Available",
+        }
+
     if not llm_client.enabled:
         return {"messages": [AIMessage(content="I can help with DegreeBaba course fees, eligibility, and admissions.")]}
 
     messages = list(state["messages"])
-    resolved = state.get("resolved", {})
     page_ctx = state.get("page_context", {})
 
     # ── Page context note (from URL pathname, human-readable names) ────────
@@ -386,7 +589,6 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
 
     # ── Resolved entity slugs note (from fuzzy entity resolution) ─────────
     page_hint_only = resolved.get("_page_hint_only", False)
-    resolution_status = resolved.get("resolution_status", "none")
     context_parts = []
     if not page_hint_only:
         comp_targets = resolved.get("comparison_targets", [])
@@ -753,6 +955,76 @@ def _create_background_task(awaitable: Awaitable[Any], *, name: str) -> asyncio.
     return task
 
 
+async def _persist_fast_path(
+    *,
+    session_id: str,
+    site_id: str,
+    message: str,
+    reply: str,
+    page_university_slug: str | None,
+    ip_address: str | None,
+    user_agent: str | None,
+) -> None:
+    """Persist a deterministic reply in order without delaying first paint."""
+    pool = await get_pool()
+    await queries.ensure_session(
+        pool, session_id, site_id, page_university_slug, ip_address, user_agent
+    )
+    await queries.insert_message(pool, session_id, "user", message)
+    await queries.insert_message(pool, session_id, "assistant", reply)
+
+
+def _plan_progressive_lead_field(
+    context: dict[str, Any],
+    profile_context: dict[str, Any],
+    *,
+    forced_field: str | None = None,
+) -> tuple[str | None, dict[str, Any], int]:
+    """Advance the optional one-field lead cadence for a successful factual turn."""
+    profile = dict(profile_context)
+    lead_profile = dict(profile.get("lead") or {})
+    asked_fields = list(profile.get("lead_asked_fields") or [])
+    counter = int(context.get("factual_turns_since_profile_ask") or 0)
+
+    if context.get("has_lead"):
+        return None, profile, counter
+
+    if forced_field and not lead_profile.get(forced_field):
+        if forced_field not in asked_fields:
+            asked_fields.append(forced_field)
+        profile["lead_asked_fields"] = asked_fields
+        return forced_field, profile, 0
+
+    counter += 1
+    if counter < 2:
+        return None, profile, counter
+
+    next_field = next(
+        (
+            field for field in ("name", "phone", "email")
+            if not lead_profile.get(field) and field not in asked_fields
+        ),
+        None,
+    )
+    if next_field is None:
+        missing_fields = [
+            field for field in ("name", "phone", "email")
+            if not lead_profile.get(field)
+        ]
+        if missing_fields:
+            # A skipped field may be offered again only after the complete
+            # sequence and another full cadence interval, never immediately.
+            next_field = missing_fields[0]
+            asked_fields = [
+                field for field in asked_fields if lead_profile.get(field)
+            ]
+    if next_field:
+        asked_fields.append(next_field)
+        profile["lead_asked_fields"] = asked_fields
+        return next_field, profile, 0
+    return None, profile, 0
+
+
 def _schedule_anonymous_signal(
     session_id: str,
     university_slug: str | None,
@@ -849,7 +1121,7 @@ def _build_tool_calls_log(messages: list[BaseMessage]) -> list[dict[str, Any]]:
                 tool_calls_log.append(entry)
     return tool_calls_log
 
-async def run_chat_turn(
+async def _run_chat_turn_unlocked(
     session_id: str,
     site_id: str,
     message: str,
@@ -862,17 +1134,74 @@ async def run_chat_turn(
     
     init_observability_context()
 
+    # Hardcoded local paths do not need conversation history or resolver state.
+    # Persistence runs concurrently after control is yielded to the SSE caller.
+    greeting = is_greeting(message)
+    contact = is_contact_intent(message)
+    if greeting or contact:
+        reply = CONTACT_REPLY if contact else (
+            "Hello! I'm the DegreeBaba assistant. How can I help you with "
+            "universities, courses, fees, or admissions today?"
+        )
+        persistence_task = _create_background_task(
+            _persist_fast_path(
+                session_id=session_id,
+                site_id=site_id,
+                message=message,
+                reply=reply,
+                page_university_slug=page_university_slug,
+                ip_address=ip_address,
+                user_agent=user_agent,
+            ),
+            name="fast-path-persistence",
+        )
+        mark_first_token()
+        yield {"event": "token", "data": {"text": reply}}
+        yield {
+            "event": "final",
+            "data": {
+                "lead_ask": contact,
+                "quick_replies": quick_replies_for(message),
+                "metrics": {
+                    "response_time_ms": 0,
+                    "ttft_ms": 0,
+                    "first_sse_event_ms": 0,
+                    "agent_ttft_ms": 0,
+                    "llm_duration_ms": 0,
+                    "tool_execution_time_ms": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_cost_usd": 0.0,
+                    "model_name": None,
+                    "timing_tree": {"fast_path": True},
+                },
+            },
+        }
+        # Keep the session lock until ordered persistence has completed, while
+        # the user has already received both SSE events.
+        await persistence_task
+        return
+
     t_stage = time.perf_counter()
     pool = await get_pool()
     pool_ms = (time.perf_counter() - t_stage) * 1000
 
-    t_stage = time.perf_counter()
-    await queries.ensure_session(pool, session_id, site_id, page_university_slug, ip_address, user_agent)
-    ensure_session_ms = (time.perf_counter() - t_stage) * 1000
+    async def _timed(coro):
+        started = time.perf_counter()
+        value = await coro
+        return value, (time.perf_counter() - started) * 1000
 
-    t_stage = time.perf_counter()
-    history_result = await queries.get_session_history(pool, session_id, limit=settings.max_conversation_messages)
-    history_ms = (time.perf_counter() - t_stage) * 1000
+    pre_graph_started = time.perf_counter()
+    (__, ensure_session_ms), (history_result, history_ms), (context, session_context_ms) = await asyncio.gather(
+        _timed(queries.ensure_session(
+            pool, session_id, site_id, page_university_slug, ip_address, user_agent
+        )),
+        _timed(queries.get_session_history(
+            pool, session_id, limit=settings.max_conversation_messages
+        )),
+        _timed(queries.get_session_context(pool, session_id)),
+    )
     history_messages: list[BaseMessage] = []
     for msg in history_result.get("messages", []):
         role = msg.get("role")
@@ -882,13 +1211,15 @@ async def run_chat_turn(
         elif role == "assistant" and content:
             history_messages.append(AIMessage(content=content))
 
-    t_stage = time.perf_counter()
-    await queries.insert_message(pool, session_id, "user", message)
-    persist_user_message_ms = (time.perf_counter() - t_stage) * 1000
+    async def _persist_user_message() -> float:
+        started = time.perf_counter()
+        await queries.insert_message(pool, session_id, "user", message)
+        return (time.perf_counter() - started) * 1000
 
-    t_stage = time.perf_counter()
-    context = await queries.get_session_context(pool, session_id)
-    session_context_ms = (time.perf_counter() - t_stage) * 1000
+    user_persist_task = _create_background_task(
+        _persist_user_message(), name="user-message-persistence"
+    )
+    pre_graph_setup_wall_ms = (time.perf_counter() - pre_graph_started) * 1000
 
     initial_state = _make_state(
         session_id=session_id,
@@ -903,6 +1234,10 @@ async def run_chat_turn(
     reply_text = ""
     final_state = None
     first_sse_event_at: float | None = None
+    streamed_any = False
+    stream_replaced = False
+    output_scan_incident: dict[str, Any] | None = None
+    unsafe_reply_text: str | None = None
 
     def mark_first_sse_event() -> None:
         nonlocal first_sse_event_at
@@ -910,22 +1245,36 @@ async def run_chat_turn(
             first_sse_event_at = time.perf_counter()
             mark_first_token()
     
-    # This observes graph events. node_agent currently uses model.ainvoke(), so
-    # user-visible token events occur only if a node itself uses a streaming
-    # model call; otherwise the first token is emitted from the buffered reply
-    # after graph completion below.
+    # LangGraph exposes provider chunks even though node_agent calls ainvoke().
+    # Scan a trailing window before each chunk is emitted; a final full scan
+    # below can still retract/replace the accumulated response.
     graph_stream_started = time.perf_counter()
     async for event in _graph.astream_events(initial_state, version="v2"):
         event_kind = event["event"]
         
-        # Buffer model chunks. Output security scanning must inspect the full
-        # response before any generated text is emitted to the client.
+        # Forward clean model chunks immediately for real TTFT.
         if event_kind == "on_chat_model_stream":
             chunk = event["data"]["chunk"]
             if isinstance(chunk, AIMessage) and chunk.content:
                 node_name = event.get("metadata", {}).get("langgraph_node")
                 if node_name in ("agent", "chitchat_reply"):
-                    reply_text += chunk.content
+                    chunk_text = str(chunk.content)
+                    reply_text += chunk_text
+                    if not stream_replaced:
+                        incremental_scan = scan_output(reply_text[-1000:])
+                        if incremental_scan["clean"]:
+                            mark_first_sse_event()
+                            streamed_any = True
+                            yield {"event": "token", "data": {"text": chunk_text}}
+                        else:
+                            output_scan_incident = incremental_scan
+                            unsafe_reply_text = reply_text
+                            stream_replaced = True
+                            mark_first_sse_event()
+                            yield {
+                                "event": "replace",
+                                "data": {"text": incremental_scan["safe_reply"]},
+                            }
                     
         # Capture the final state updates
         if event_kind == "on_chain_end" and event["name"] == "LangGraph":
@@ -980,6 +1329,8 @@ async def run_chat_turn(
                 "DegreeBaba team can fill the gap. Feel free to ask about fees, "
                 "eligibility, or available programs."
             )
+            lead_ask = True
+            lead_ask_triggered_by = "No Answer Available"
 
     # BACKGROUND LEAD SCORING (analytics only — does not control this turn's lead_ask)
     _create_background_task(
@@ -987,23 +1338,37 @@ async def run_chat_turn(
         name="lead-scoring",
     )
 
-    # Output security scan
+    # Final full-response scan. If streaming already began, replace the bubble
+    # rather than pretending the earlier chunks were never delivered.
     scan = scan_output(reply_text)
     if not scan["clean"]:
+        output_scan_incident = scan
+        unsafe_reply_text = reply_text
         logger.warning("Output scan blocked response (reason=%s) for session=%s", scan["reason"], session_id)
+        reply_text = scan["safe_reply"]
+        if streamed_any and not stream_replaced:
+            stream_replaced = True
+            yield {"event": "replace", "data": {"text": reply_text}}
+
+    if output_scan_incident:
         await queries.insert_flagged_message(
             pool,
             session_id,
-            reply_text[:500],
-            layer=f"output_scan:{scan['reason']}",
+            (unsafe_reply_text or reply_text)[:500],
+            layer=f"output_scan:{output_scan_incident['reason']}",
             risk_score=1.0,
-            reason=scan["reason"] or "output_scan",
+            reason=output_scan_incident["reason"] or "output_scan",
         )
-        reply_text = scan["safe_reply"]
 
-    # This is the first point at which generated text is known to be safe.
-    mark_first_sse_event()
-    yield {"event": "token", "data": {"text": reply_text}}
+    if stream_replaced:
+        reply_text = (output_scan_incident or scan)["safe_reply"]
+    elif not streamed_any:
+        mark_first_sse_event()
+        yield {"event": "token", "data": {"text": reply_text}}
+
+    # User persistence overlaps graph/model work but must finish before the
+    # assistant row so chronological message IDs remain correct.
+    persist_user_message_ms = await user_persist_task
 
     # Observability stats
     metadata = request_metadata_var.get()
@@ -1028,9 +1393,7 @@ async def run_chat_turn(
     resolver_ms = (final_state or {}).get("resolver_ms", 0.0)
     llm_ms_total = (final_state or {}).get("llm_ms_total", 0.0)
     tool_ms_total = (final_state or {}).get("tool_ms_total", 0.0)
-    pre_graph_setup_ms = (
-        pool_ms + ensure_session_ms + history_ms + persist_user_message_ms + session_context_ms
-    )
+    pre_graph_setup_ms = pool_ms + pre_graph_setup_wall_ms
     graph_internal_overhead_ms = max(
         graph_stream_ms - resolver_ms - llm_ms_total - tool_ms_total,
         0.0,
@@ -1067,6 +1430,41 @@ async def run_chat_turn(
         completed_at=completed_at,
     )
     assistant_persist_ms = (time.perf_counter() - assistant_persist_started) * 1000
+
+    profile_context = dict(
+        (final_state or {}).get("profile_context_update")
+        or context.get("profile_context")
+        or {}
+    )
+    progressive_lead_field = (final_state or {}).get("progressive_lead_field")
+    profile_write_needed = (final_state or {}).get("profile_context_update") is not None
+    resolved_status = ((final_state or {}).get("resolved") or {}).get("resolution_status")
+    if progressive_lead_field:
+        progressive_lead_field, profile_context, profile_counter = _plan_progressive_lead_field(
+            context,
+            profile_context,
+            forced_field=progressive_lead_field,
+        )
+        profile_write_needed = True
+    elif not lead_ask and resolved_status in {
+        "resolved", "session_context", "page_context", "catalog_query", "comparison_context", "none"
+    }:
+        progressive_lead_field, profile_context, profile_counter = _plan_progressive_lead_field(
+            context,
+            profile_context,
+        )
+        profile_write_needed = True
+    else:
+        profile_counter = int(context.get("factual_turns_since_profile_ask") or 0)
+
+    if profile_write_needed:
+        await queries.update_profile_context(
+            pool,
+            session_id,
+            profile_context,
+            profile_counter,
+        )
+
     turn_total_ms = (time.perf_counter() - metadata["t_start"]) * 1000
     turn_accounted_ms = accounted_ms + assistant_persist_ms
     turn_unaccounted_ms = max(turn_total_ms - turn_accounted_ms, 0.0)
@@ -1087,7 +1485,8 @@ async def run_chat_turn(
         "event": "final",
         "data": {
             "lead_ask": lead_ask,
-            "quick_replies": ["Check fees", "Eligibility", "Talk to counsellor"],
+            "progressive_lead_field": progressive_lead_field,
+            "quick_replies": quick_replies_for(message),
             "metrics": {
                 "response_time_ms": response_time_ms,
                 "ttft_ms": ttft_ms,
@@ -1121,3 +1520,38 @@ async def run_chat_turn(
             },
         },
     }
+
+
+async def run_chat_turn(
+    session_id: str,
+    site_id: str,
+    message: str,
+    page_university_slug: str | None,
+    page_context: dict[str, Any] | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+    request_started_at: float | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Serialize turns per session while allowing unrelated sessions to run."""
+    entry = _SESSION_LOCKS.get(session_id)
+    if entry is None:
+        entry = {"lock": asyncio.Lock(), "users": 0}
+        _SESSION_LOCKS[session_id] = entry
+    entry["users"] += 1
+    try:
+        async with entry["lock"]:
+            async for event in _run_chat_turn_unlocked(
+                session_id=session_id,
+                site_id=site_id,
+                message=message,
+                page_university_slug=page_university_slug,
+                page_context=page_context,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                request_started_at=request_started_at,
+            ):
+                yield event
+    finally:
+        entry["users"] -= 1
+        if entry["users"] == 0 and _SESSION_LOCKS.get(session_id) is entry:
+            _SESSION_LOCKS.pop(session_id, None)

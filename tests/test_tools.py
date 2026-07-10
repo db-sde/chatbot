@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -34,6 +35,12 @@ class FakePool:
         return None
 
     async def fetch(self, sql, *args):
+        if "FROM reviews" in sql:
+            return [{
+                "review_text": "Helpful support.",
+                "reviewer_name": "Student",
+                "reviewer_label": "Learner",
+            }]
         if "FROM courses c" in sql:
             return [
                 {
@@ -92,3 +99,25 @@ async def test_list_courses():
 async def test_get_faq():
     result = await tools.get_faq("course", "online-mba", "fee")
     assert result[0]["question"] == "What is the fee?"
+
+
+@pytest.mark.asyncio
+async def test_get_reviews():
+    result = await tools.get_reviews("university", "nmims")
+    assert result[0]["review_text"] == "Helpful support."
+
+
+@pytest.mark.asyncio
+async def test_list_courses_passes_specialization_filter(monkeypatch):
+    from db import queries
+
+    query = AsyncMock(return_value=[])
+    monkeypatch.setattr(queries, "list_courses", query)
+    await tools.list_courses(
+        course_type="mba",
+        mode="online",
+        max_fee=200000,
+        specialization_query="finance",
+    )
+
+    assert query.await_args.args[-1] == "finance"

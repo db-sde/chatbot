@@ -206,6 +206,8 @@ CREATE TABLE IF NOT EXISTS session_context (
     current_course_slug TEXT,
     current_specialization_slug TEXT,
     comparison_context JSONB,
+    profile_context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    factual_turns_since_profile_ask INTEGER NOT NULL DEFAULT 0,
     last_updated TIMESTAMPTZ DEFAULT now()
 );
 
@@ -424,6 +426,8 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 
 -- Structured comparison state must outlive the in-memory graph and message window.
 ALTER TABLE session_context ADD COLUMN IF NOT EXISTS comparison_context JSONB;
+ALTER TABLE session_context ADD COLUMN IF NOT EXISTS profile_context JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE session_context ADD COLUMN IF NOT EXISTS factual_turns_since_profile_ask INTEGER NOT NULL DEFAULT 0;
 
 ALTER TABLE unanswered_questions ADD COLUMN IF NOT EXISTS reason TEXT;
 

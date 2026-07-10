@@ -61,13 +61,23 @@ async def get_session_context(pool, session_id: str) -> dict[str, Any]:
     row = await pool.fetchrow(
         """
         SELECT current_university_slug, current_course_slug, current_specialization_slug,
-               comparison_context
-        FROM session_context
-        WHERE session_id = $1::uuid
+               comparison_context, profile_context, factual_turns_since_profile_ask,
+               EXISTS(SELECT 1 FROM leads WHERE session_id = $1::uuid) AS has_lead
+        FROM session_context sc
+        WHERE sc.session_id = $1::uuid
         """,
         session_id,
     )
-    return dict_row(row) or {}
+    context = dict_row(row) or {}
+    for key in ("comparison_context", "profile_context"):
+        value = context.get(key)
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                decoded = {}
+            context[key] = decoded if isinstance(decoded, dict) else {}
+    return context
 
 
 async def get_session_history(
@@ -179,6 +189,79 @@ async def update_comparison_context(
         session_id,
         json.dumps(comparison_context),
     )
+
+
+async def update_profile_context(
+    pool,
+    session_id: str,
+    profile_context: dict[str, Any],
+    factual_turns_since_profile_ask: int | None = None,
+) -> None:
+    """Persist qualification/contact profile state without changing entity context."""
+    await pool.execute(
+        """
+        INSERT INTO session_context(
+            session_id, profile_context, factual_turns_since_profile_ask
+        )
+        VALUES($1::uuid, $2::jsonb, COALESCE($3, 0))
+        ON CONFLICT (session_id) DO UPDATE SET
+            profile_context = EXCLUDED.profile_context,
+            factual_turns_since_profile_ask = COALESCE(
+                $3, session_context.factual_turns_since_profile_ask
+            ),
+            last_updated = now()
+        """,
+        session_id,
+        json.dumps(profile_context),
+        factual_turns_since_profile_ask,
+    )
+
+
+async def save_progressive_lead_field(
+    pool,
+    session_id: str,
+    field: str,
+    value: str,
+) -> dict[str, Any]:
+    """Save one optional lead field and create a lead once all three exist."""
+    if field not in {"name", "phone", "email"}:
+        raise ValueError("unsupported progressive lead field")
+
+    row = await pool.fetchrow(
+        """
+        SELECT profile_context
+        FROM session_context
+        WHERE session_id = $1::uuid
+        """,
+        session_id,
+    )
+    stored_profile = (dict(row).get("profile_context") if row else None) or {}
+    if isinstance(stored_profile, str):
+        try:
+            stored_profile = json.loads(stored_profile)
+        except (TypeError, json.JSONDecodeError):
+            stored_profile = {}
+    profile = dict(stored_profile) if isinstance(stored_profile, dict) else {}
+    lead_profile = dict(profile.get("lead") or {})
+    lead_profile[field] = value
+    profile["lead"] = lead_profile
+    await update_profile_context(pool, session_id, profile)
+
+    if all(lead_profile.get(key) for key in ("name", "phone", "email")):
+        exists = await pool.fetchval(
+            "SELECT 1 FROM leads WHERE session_id = $1::uuid LIMIT 1", session_id
+        )
+        if not exists:
+            await insert_lead(
+                pool,
+                session_id,
+                lead_profile["name"],
+                lead_profile["phone"],
+                lead_profile["email"],
+                None,
+                "progressive_chat",
+            )
+    return profile
 
 
 async def insert_message(
@@ -338,7 +421,17 @@ async def get_eligibility(pool, university_slug: str, course_slug: str) -> dict[
     )
 
 
-async def list_courses(pool, course_type: str | None, mode: str | None, max_fee: float | None, min_naac: str | None, sort_by: str | None, order: str, limit: int) -> list[dict[str, Any]]:
+async def list_courses(
+    pool,
+    course_type: str | None,
+    mode: str | None,
+    max_fee: float | None,
+    min_naac: str | None,
+    sort_by: str | None,
+    order: str,
+    limit: int,
+    specialization_query: str | None = None,
+) -> list[dict[str, Any]]:
     order_dir = "DESC" if order.lower() == "desc" else "ASC"
     sort_columns = {
         "fee": "c.total_fee",
@@ -357,13 +450,21 @@ async def list_courses(pool, course_type: str | None, mode: str | None, max_fee:
           AND ($2::text IS NULL OR c.mode ILIKE '%' || $2 || '%')
           AND ($3::numeric IS NULL OR c.total_fee <= $3)
           AND ($4::text IS NULL OR c.naac_grade >= $4)
+          AND (
+              $5::text IS NULL OR EXISTS (
+                  SELECT 1 FROM specializations s
+                  WHERE s.course_id = c.id
+                    AND (s.spec_name ILIKE '%' || $5 || '%' OR s.slug ILIKE '%' || $5 || '%')
+              )
+          )
         ORDER BY {sort_expr} {order_dir} NULLS LAST
-        LIMIT $5
+        LIMIT $6
         """,
         course_type,
         mode,
         max_fee,
         min_naac,
+        specialization_query,
         max(1, min(limit, 20)),
     )
     return dict_rows(rows)
@@ -398,6 +499,29 @@ async def get_faq(pool, entity_type: str, entity_slug: str, query_text: str | No
         entity_type,
         entity_id,
         query_text,
+    )
+    return dict_rows(rows)
+
+
+async def get_reviews(
+    pool,
+    entity_type: str,
+    entity_slug: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    table = _entity_table(entity_type)
+    rows = await pool.fetch(
+        f"""
+        SELECT r.review_text, r.reviewer_name, r.reviewer_label
+        FROM reviews r
+        JOIN {table} e ON e.id = r.entity_id
+        WHERE r.entity_type = $1 AND e.slug = $2
+        ORDER BY r.id DESC
+        LIMIT $3
+        """,
+        entity_type,
+        entity_slug,
+        max(1, min(limit, 10)),
     )
     return dict_rows(rows)
 

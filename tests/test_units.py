@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import auth
 from agent import resolve, tools
 from agent.graph import _merge_resolved_into_tool_args
+from db import queries
 from security import policy, scanner, tool_validator
 from leads import scoring
 
@@ -425,6 +426,106 @@ async def test_contracted_fee_follow_up_uses_session_context():
     assert res["course_slug"] == "online-mba"
 
 
+@pytest.mark.asyncio
+async def test_catalog_superlative_does_not_inherit_session_university(monkeypatch):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    res = await resolve.resolve_entities(
+        "which is the best online mba program",
+        {"current_university_slug": "nmims-online"},
+    )
+
+    assert res["resolution_status"] == "catalog_query"
+    assert res["university_slug"] is None
+
+
+@pytest.mark.asyncio
+async def test_genuine_follow_up_still_inherits_session_university(monkeypatch):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    res = await resolve.resolve_entities(
+        "tell me more about it",
+        {"current_university_slug": "nmims-online"},
+    )
+
+    assert res["resolution_status"] == "session_context"
+    assert res["university_slug"] == "nmims-online"
+
+
+@pytest.mark.asyncio
+async def test_generic_typo_uses_session_context_instead_of_unknown_entity(monkeypatch):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    res = await resolve.resolve_entities(
+        "does it offer scolarship",
+        {"current_university_slug": "nmims-online"},
+    )
+
+    assert res["resolution_status"] == "session_context"
+    assert res["university_slug"] == "nmims-online"
+
+
+@pytest.mark.asyncio
+async def test_explicit_unknown_university_is_not_replaced_by_session_context(monkeypatch):
+    """A named unknown institution must not inherit facts from another university."""
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    res = await resolve.resolve_entities(
+        "FakeUniversity fee",
+        {"current_university_slug": "nmims-online"},
+    )
+
+    assert res["resolution_status"] == "entity_not_found"
+    assert res["university_slug"] is None
+
+
+@pytest.mark.asyncio
+async def test_subjective_recommendation_collects_only_real_catalog_filters(monkeypatch):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+
+    first = await resolve.resolve_entities("which is the best online mba for me", {})
+    assert first["resolution_status"] == "subjective_recommendation"
+    assert first["qualification"]["mode"] == "online"
+    assert first["qualification"]["course_type"] == "mba"
+    assert first["qualification"]["awaiting"] == "budget"
+
+    second = await resolve.resolve_entities(
+        "2 lakh",
+        {"profile_context": first["profile_context_update"]},
+    )
+    assert second["qualification"]["max_fee"] == 200_000
+    assert second["qualification"]["awaiting"] == "specialization"
+
+    third = await resolve.resolve_entities(
+        "finance",
+        {"profile_context": second["profile_context_update"]},
+    )
+    assert third["qualification"]["status"] == "ready"
+    assert third["qualification"]["specialization"] == "finance"
+
+
+@pytest.mark.asyncio
+async def test_qualification_question_can_be_ignored_for_normal_factual_turn(monkeypatch):
+    monkeypatch.setattr(resolve, "find_universities_in_message", lambda _: [])
+    monkeypatch.setattr(resolve, "_fuzzy_find_universities_in_message", lambda *_: [])
+    context = {
+        "current_university_slug": "nmims-online",
+        "profile_context": {
+            "qualification": {"status": "collecting", "awaiting": "budget"}
+        },
+    }
+
+    result = await resolve.resolve_entities("what is the eligibility?", context)
+
+    assert result["resolution_status"] == "session_context"
+    assert result["university_slug"] == "nmims-online"
+
+
 def test_pronoun_it_is_not_a_specialization():
     assert "specialization_query" not in resolve.extract_intent("How much does it cost?")
     assert "specialization_query" not in resolve.extract_intent("Is it eligible?")
@@ -724,6 +825,28 @@ async def test_public_history_query_is_scoped_to_site():
         pool, "session-id", limit=-10, site_id="site-a"
     )
     assert pool.args[2] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_context_decodes_asyncpg_json_strings():
+    class JsonContextPool:
+        async def fetchrow(self, _sql, *_args):
+            return {
+                "current_university_slug": "nmims-online",
+                "current_course_slug": "executive-mba-nmims-online",
+                "current_specialization_slug": None,
+                "comparison_context": '{"university_slugs":["nmims-online","amity-online"]}',
+                "profile_context": '{"lead_asked_fields":["name"]}',
+                "factual_turns_since_profile_ask": 1,
+                "has_lead": False,
+            }
+
+    context = await queries.get_session_context(JsonContextPool(), "session-id")
+
+    assert context["profile_context"] == {"lead_asked_fields": ["name"]}
+    assert context["comparison_context"]["university_slugs"] == [
+        "nmims-online", "amity-online"
+    ]
 
 
 @pytest.mark.asyncio

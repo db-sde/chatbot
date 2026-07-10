@@ -56,7 +56,10 @@ async def init_pool() -> asyncpg.Pool:
             try:
                 _pool = await asyncpg.create_pool(
                     dsn=db_url,
-                    min_size=1,
+                    # Pre-warm enough connections for the three independent
+                    # pre-graph reads. Otherwise the first user turn pays for
+                    # Neon TLS connection setup inside asyncio.gather().
+                    min_size=3,
                     max_size=10,
                     ssl="require" if require_ssl else None,
                 )

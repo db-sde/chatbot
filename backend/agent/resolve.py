@@ -4,7 +4,7 @@ import logging
 import re
 from typing import Any
 
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 from db import queries
 from db.pool import get_pool
@@ -679,6 +679,10 @@ _UNIVERSITY_LIKE_BLOCKLIST = {
     "its", "them", "they", "our", "your", "my", "new", "also", "now", "top",
     "right", "need", "some", "many", "these", "those", "been", "look", "see",
     "not", "but", "just", "very", "from", "where", "when", "why", "who",
+    # Prompt-control vocabulary is not an institution name. Input security
+    # handles these messages before the graph in production; keeping them out
+    # of entity counting also preserves the graph's direct-call guard path.
+    "ignore", "previous", "instructions", "instruction", "system", "prompt",
     # Back-reference words (not university names)
     "uni", "talking", "referring", "said", "asking", "mentioned", "above",
     "that", "same", "one", "other", "another", "both", "either",
@@ -720,6 +724,16 @@ def _count_intended_universities(message: str) -> int:
                 continue
             lower = cleaned.lower()
             if lower in _UNIVERSITY_LIKE_BLOCKLIST:
+                continue
+            # High-confidence typo tolerance for generic academic vocabulary.
+            # This prevents "scolarship" from becoming a fake university while
+            # keeping actual brand candidates available to the alias matcher.
+            if len(lower) >= 4 and process.extractOne(
+                lower,
+                _UNIVERSITY_LIKE_BLOCKLIST,
+                scorer=fuzz.ratio,
+                score_cutoff=88,
+            ):
                 continue
             is_cap_signal = idx > 0 and cleaned[0].isupper()
             is_leftover_signal = len(cleaned) >= 4
@@ -793,6 +807,28 @@ _CATALOG_WIDE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_CATALOG_SUPERLATIVE_PATTERN = re.compile(
+    r"\b(?:best|top|cheapest|most\s+affordable|highest[-\s]?rated)\b"
+    r"[^.?!]{0,50}\b(?:programs?|courses?|mba|bba|bca|mca|pgdm)\b"
+    r"|\bwhich\b[^.?!]{0,45}\b(?:program|course|mba|bba|bca|mca|pgdm)\b"
+    r"[^.?!]{0,25}\b(?:should\s+i|suits?\s+me|is\s+(?:the\s+)?best)\b"
+    r"|\brecommend\s+(?:a|an|the)?\s*[^.?!]{0,30}"
+    r"\b(?:program|course|mba|bba|bca|mca|pgdm)\b",
+    re.IGNORECASE,
+)
+
+_SUBJECTIVE_RECOMMENDATION_PATTERN = re.compile(
+    r"\b(?:best|right|ideal|suitable)\b[^.?!]{0,55}\b(?:for\s+me|suits?\s+me)\b"
+    r"|\b(?:which|what)\b[^.?!]{0,45}\b(?:should\s+i\s+choose|suits?\s+me)\b"
+    r"|\bhelp\s+me\s+(?:choose|pick|find)\b",
+    re.IGNORECASE,
+)
+
+
+def is_subjective_recommendation(message: str) -> bool:
+    """Whether a catalog recommendation needs user-supplied filter criteria."""
+    return bool(_SUBJECTIVE_RECOMMENDATION_PATTERN.search(message))
+
 
 def _is_catalog_wide_query(message: str) -> bool:
     """
@@ -801,7 +837,119 @@ def _is_catalog_wide_query(message: str) -> bool:
     institution should be assumed from session or page context, even if one
     was discussed earlier in the conversation or is currently on-screen.
     """
-    return bool(_CATALOG_WIDE_PATTERN.search(message))
+    return bool(
+        _CATALOG_WIDE_PATTERN.search(message)
+        or _CATALOG_SUPERLATIVE_PATTERN.search(message)
+    )
+
+
+def _qualification_budget(message: str, intent: dict[str, Any]) -> float | None:
+    if intent.get("max_fee") is not None:
+        return float(intent["max_fee"])
+    match = re.search(
+        r"(?:₹|rs\.?\s*)?([0-9]+(?:\.[0-9]+)?)\s*(lakh|lac|lakhs|k|thousand)?",
+        message.lower(),
+    )
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit in {"lakh", "lac", "lakhs"}:
+        value *= 100_000
+    elif unit in {"k", "thousand"}:
+        value *= 1_000
+    return value if value >= 10_000 else None
+
+
+def _qualification_resolution(
+    message: str,
+    intent: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Advance the one-question-at-a-time recommendation profile."""
+    profile_context = dict(context.get("profile_context") or {})
+    qualification = dict(profile_context.get("qualification") or {})
+    active = qualification.get("status") == "collecting"
+
+    if not active:
+        qualification = {
+            "status": "collecting",
+            "course_type": intent.get("course_query"),
+            "mode": intent.get("mode"),
+            "max_fee": intent.get("max_fee"),
+            "specialization": intent.get("specialization_query"),
+            "specialization_answered": bool(intent.get("specialization_query")),
+        }
+    else:
+        awaiting = qualification.get("awaiting")
+        if awaiting == "budget":
+            budget = _qualification_budget(message, intent)
+            if budget is not None:
+                qualification["max_fee"] = budget
+        elif awaiting == "mode":
+            mode = intent.get("mode")
+            if not mode:
+                normalized = message.lower()
+                if "online" in normalized:
+                    mode = "online"
+                elif "distance" in normalized:
+                    mode = "distance"
+            if mode:
+                qualification["mode"] = mode
+        elif awaiting == "specialization":
+            normalized = _normalize_message_for_scan(message)
+            no_preference = any(
+                phrase in normalized
+                for phrase in ("no preference", "any specialization", "anything", "not sure")
+            )
+            specialization = intent.get("specialization_query")
+            if specialization or no_preference:
+                qualification["specialization"] = specialization
+                qualification["specialization_answered"] = True
+
+    if qualification.get("max_fee") is None:
+        qualification["awaiting"] = "budget"
+    elif not qualification.get("mode"):
+        qualification["awaiting"] = "mode"
+    elif not qualification.get("specialization_answered"):
+        qualification["awaiting"] = "specialization"
+    else:
+        qualification["awaiting"] = None
+        qualification["status"] = "ready"
+
+    profile_context["qualification"] = qualification
+    return {
+        **_EMPTY_RESOLUTION,
+        "raw": intent,
+        "mode": qualification.get("mode"),
+        "max_fee": qualification.get("max_fee"),
+        "resolution_status": "subjective_recommendation",
+        "intent_type": "subjective_recommendation",
+        "profile_context_update": profile_context,
+        "qualification": qualification,
+    }
+
+
+def _is_qualification_answer(
+    message: str,
+    intent: dict[str, Any],
+    awaiting: str | None,
+) -> bool:
+    if awaiting == "budget":
+        return _qualification_budget(message, intent) is not None
+    if awaiting == "mode":
+        normalized = message.lower()
+        return bool(intent.get("mode") or "online" in normalized or "distance" in normalized)
+    if awaiting == "specialization":
+        normalized = _normalize_message_for_scan(message)
+        return bool(
+            intent.get("specialization_query")
+            or any(
+                phrase in normalized
+                for phrase in ("no preference", "any specialization", "anything", "not sure")
+            )
+        )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1192,14 @@ async def resolve_entities(
     intent = extract_intent(message)
     logger.info("INTENT | msg=%r -> %r", message[:80], intent)
 
+    qualification = (context.get("profile_context") or {}).get("qualification") or {}
+    qualification_active = qualification.get("status") == "collecting"
+    if qualification_active and _is_qualification_answer(
+        message, intent, qualification.get("awaiting")
+    ):
+        logger.info("SUBJECTIVE RECOMMENDATION | active=True msg=%r", message[:80])
+        return _qualification_resolution(message, intent, context)
+
     # ── Step 1: Catalog-first universities ─────────────────────────────────
     catalog_hits = find_universities_in_message(message)
     if not catalog_hits:
@@ -1062,6 +1218,12 @@ async def resolve_entities(
                 "CANONICAL SLUG | matched=%r -> %s (method=%s)",
                 hit.get("matched_alias"), slug, hit.get("method"),
             )
+
+    if not resolved_slugs and is_subjective_recommendation(message):
+        logger.info(
+            "SUBJECTIVE RECOMMENDATION | active=False msg=%r", message[:80]
+        )
+        return _qualification_resolution(message, intent, context)
 
     # How many university-like names did the user intend to mention?
     # This is used to detect partial matches and entity_not_found when
