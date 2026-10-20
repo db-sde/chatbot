@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import re
 
+from settings import settings
+
 logger = logging.getLogger(__name__)
 
 # Matches /colleges/{uni}  or  /colleges/{uni}/{course}  or  /colleges/{uni}/{course}/{spec}
@@ -42,6 +44,26 @@ async def resolve_page_context(pathname: str | None, pool) -> dict:
 
     if not pathname:
         return empty
+
+    # WordPress paths need not match chatbot's internal, globally unique slugs.
+    # Only enabled deployments pay for this single indexed lookup.
+    if len((settings.catalog_webhook_secret or "").strip()) >= 32:
+        try:
+            linked = await pool.fetchrow(
+                """SELECT u.slug AS page_university_slug,u.name AS page_university_name,
+                    c.slug AS page_course_slug,c.program_name AS page_course_name,
+                    s.slug AS page_spec_slug,s.spec_name AS page_spec_name
+                FROM catalog_sources cs
+                LEFT JOIN specializations s ON cs.entity_type='specialization' AND s.id=cs.entity_id
+                LEFT JOIN courses c ON (cs.entity_type='course' AND c.id=cs.entity_id) OR (cs.entity_type='specialization' AND c.id=s.course_id)
+                JOIN universities u ON (cs.entity_type='university' AND u.id=cs.entity_id) OR (cs.entity_type='course' AND u.id=c.university_id) OR (cs.entity_type='specialization' AND u.id=s.university_id AND c.university_id=u.id)
+                WHERE cs.source_path=$1 AND cs.source='degreebaba-parser' LIMIT 1""",
+                pathname.rstrip("/") or "/",
+            )
+            if linked:
+                return dict(linked)
+        except Exception:
+            logger.exception("Parser page context lookup failed; using existing URL resolver")
 
     m = _PATTERN.match(pathname.rstrip("/"))
     if not m:

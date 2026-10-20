@@ -205,7 +205,11 @@ async def update_profile_context(
         )
         VALUES($1::uuid, $2::jsonb, COALESCE($3, 0))
         ON CONFLICT (session_id) DO UPDATE SET
-            profile_context = EXCLUDED.profile_context,
+            profile_context = CASE
+                WHEN session_context.profile_context ? 'lead'
+                THEN EXCLUDED.profile_context || jsonb_build_object('lead', session_context.profile_context->'lead')
+                ELSE EXCLUDED.profile_context
+            END,
             factual_turns_since_profile_ask = COALESCE(
                 $3, session_context.factual_turns_since_profile_ask
             ),
@@ -223,45 +227,36 @@ async def save_progressive_lead_field(
     field: str,
     value: str,
 ) -> dict[str, Any]:
-    """Save one optional lead field and create a lead once all three exist."""
+    """Save optional fields atomically; a name and phone suffice for callback."""
     if field not in {"name", "phone", "email"}:
         raise ValueError("unsupported progressive lead field")
 
-    row = await pool.fetchrow(
-        """
-        SELECT profile_context
-        FROM session_context
-        WHERE session_id = $1::uuid
-        """,
-        session_id,
-    )
-    stored_profile = (dict(row).get("profile_context") if row else None) or {}
-    if isinstance(stored_profile, str):
-        try:
-            stored_profile = json.loads(stored_profile)
-        except (TypeError, json.JSONDecodeError):
-            stored_profile = {}
-    profile = dict(stored_profile) if isinstance(stored_profile, dict) else {}
-    lead_profile = dict(profile.get("lead") or {})
-    lead_profile[field] = value
-    profile["lead"] = lead_profile
-    await update_profile_context(pool, session_id, profile)
-
-    if all(lead_profile.get(key) for key in ("name", "phone", "email")):
-        exists = await pool.fetchval(
-            "SELECT 1 FROM leads WHERE session_id = $1::uuid LIMIT 1", session_id
-        )
-        if not exists:
-            await insert_lead(
-                pool,
-                session_id,
-                lead_profile["name"],
-                lead_profile["phone"],
-                lead_profile["email"],
-                None,
-                "progressive_chat",
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Serialize progressive submissions even before session_context exists.
+            await conn.fetchval("SELECT id FROM sessions WHERE id = $1::uuid FOR UPDATE", session_id)
+            row = await conn.fetchrow(
+                """
+                INSERT INTO session_context(session_id, profile_context)
+                VALUES($1::uuid, jsonb_build_object('lead', jsonb_build_object($2::text, $3::text)))
+                ON CONFLICT (session_id) DO UPDATE SET
+                    profile_context = session_context.profile_context || jsonb_build_object(
+                        'lead', COALESCE(session_context.profile_context->'lead', '{}'::jsonb)
+                        || jsonb_build_object($2::text, $3::text)
+                    ), last_updated = now()
+                RETURNING profile_context
+                """,
+                session_id, field, value,
             )
-    return profile
+            stored = row["profile_context"]
+            profile = json.loads(stored) if isinstance(stored, str) else dict(stored)
+            lead_profile = profile["lead"]
+            if lead_profile.get("name") and lead_profile.get("phone"):
+                await insert_lead(
+                    conn, session_id, lead_profile["name"], lead_profile["phone"],
+                    lead_profile.get("email"), None, "progressive_chat", "progressive",
+                )
+            return profile
 
 
 async def insert_message(
@@ -340,7 +335,14 @@ async def count_site_messages_today(pool, site_id: str) -> int:
 
 
 async def find_entity_search(pool, entity_type: str) -> list[dict[str, Any]]:
-    rows = await pool.fetch("SELECT entity_type, entity_id, search_text FROM entity_search WHERE entity_type = $1", entity_type)
+    tables = {"university": "universities", "course": "courses", "specialization": "specializations"}
+    table = tables[entity_type]
+    parents = {"university": "", "course": ", e.university_id", "specialization": ", e.university_id, e.course_id"}[entity_type]
+    rows = await pool.fetch(
+        f"SELECT s.entity_type, s.entity_id, s.search_text, e.slug{parents} "
+        f"FROM entity_search s JOIN {table} e ON e.id = s.entity_id WHERE s.entity_type = $1",
+        entity_type,
+    )
     return dict_rows(rows)
 
 
@@ -458,7 +460,9 @@ async def list_courses(
         WHERE ($1::text IS NULL OR c.program_name ILIKE '%' || $1 || '%')
           AND ($2::text IS NULL OR c.mode ILIKE '%' || $2 || '%')
           AND ($3::numeric IS NULL OR c.total_fee <= $3)
-          AND ($4::text IS NULL OR c.naac_grade >= $4)
+          AND ($4::text IS NULL OR
+              array_position(ARRAY['D','C','B','B+','B++','A','A+','A++'], upper(trim(c.naac_grade)))
+              >= array_position(ARRAY['D','C','B','B+','B++','A','A+','A++'], upper(trim($4))))
           AND (
               $5::text IS NULL OR EXISTS (
                   SELECT 1 FROM specializations s
@@ -700,12 +704,28 @@ async def compare_programs(pool, course_slugs: list[str], fields: list[str]) -> 
     return dict_rows(rows)
 
 
-async def insert_lead(pool, session_id: str, name: str, phone: str, email: str | None, course_interest: str | None, trigger_reason: str) -> dict[str, Any]:
+async def insert_lead(pool, session_id: str, name: str, phone: str, email: str | None, course_interest: str | None, trigger_reason: str, submission_id: str | None = None) -> dict[str, Any]:
     row = await pool.fetchrow(
         """
-        INSERT INTO leads(session_id, name, phone, email, course_interest, trigger_reason)
-        VALUES($1::uuid, $2, $3, $4, $5, $6)
-        RETURNING id, session_id, name, phone, email, course_interest, trigger_reason, created_at
+        WITH saved AS (
+            INSERT INTO leads(session_id, name, phone, email, course_interest, trigger_reason, submission_id)
+            VALUES($1::uuid, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (session_id, submission_id) DO UPDATE SET
+                name=EXCLUDED.name, phone=EXCLUDED.phone, email=EXCLUDED.email,
+                course_interest=EXCLUDED.course_interest
+            RETURNING id, session_id, name, phone, email, course_interest, trigger_reason, created_at
+        ), payloads AS (
+            SELECT saved.id, jsonb_build_object(
+                'session_id', saved.session_id, 'site_key', sessions.site_id,
+                'name', saved.name, 'phone', saved.phone, 'email', saved.email,
+                'course_interest', saved.course_interest
+            ) AS payload FROM saved JOIN sessions ON sessions.id = saved.session_id
+        ), queued AS (
+            INSERT INTO crm_deliveries(lead_id, webhook_url, payload, payload_hash)
+            SELECT id, $8::text, payload, md5(payload::text) FROM payloads WHERE $8::text IS NOT NULL
+            ON CONFLICT (lead_id, payload_hash) DO NOTHING
+        )
+        SELECT * FROM saved
         """,
         session_id,
         name,
@@ -713,6 +733,8 @@ async def insert_lead(pool, session_id: str, name: str, phone: str, email: str |
         email,
         course_interest,
         trigger_reason,
+        submission_id,
+        settings.crm_webhook_url or None,
     )
     return dict(row)
 

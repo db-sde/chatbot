@@ -511,28 +511,46 @@
     if (settings.capture_email) inputsHtml += `<input name="email" type="email" placeholder="Email Address" style="margin-bottom: 8px;" />`;
 
     box.innerHTML = `
-      <h4>${settings.lead_form_title}</h4>
-      <p>${settings.lead_form_description}</p>
+      <h4></h4>
+      <p></p>
       ${inputsHtml}
       <button type="submit" class="lead-submit">Request Callback</button>
       <button type="button" class="skip-btn">No thanks, maybe later</button>
     `;
+    box.querySelector("h4").textContent = settings.lead_form_title;
+    box.querySelector("p").textContent = settings.lead_form_description;
+    const submissionId = crypto.randomUUID();
+    let isSaving = false;
 
     box.querySelector(".skip-btn").addEventListener("click", () => box.remove());
     box.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (isSaving) return;
       const data = Object.fromEntries(new FormData(box).entries());
-      box.innerHTML = `<p style="text-align: center; color: var(--primary-color); font-weight: 500; padding: 10px 0;">✓ Thanks! A counsellor will reach out to you shortly.</p>`;
-      await playSound();
-      
-      await fetch(`${apiBase}/webhook/lead`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionId, site_key: siteKey, course_interest: courseInterest || "",
-          name: data.name || "Anonymous", phone: data.phone || "0000000000", email: data.email || null
-        })
-      });
+      isSaving = true;
+      const submitButton = box.querySelector(".lead-submit");
+      submitButton.disabled = true;
+      submitButton.textContent = "Saving...";
+      try {
+        const response = await fetch(`${apiBase}/webhook/lead`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId, site_key: siteKey, course_interest: courseInterest || "",
+            submission_id: submissionId,
+            name: data.name || "Anonymous", phone: data.phone || "0000000000", email: data.email || null
+          })
+        });
+        if (!response.ok) throw new Error("Lead was not saved");
+      } catch (_) {
+        box.querySelector("p").textContent = "We couldn't save your request. Please try again or keep chatting.";
+        isSaving = false;
+        submitButton.disabled = false;
+        submitButton.textContent = "Request Callback";
+        return;
+      }
+      box.innerHTML = `<p style="text-align: center; color: var(--primary-color); font-weight: 500; padding: 10px 0;">✓ Thanks! Your callback request has been saved.</p>`;
+      void playSound();
       
       setTimeout(() => box.remove(), 3000);
     });
@@ -691,7 +709,7 @@
       const response = await fetch(`${apiBase}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, site_key: siteKey, message, page_university_slug: pageSlug })
+        body: JSON.stringify({ session_id: sessionId, site_key: siteKey, message, page_university_slug: pageSlug, page_pathname: location.pathname })
       });
 
       if (!response.ok) {

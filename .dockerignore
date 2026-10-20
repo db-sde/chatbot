@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+CODEBASE_REVIEW.md

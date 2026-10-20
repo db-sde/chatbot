@@ -74,6 +74,19 @@ def is_contact_intent(message: str) -> bool:
         return False
     text = _normalize_contact_text(message)
 
+    if re.search(
+        r"\b(?:do not|don t|dont|never|stop|no|not interested in)\s+"
+        r"(?:(?:want|need|wish|to|a|an|any|please|me|be|being|receiving)\s+){0,6}"
+        r"(?:call\w*|contact\w*|connect\w*|speak\w*|talk\w*|counsell?\w*|callback|advisor)\b",
+        text,
+    ):
+        return False
+    # Questions about counselling are factual requests, not consent to outreach.
+    if re.match(r"^(?:what|why|how|when|where|who|does|is|are)\b", text) and not re.search(
+        r"\b(?:please|want|need|can i|could i)\b.*\b(?:call|contact|connect|speak|talk|callback)\b", text
+    ):
+        return False
+
     for phrase in CONTACT_PHRASES:
         if phrase in text:
             return True

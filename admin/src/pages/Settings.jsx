@@ -1,11 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   Activity,
-  Server,
-  User,
   Shield,
   AlertCircle,
-  HelpCircle,
   Mail
 } from "lucide-react";
 import { api } from "../services/api";

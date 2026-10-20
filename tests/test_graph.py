@@ -621,6 +621,7 @@ async def test_ready_qualification_uses_filtered_catalog_results(monkeypatch):
     assert "NMIMS" in result["reply"]
     assert result["progressive_lead_field"] == "name"
     assert result["profile_context_update"]["qualification"]["status"] == "complete"
+    assert result["profile_context_update"]["recommended_course_slugs"] == ["online-mba"]
     lookup.assert_awaited_once_with(
         course_type="mba",
         mode="online",

@@ -6,10 +6,11 @@ import logging.config
 import os
 import re
 import time
+from pathlib import Path
+from uuid import UUID
 from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any, Literal
 
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
@@ -89,20 +90,45 @@ async def lifespan(app_: FastAPI):  # noqa: ARG001
         await load_entity_cache()
     except Exception:
         logger.warning("Entity cache warmup failed — will fall back to DB on first request")
-    yield
-    await close_pool()
+    from leads.delivery import run_delivery_worker
+    delivery_task = asyncio.create_task(run_delivery_worker(), name="crm-delivery") if settings.crm_webhook_url else None
+    catalog_tasks = []
+    if len((settings.catalog_webhook_secret or "").strip()) >= 32:
+        from catalog.service import run_import_worker, watch_catalog_revision
+        catalog_tasks = [
+            asyncio.create_task(run_import_worker(), name="catalog-import"),
+            asyncio.create_task(watch_catalog_revision(), name="catalog-cache"),
+        ]
+    try:
+        yield
+    finally:
+        for task in catalog_tasks:
+            task.cancel()
+        for task in catalog_tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        if delivery_task:
+            delivery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await delivery_task
+        from agent.graph import drain_background_tasks
+        await drain_background_tasks()
+        await close_pool()
 
 
 
 app = FastAPI(title="DegreeBaba AI Chatbot", version="0.1.0", lifespan=lifespan)
+from catalog.routes import router as catalog_router
+app.include_router(catalog_router)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"}))
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
+    allow_origin_regex=settings.allowed_origin_regex,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 # Added last so it is the OUTERMOST middleware (Starlette wraps in reverse
@@ -150,6 +176,7 @@ class LeadRequest(BaseModel):
     phone: str = Field(min_length=7, max_length=30)
     email: EmailStr | None = None
     course_interest: str | None = None
+    submission_id: UUID | None = None
 
 
 class ProgressiveLeadRequest(BaseModel):
@@ -185,6 +212,22 @@ class WidgetSettingsUpdate(BaseModel):
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"ok": "true"}
+
+
+async def _record_flagged_input(pool, session_id: str, message: str, *, site_id: str, **details) -> None:
+    """Record first-message violations without letting audit failures break refusal."""
+    try:
+        await queries.ensure_session(pool, session_id, site_id, None)
+        await queries.insert_flagged_message(pool, session_id, message, **details)
+    except Exception:
+        logger.exception("Unable to persist flagged input (session=%s)", session_id)
+
+
+async def _record_security_event(pool, **details) -> None:
+    try:
+        await queries.insert_security_event(pool, **details)
+    except Exception:
+        logger.exception("Unable to persist security event (session=%s)", details.get("session_id"))
 
 
 @app.get("/")
@@ -283,13 +326,14 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                     "Prompt Guard blocked message (score=%.4f reason=%s source=%s) session=%s",
                     safety["risk_score"], safety["reason"], source, body.session_id,
                 )
-                await queries.insert_flagged_message(
+                await _record_flagged_input(
                     pool, body.session_id, body.message,
+                    site_id=body.site_key,
                     layer=f"prompt_guard:{source}",
                     risk_score=safety["risk_score"],
                     reason=safety["reason"] or "injection",
                 )
-                await queries.insert_security_event(
+                await _record_security_event(
                     pool,
                     ip_address=client_ip,
                     user_agent=client_ua,
@@ -316,13 +360,14 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> StreamingResp
                     "I'm DegreeBaba's AI assistant and I can only help with "
                     "university, course, and admissions questions."
                 )
-                await queries.insert_flagged_message(
+                await _record_flagged_input(
                     pool, body.session_id, body.message,
+                    site_id=body.site_key,
                     layer="policy",
                     risk_score=0.9,
                     reason=policy["rule"] or "policy_violation",
                 )
-                await queries.insert_security_event(
+                await _record_security_event(
                     pool,
                     ip_address=client_ip,
                     user_agent=client_ua,
@@ -460,14 +505,12 @@ async def lead_webhook(request: Request, body: LeadRequest = Body(...)) -> dict[
         body.course_interest,
         "widget_form",
         body.site_key,
+        str(body.submission_id) if body.submission_id else None,
     )
     if lead.get("not_found"):
         if lead.get("reason") == "session_site_mismatch":
             raise HTTPException(status_code=403, detail="Session does not belong to this site")
         raise HTTPException(status_code=503, detail="Lead capture is temporarily unavailable")
-    if settings.crm_webhook_url:
-        async with httpx.AsyncClient(timeout=8) as client:
-            await client.post(settings.crm_webhook_url, json=body.model_dump())
     return {"ok": True}
 
 
@@ -495,6 +538,9 @@ async def progressive_lead_webhook(
         raise HTTPException(status_code=422, detail="Enter a valid name")
 
     pool = await get_pool()
+    client_ip = request.client.host if request.client else None
+    if client_ip and await queries.is_ip_blocked(pool, client_ip):
+        raise HTTPException(status_code=403, detail="Your access has been restricted due to suspicious activity.")
     try:
         await queries.ensure_session(pool, body.session_id, body.site_key, None)
     except queries.SessionSiteMismatchError as exc:
@@ -547,8 +593,15 @@ admin_dist_path = os.path.join(
 
 @app.get("/admin")
 async def serve_admin_dashboard_root():
-    index_file = os.path.join(admin_dist_path, "index.html")
-    if os.path.isfile(index_file):
+    return _admin_index_response()
+
+
+def _admin_index_response():
+    dist_root = Path(admin_dist_path).resolve()
+    index_file = (dist_root / "index.html").resolve()
+    if not index_file.is_relative_to(dist_root):
+        raise HTTPException(status_code=404, detail="Not found")
+    if index_file.is_file():
         return FileResponse(index_file)
     return HTMLResponse(
         "Dashboard build output not found. Please run <code>npm run build</code> inside the <code>admin</code> folder."
@@ -557,16 +610,13 @@ async def serve_admin_dashboard_root():
 
 @app.get("/admin/{path_name:path}")
 async def serve_admin_dashboard(path_name: str):
-    file_path = os.path.join(admin_dist_path, path_name)
-    if path_name and os.path.isfile(file_path):
+    dist_root = Path(admin_dist_path).resolve()
+    file_path = (dist_root / path_name).resolve()
+    if not file_path.is_relative_to(dist_root):
+        raise HTTPException(status_code=404, detail="Not found")
+    if path_name and file_path.is_file():
         return FileResponse(file_path)
-    # Default to single-page application fallback
-    index_file = os.path.join(admin_dist_path, "index.html")
-    if os.path.isfile(index_file):
-        return FileResponse(index_file)
-    return HTMLResponse(
-        "Dashboard build output not found. Please run <code>npm run build</code> inside the <code>admin</code> folder."
-    )
+    return _admin_index_response()
 
 
 # ── Backend Administration API Endpoints (prefixed with /api/admin) ──
@@ -797,6 +847,10 @@ async def admin_settings_status(_: Annotated[None, Depends(check_admin_auth)]) -
     
     ai_status = "Connected" if llm_client.enabled else "Not Configured"
     lead_enabled = bool(settings.crm_webhook_url)
+    pool = await get_pool()
+    last_delivery = await pool.fetchrow(
+        "SELECT status, last_status_code FROM crm_deliveries ORDER BY updated_at DESC, id DESC LIMIT 1"
+    ) if lead_enabled else None
     
     return {
         "ai_provider": {
@@ -807,7 +861,10 @@ async def admin_settings_status(_: Annotated[None, Depends(check_admin_auth)]) -
         "lead_delivery": {
             "enabled": lead_enabled,
             "delivery_method": "CRM Webhook" if lead_enabled else "None",
-            "last_delivery_status": "Success" if lead_enabled else "N/A"
+            "last_delivery_status": (
+                {"pending": "Pending / retrying", "processing": "Sending", "delivered": "Success"}[last_delivery["status"]]
+                if last_delivery else ("No deliveries yet" if lead_enabled else "N/A")
+            )
         },
         "current_user": {
             "username": "admin",

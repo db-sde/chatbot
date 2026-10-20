@@ -433,11 +433,12 @@ def _local_extract(message: str) -> dict[str, Any]:
             result["specialization_hint"] = spec
             break
 
+    from money import MONEY_PATTERN, parse_money
     fee_match = re.search(
-        r"(?:under|below|less than|max(?:imum)?)\s*(?:rs\.?|₹)?\s*([\d,]+)", text
+        rf"(?:under|below|less than|max(?:imum)?(?:\s+(?:fee|budget))?)\s*{MONEY_PATTERN}", text
     )
     if fee_match:
-        result["max_fee"] = float(fee_match.group(1).replace(",", ""))
+        result["max_fee"] = parse_money(fee_match.group(0))
 
     if "cheapest" in text or "lowest" in text:
         result["sort_by"] = "fee"
@@ -858,21 +859,11 @@ def _is_catalog_wide_query(message: str) -> bool:
 
 
 def _qualification_budget(message: str, intent: dict[str, Any]) -> float | None:
+    from money import parse_money
     if intent.get("max_fee") is not None:
         return float(intent["max_fee"])
-    match = re.search(
-        r"(?:₹|rs\.?\s*)?([0-9]+(?:\.[0-9]+)?)\s*(lakh|lac|lakhs|k|thousand)?",
-        message.lower(),
-    )
-    if not match:
-        return None
-    value = float(match.group(1))
-    unit = match.group(2)
-    if unit in {"lakh", "lac", "lakhs"}:
-        value *= 100_000
-    elif unit in {"k", "thousand"}:
-        value *= 1_000
-    return value if value >= 10_000 else None
+    value = parse_money(message)
+    return value if value is not None and value >= 10_000 else None
 
 
 def _qualification_resolution(
@@ -1098,7 +1089,7 @@ async def snap_course(
         else list(all_rows)
     )
 
-    for candidate_rows, label in [(scoped, "scoped"), (all_rows, "global")]:
+    for candidate_rows, label in [(scoped, "scoped")]:
         if not candidate_rows:
             continue
         row = _exact_match(normalized, candidate_rows)
@@ -1132,13 +1123,15 @@ async def snap_specialization(
     candidate_sets: list[tuple[list[dict[str, Any]], str]] = []
     if course_entity_id is not None:
         candidate_sets.append(
-            ([r for r in all_rows if r.get("course_id") == course_entity_id], "course-scoped")
+            ([r for r in all_rows if r.get("course_id") == course_entity_id
+              and (university_entity_id is None or r.get("university_id") == university_entity_id)], "course-scoped")
         )
-    if university_entity_id is not None:
+    elif university_entity_id is not None:
         candidate_sets.append(
             ([r for r in all_rows if r.get("university_id") == university_entity_id], "uni-scoped")
         )
-    candidate_sets.append((all_rows, "global"))
+    else:
+        candidate_sets.append((all_rows, "global"))
 
     for scope_rows, label in candidate_sets:
         if not scope_rows:
@@ -1173,6 +1166,7 @@ _EMPTY_RESOLUTION = {
     "sort_by": None,
     "order": "asc",
     "comparison_targets": [],
+    "comparison_course_slugs": [],
     "resolution_status": "none",
     "requested_entity": None,
     "comparison_found": [],
@@ -1213,6 +1207,18 @@ async def resolve_entities(
 
     intent = extract_intent(message)
     logger.info("INTENT | msg=%r -> %r", message[:80], intent)
+
+    recommended = (context.get("profile_context") or {}).get("recommended_course_slugs") or []
+    if recommended and re.fullmatch(
+        r"(?:please\s+)?compare\s+(?:(?:these|those|the recommended|my recommended)\s+(?:programs|courses|options)|them)[.!?]*",
+        message.strip(), re.IGNORECASE,
+    ):
+        return {
+            **_EMPTY_RESOLUTION,
+            "raw": intent,
+            "comparison_course_slugs": list(recommended),
+            "resolution_status": "shortlist_context",
+        }
 
     qualification = (context.get("profile_context") or {}).get("qualification") or {}
     qualification_active = qualification.get("status") == "collecting"
@@ -1273,18 +1279,49 @@ async def resolve_entities(
     university_slug = resolved_slugs[0] if resolved_slugs else None
     university_entity_id = resolved_ids[0] if resolved_ids else None
 
+    # Apply the same effective university scope before resolving children.
+    # Otherwise a session follow-up can pick another university's MBA first.
+    page_context = context.get("_page_context") or {}
+    if not explicit_university_requested and not catalog_wide_requested and not is_saved_comparison_follow_up:
+        session_uni = context.get("current_university_slug")
+        page_uni = resolve_university_alias(page_university_slug) or page_university_slug
+        university_slug = (resolve_university_alias(session_uni) or session_uni) if session_uni else (
+            page_uni if _message_needs_entity(message) else None
+        )
+        if university_slug and ("course_query" in intent or "specialization_query" in intent):
+            _, university_entity_id = await snap_university(university_slug)
+
+    inherited_course = None
+    inherited_spec = None
+    if not explicit_university_requested and not catalog_wide_requested:
+        inherited_course = context.get("current_course_slug")
+        inherited_spec = context.get("current_specialization_slug")
+        if university_slug == page_context.get("page_university_slug"):
+            inherited_course = inherited_course or page_context.get("page_course_slug")
+            inherited_spec = inherited_spec or page_context.get("page_spec_slug")
+
     # ── Step 2: Course (scoped to university) ──────────────────────────────
     course_slug: str | None = None
     course_entity_id: int | None = None
     if "course_query" in intent and not catalog_wide_requested:
-        course_slug, course_entity_id = await snap_course(
-            intent["course_query"],
-            university_entity_id=university_entity_id,
-        )
+        # An unresolved context must not silently select a global course.
+        if not university_slug or university_entity_id is not None:
+            course_slug, course_entity_id = await snap_course(
+                intent["course_query"],
+                university_entity_id=university_entity_id,
+            )
+    elif inherited_course:
+        course_slug = inherited_course
+
+    if course_slug and course_entity_id is None and "specialization_query" in intent:
+        course_rows = ENTITY_CACHE["course"]
+        if not course_rows:
+            course_rows = await queries.find_entity_search(await get_pool(), "course")
+        course_entity_id = next((row["entity_id"] for row in course_rows if row.get("slug") == course_slug), None)
 
     # ── Step 3: Specialization ─────────────────────────────────────────────
     specialization_slug: str | None = None
-    if "specialization_query" in intent:
+    if "specialization_query" in intent and (not university_slug or university_entity_id is not None) and (not course_slug or course_entity_id is not None):
         specialization_slug = await snap_specialization(
             intent["specialization_query"],
             university_entity_id=university_entity_id,
@@ -1406,10 +1443,11 @@ async def resolve_entities(
         else:
             resolution_status = "none"
 
-        if not catalog_wide and not course_slug:
-            course_slug = context.get("current_course_slug")
-        if not catalog_wide and not specialization_slug:
-            specialization_slug = context.get("current_specialization_slug")
+        if not catalog_wide and not course_slug and "course_query" not in intent:
+            course_slug = inherited_course
+        if not catalog_wide and not specialization_slug and "specialization_query" not in intent:
+            if course_slug == inherited_course:
+                specialization_slug = inherited_spec
 
     logger.info(
         "RESOLVED | uni=%s course=%s spec=%s status=%s mention_type=%s",

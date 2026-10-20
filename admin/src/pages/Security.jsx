@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState } from "react";
 import {
   ShieldAlert,
   ShieldX,
@@ -147,32 +147,36 @@ export default function Security() {
   const [activeTab, setActiveTab] = useState("overview"); // overview | events | ips
   const [activeEvent, setActiveEvent] = useState(null);
 
-  const load = useCallback(async () => {
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const [summaryData, attacksData, eventsData, blockedData, topIpsData] = await Promise.all([
+          api.getSecuritySummary(), api.getSecurityAttacks(20),
+          api.getSecurityEvents({ limit: 50 }), api.getBlockedIps(), api.getTopAttackingIps(20),
+        ]);
+        if (cancelled) return;
+        setSummary(summaryData);
+        setAttacks(attacksData || []);
+        setEvents(eventsData || []);
+        setBlockedIps(blockedData || []);
+        setTopIps(topIpsData || []);
+        setError(null);
+      } catch (err) {
+        if (!cancelled) setError(err.message || "Failed to load security data.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    void load();
+    return () => { cancelled = true; };
+  }, [refresh]);
+
+  function reload() {
     setLoading(true);
     setError(null);
-    try {
-      const [summaryData, attacksData, eventsData, blockedData, topIpsData] = await Promise.all([
-        api.getSecuritySummary(),
-        api.getSecurityAttacks(20),
-        api.getSecurityEvents({ limit: 50 }),
-        api.getBlockedIps(),
-        api.getTopAttackingIps(20),
-      ]);
-      setSummary(summaryData);
-      setAttacks(attacksData || []);
-      setEvents(eventsData || []);
-      setBlockedIps(blockedData || []);
-      setTopIps(topIpsData || []);
-    } catch (err) {
-      setError(err.message || "Failed to load security data.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load, refresh]);
+    setRefresh((r) => r + 1);
+  }
 
   async function performBlock(ip, isPermanent) {
     try {
@@ -182,7 +186,7 @@ export default function Security() {
         isPermanent ? "permanent" : "temporary",
         isPermanent ? null : 24
       );
-      setRefresh((r) => r + 1);
+      reload();
     } catch (err) {
       alert("Failed to block IP: " + err.message);
     }
@@ -191,14 +195,14 @@ export default function Security() {
   async function performUnblock(ip) {
     try {
       await api.unblockIp(ip);
-      setRefresh((r) => r + 1);
+      reload();
     } catch (err) {
       alert("Failed to unblock IP: " + err.message);
     }
   }
 
   if (loading) return <LoadingState message="Loading security intelligence…" />;
-  if (error) return <ErrorState title="Security scan failed" description={error} retry={() => setRefresh((r) => r + 1)} />;
+  if (error) return <ErrorState title="Security scan failed" description={error} retry={reload} />;
 
   const totalEvents = summary?.total_events ?? 0;
   const last24h = summary?.last_24h_events ?? 0;
@@ -224,7 +228,7 @@ export default function Security() {
           <p className="text-xs text-gray-500 mt-0.5">Real-time threat detection and IP enforcement</p>
         </div>
         <button
-          onClick={() => setRefresh((r) => r + 1)}
+          onClick={reload}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#1F2937] text-xs text-gray-400 hover:text-gray-200 hover:border-gray-600 transition-all self-start sm:self-center"
         >
           <RefreshCw size={12} />

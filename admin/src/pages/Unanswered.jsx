@@ -63,8 +63,8 @@ export default function Unanswered() {
 
       {groups.length === 0 ? (
         <EmptyState
-          title="Zero Gaps Detected!"
-          description="Every query has successfully triggered catalog retrievals. The advisor database is complete."
+          title="No knowledge gaps logged"
+          description="No unanswered questions are currently recorded. This does not establish that every catalog detail is available."
           icon={HelpCircle}
         />
       ) : (

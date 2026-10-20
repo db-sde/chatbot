@@ -358,52 +358,6 @@ CREATE TABLE IF NOT EXISTS blocked_ips (
 INSERT INTO widget_settings (site_id) VALUES ('default') ON CONFLICT (site_id) DO NOTHING;
 
 
--- ── Indexes ──
-CREATE INDEX IF NOT EXISTS idx_entity_search_type ON entity_search(entity_type);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_search_entity ON entity_search(entity_type, entity_id);
-
-CREATE INDEX IF NOT EXISTS idx_flagged_messages_layer ON flagged_messages(layer);
-CREATE INDEX IF NOT EXISTS idx_flagged_messages_session ON flagged_messages(session_id);
-CREATE INDEX IF NOT EXISTS idx_flagged_messages_created_at ON flagged_messages(created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_unanswered_session ON unanswered_questions(session_id);
-CREATE INDEX IF NOT EXISTS idx_unanswered_created_at ON unanswered_questions(created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_ip ON sessions(ip_address);
-
-CREATE INDEX IF NOT EXISTS idx_messages_observability ON messages(session_id, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_lead_intent ON sessions(lead_intent_detected) WHERE lead_intent_detected = TRUE;
-
-CREATE INDEX IF NOT EXISTS idx_courses_university ON courses(university_id);
-CREATE INDEX IF NOT EXISTS idx_courses_fee ON courses(total_fee);
-CREATE INDEX IF NOT EXISTS idx_courses_mode ON courses(mode);
-CREATE INDEX IF NOT EXISTS idx_specializations_course ON specializations(course_id);
-CREATE INDEX IF NOT EXISTS idx_specializations_university ON specializations(university_id);
-CREATE INDEX IF NOT EXISTS idx_faqs_entity ON faqs(entity_type, entity_id);
-CREATE INDEX IF NOT EXISTS idx_reviews_entity ON reviews(entity_type, entity_id);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_site_id ON sessions(site_id);
-CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_university ON sessions(page_university_slug);
-CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_role_model ON messages(role, model_name);
-CREATE INDEX IF NOT EXISTS idx_leads_session ON leads(session_id);
-CREATE INDEX IF NOT EXISTS idx_lead_score_events_session ON lead_score_events(session_id);
-CREATE INDEX IF NOT EXISTS idx_entity_search_text_trgm ON entity_search USING gin(search_text gin_trgm_ops);
-
-CREATE INDEX IF NOT EXISTS idx_security_events_created_at ON security_events(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_security_events_ip_address ON security_events(ip_address);
-CREATE INDEX IF NOT EXISTS idx_security_events_event_type ON security_events(event_type);
-CREATE INDEX IF NOT EXISTS idx_security_events_severity ON security_events(severity);
-CREATE INDEX IF NOT EXISTS idx_security_events_blocked ON security_events(blocked);
-
-CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip_address ON blocked_ips(ip_address);
-CREATE INDEX IF NOT EXISTS idx_blocked_ips_is_active ON blocked_ips(is_active);
-CREATE INDEX IF NOT EXISTS idx_blocked_ips_expires_at ON blocked_ips(expires_at);
-
-
 -- ── Schema Delta Updates for Existing Databases ──
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ip_address INET;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_agent TEXT;
@@ -450,3 +404,49 @@ ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS lead_form_title TEXT DEFAUL
 ALTER TABLE widget_settings ADD COLUMN IF NOT EXISTS lead_form_description TEXT DEFAULT 'A counsellor can follow up with you.';
 
 ALTER TABLE security_events ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT 'India';
+
+
+-- ── Indexes ──
+CREATE INDEX IF NOT EXISTS idx_entity_search_type ON entity_search(entity_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_search_entity ON entity_search(entity_type, entity_id);
+
+CREATE INDEX IF NOT EXISTS idx_flagged_messages_layer ON flagged_messages(layer);
+CREATE INDEX IF NOT EXISTS idx_flagged_messages_session ON flagged_messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_flagged_messages_created_at ON flagged_messages(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_unanswered_session ON unanswered_questions(session_id);
+CREATE INDEX IF NOT EXISTS idx_unanswered_created_at ON unanswered_questions(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_ip ON sessions(ip_address);
+
+CREATE INDEX IF NOT EXISTS idx_messages_observability ON messages(session_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_lead_intent ON sessions(lead_intent_detected) WHERE lead_intent_detected = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_courses_university ON courses(university_id);
+CREATE INDEX IF NOT EXISTS idx_courses_fee ON courses(total_fee);
+CREATE INDEX IF NOT EXISTS idx_courses_mode ON courses(mode);
+CREATE INDEX IF NOT EXISTS idx_specializations_course ON specializations(course_id);
+CREATE INDEX IF NOT EXISTS idx_specializations_university ON specializations(university_id);
+CREATE INDEX IF NOT EXISTS idx_faqs_entity ON faqs(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_entity ON reviews(entity_type, entity_id);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_site_id ON sessions(site_id);
+CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_university ON sessions(page_university_slug);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_role_model ON messages(role, model_name);
+CREATE INDEX IF NOT EXISTS idx_leads_session ON leads(session_id);
+CREATE INDEX IF NOT EXISTS idx_lead_score_events_session ON lead_score_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_entity_search_text_trgm ON entity_search USING gin(search_text gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS idx_security_events_created_at ON security_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_security_events_ip_address ON security_events(ip_address);
+CREATE INDEX IF NOT EXISTS idx_security_events_event_type ON security_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_security_events_severity ON security_events(severity);
+CREATE INDEX IF NOT EXISTS idx_security_events_blocked ON security_events(blocked);
+
+CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip_address ON blocked_ips(ip_address);
+CREATE INDEX IF NOT EXISTS idx_blocked_ips_is_active ON blocked_ips(is_active);
+CREATE INDEX IF NOT EXISTS idx_blocked_ips_expires_at ON blocked_ips(expires_at);

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file="../.env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=Path(__file__).resolve().parents[1] / ".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "postgresql://postgres:postgres@localhost:5432/degreebaba_ai"
     # Provider config
@@ -22,6 +24,8 @@ class Settings(BaseSettings):
 
     allowed_site_keys: str = '{"degreebaba_dev":["localhost","127.0.0.1","chatbot-onjr.onrender.com","*.onrender.com"],"degreebaba_prod":["degreebaba.com","www.degreebaba.com"],"degreebaba_demo":["chatbot-onjr.onrender.com","*.onrender.com"]}'
     crm_webhook_url: str | None = None
+    catalog_webhook_secret: str | None = None
+    catalog_source_hosts: str = "degreebaba.com,www.degreebaba.com"
     admin_auth_token: str = "change-me"
     rate_limit_per_minute: int = 10
     daily_message_cap_per_site: int = 2000
@@ -39,7 +43,7 @@ class Settings(BaseSettings):
     @field_validator("trusted_proxies_raw")
     @classmethod
     def _reject_wildcard_trusted_proxies(cls, value: str) -> str:
-        if value.strip() == "*":
+        if "*" in [item.strip() for item in value.split(",")]:
             raise ValueError(
                 "TRUSTED_PROXIES='*' is not allowed because it lets any client "
                 "spoof X-Forwarded-For and bypass per-IP rate limits. "
@@ -85,6 +89,18 @@ class Settings(BaseSettings):
                 else:
                     origins.add(f"https://{domain}")
         return sorted(origins)
+
+    @property
+    def allowed_origin_regex(self) -> str:
+        """Match configured production domains and subdomains, as auth does."""
+        domains = {
+            domain.removeprefix("*.")
+            for values in self.site_domains.values()
+            for domain in values
+            if domain not in {"localhost", "127.0.0.1"}
+        }
+        patterns = [rf"https://(?:[a-zA-Z0-9-]+\.)*{re.escape(domain)}" for domain in sorted(domains)]
+        return "^(?:" + "|".join(patterns) + ")$" if patterns else r"(?!)"
 
 
 @lru_cache

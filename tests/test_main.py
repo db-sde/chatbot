@@ -91,6 +91,9 @@ async def test_progressive_lead_endpoint_returns_next_missing_field(monkeypatch)
     monkeypatch.setattr(main, "get_pool", pool)
     monkeypatch.setattr(main.queries, "ensure_session", ensure_session)
     monkeypatch.setattr(main.queries, "save_progressive_lead_field", save_field)
+    async def not_blocked(*_args):
+        return False
+    monkeypatch.setattr(main.queries, "is_ip_blocked", not_blocked)
 
     request = SimpleNamespace(
         client=SimpleNamespace(host="127.0.0.1"),

@@ -108,6 +108,7 @@ class ChatState(TypedDict, total=False):
     deterministic_route: str
     deterministic_metric: dict[str, Any]
     ui_cards: list[dict[str, Any]]
+    knowledge_gap: bool
 
 
 def _make_state(
@@ -258,7 +259,8 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
 
     logger.info("[%s] RESOLVE ENTITIES | msg=%r", session_id, message[:100])
     t0 = time.perf_counter()
-    resolved = await _resolve_entities(message, context, page_university_slug)
+    resolver_context = {**context, "_page_context": state.get("page_context") or {}}
+    resolved = await _resolve_entities(message, resolver_context, page_university_slug)
     resolver_ms = (time.perf_counter() - t0) * 1000
     logger.info("[%s] TIMING | resolver_ms=%.1f", session_id, resolver_ms)
 
@@ -284,7 +286,7 @@ async def node_resolve_entities(state: ChatState) -> dict[str, Any]:
     # Persist newly catalog-resolved entities. replace_dependents clears stale course/spec
     # when the user switches university (NMIMS → Sharda).
     pool = await get_pool()
-    if resolution_status == "resolved" and resolved.get("university_slug"):
+    if resolution_status in {"resolved", "session_context", "page_context"} and resolved.get("university_slug"):
         context_update = queries.update_session_context(
             pool,
             session_id,
@@ -537,6 +539,7 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
                 specialization_query=qualification.get("specialization"),
             )
             if not isinstance(matches, list) or not matches:
+                profile_context.pop("recommended_course_slugs", None)
                 reply = (
                     "I couldn't find a verified catalog match for all of those preferences. "
                     "I can broaden the budget or specialization, or optionally connect you "
@@ -549,6 +552,7 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
                     "lead_ask_triggered_by": "No Answer Available",
                     "profile_context_update": profile_context,
                     "deterministic_route": "recommendation",
+                    "knowledge_gap": True,
                 }
 
             bullets = []
@@ -575,6 +579,7 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
             )
             qualification["status"] = "complete"
             profile_context["qualification"] = qualification
+            profile_context["recommended_course_slugs"] = [row["slug"] for row in matches if row.get("slug")]
             result = {
                 "messages": [AIMessage(content=reply)],
                 "reply": reply,
@@ -617,6 +622,7 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
             "reply": reply,
             "lead_ask": True,
             "lead_ask_triggered_by": "No Answer Available",
+            "knowledge_gap": True,
         }
     if resolution_status == "partial_match":
         found = ", ".join(resolved.get("comparison_found") or []) or "none"
@@ -631,6 +637,7 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
             "reply": reply,
             "lead_ask": True,
             "lead_ask_triggered_by": "No Answer Available",
+            "knowledge_gap": True,
         }
 
     if state.get("tool_call_limit_reached") and not state.get("tool_batch_completed"):
@@ -683,6 +690,8 @@ async def node_agent(state: ChatState) -> dict[str, Any]:
     page_hint_only = resolved.get("_page_hint_only", False)
     context_parts = []
     if not page_hint_only:
+        if resolved.get("comparison_course_slugs"):
+            context_parts.append(f"course_slugs={resolved['comparison_course_slugs']}; use compare_programs_tool for these saved recommendations")
         if resolution_status == "catalog_query":
             context_parts.append("catalog_scope=true")
             raw_intent = resolved.get("raw") or {}
@@ -864,6 +873,9 @@ def _merge_resolved_into_tool_args(llm_args: dict[str, Any], resolved: dict[str,
         kwarg forced onto it.
     """
     merged = dict(llm_args)
+    if "course_slugs" in merged and resolved.get("comparison_course_slugs"):
+        merged["course_slugs"] = list(resolved["comparison_course_slugs"])
+        return merged
     # Comparison tools take lists of entity-specific slugs.  Their arguments
     # are never replaced with the primary entity selected for normal lookups.
     comparison_targets = resolved.get("comparison_targets") or []
@@ -1055,6 +1067,18 @@ def _create_background_task(awaitable: Awaitable[Any], *, name: str) -> asyncio.
     return task
 
 
+async def drain_background_tasks() -> None:
+    """Finish retained persistence/analytics work before the database is closed."""
+    if not _BACKGROUND_TASKS:
+        return
+    tasks = list(_BACKGROUND_TASKS)
+    _, pending = await asyncio.wait(tasks, timeout=10)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 async def _persist_fast_path(
     *,
     session_id: str,
@@ -1064,6 +1088,8 @@ async def _persist_fast_path(
     page_university_slug: str | None,
     ip_address: str | None,
     user_agent: str | None,
+    response_time_ms: int,
+    ttft_ms: int,
 ) -> None:
     """Persist a deterministic reply in order without delaying first paint."""
     pool = await get_pool()
@@ -1071,7 +1097,11 @@ async def _persist_fast_path(
         pool, session_id, site_id, page_university_slug, ip_address, user_agent
     )
     await queries.insert_message(pool, session_id, "user", message)
-    await queries.insert_message(pool, session_id, "assistant", reply)
+    await queries.insert_message(
+        pool, session_id, "assistant", reply,
+        response_time_ms=response_time_ms, ttft_ms=ttft_ms,
+        input_tokens=0, output_tokens=0, total_tokens=0, estimated_cost_usd=0.0,
+    )
 
 
 def _plan_progressive_lead_field(
@@ -1138,6 +1168,8 @@ def _schedule_anonymous_signal(
 
 async def background_lead_scoring(session_id: str, message: str, messages: list[BaseMessage]):
     """Runs lead scoring asynchronously after the user has received their response."""
+    # Background model usage must not mutate the foreground turn's metrics.
+    init_observability_context()
     try:
         pool = await get_pool()
         events = classify_score_events(message)
@@ -1243,6 +1275,9 @@ async def _run_chat_turn_unlocked(
             "Hello! I'm the DegreeBaba assistant. How can I help you with "
             "universities, courses, fees, or admissions today?"
         )
+        now = time.perf_counter()
+        agent_elapsed_ms = int((now - request_metadata_var.get()["t_start"]) * 1000)
+        ttft_ms = int((now - (request_started_at or request_metadata_var.get()["t_start"])) * 1000)
         persistence_task = _create_background_task(
             _persist_fast_path(
                 session_id=session_id,
@@ -1252,6 +1287,8 @@ async def _run_chat_turn_unlocked(
                 page_university_slug=page_university_slug,
                 ip_address=ip_address,
                 user_agent=user_agent,
+                response_time_ms=agent_elapsed_ms,
+                ttft_ms=ttft_ms,
             ),
             name="fast-path-persistence",
         )
@@ -1265,10 +1302,10 @@ async def _run_chat_turn_unlocked(
                 "route": "contact" if contact else "greeting",
                 "quick_replies": quick_replies_for(message),
                 "metrics": {
-                    "response_time_ms": 0,
-                    "ttft_ms": 0,
-                    "first_sse_event_ms": 0,
-                    "agent_ttft_ms": 0,
+                    "response_time_ms": agent_elapsed_ms,
+                    "ttft_ms": ttft_ms,
+                    "first_sse_event_ms": agent_elapsed_ms,
+                    "agent_ttft_ms": agent_elapsed_ms,
                     "llm_duration_ms": 0,
                     "tool_execution_time_ms": 0,
                     "input_tokens": 0,
@@ -1430,6 +1467,13 @@ async def _run_chat_turn_unlocked(
             message[:80],
         )
 
+    if final_state.get("knowledge_gap") and reply_text:
+        resolved_for_gap = final_state.get("resolved") or {}
+        _create_background_task(
+            log_unanswered(session_id, message, resolved_for_gap.get("university_slug"), resolved_for_gap.get("course_slug")),
+            name="knowledge-gap",
+        )
+
     if not reply_text:
         # Contact path should already have set reply via state; fallback safety
         if lead_ask and (final_state or {}).get("triage_intent") == "contact":
@@ -1540,13 +1584,23 @@ async def _run_chat_turn_unlocked(
     # Tool calls are reconstructed from graph messages for compatibility;
     # attach the timing/status captured by the execution decorator so analytics
     # retains per-invocation duration instead of only an aggregate total.
-    for call, metric in zip(tool_calls_log, tools_executed):
+    remaining_metrics = list(tools_executed)
+    for call in tool_calls_log:
+        metric = next((item for item in remaining_metrics
+                       if item["name"] == call["name"] and item.get("args", {}) == call["args"]), None)
+        if metric is None:
+            metric = next((item for item in remaining_metrics if item["name"] == call["name"]), None)
+        if metric is None:
+            continue
+        remaining_metrics.remove(metric)
         call.update({
             "duration_ms": metric.get("duration_ms", 0),
             "status": metric.get("status", call.get("status", "SUCCESS")),
             "started_at": metric.get("started_at"),
             "completed_at": metric.get("completed_at"),
         })
+    for metric in remaining_metrics:
+        tool_calls_log.append({**metric, "args": metric.get("args", {}), "deterministic": metric["name"].startswith("deterministic_")})
     
     assistant_persist_started = time.perf_counter()
     await queries.insert_message(

@@ -15,11 +15,11 @@ from pricing_config import calculate_message_cost
 logger = logging.getLogger(__name__)
 
 # ContextVars to store turn-level observability metrics
-tool_metrics_var: contextvars.ContextVar[list[dict[str, Any]]] = contextvars.ContextVar(
-    "tool_metrics", default=[]
+tool_metrics_var: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "tool_metrics", default=None
 )
-request_metadata_var: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
-    "request_metadata", default={}
+request_metadata_var: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "request_metadata", default=None
 )
 
 def init_observability_context() -> None:
@@ -36,6 +36,14 @@ def init_observability_context() -> None:
         "total_tokens": 0,
         "estimated_cost_usd": 0.0,
     })
+
+
+def _request_metadata() -> dict[str, Any]:
+    metadata = request_metadata_var.get()
+    if metadata is None:
+        init_observability_context()
+        metadata = request_metadata_var.get()
+    return metadata
 
 def timed_tool_execution(func: F) -> F:
     """Decorator to time tool execution, capture status, and record metrics in ContextVar."""
@@ -57,8 +65,13 @@ def timed_tool_execution(func: F) -> F:
         completed_at = datetime.now(timezone.utc).isoformat()
         
         # Record metrics in context list
+        try:
+            arguments = dict(inspect.signature(func).bind_partial(*args, **kwargs).arguments)
+        except TypeError:
+            arguments = {}
         metric = {
             "name": func.__name__,
+            "args": arguments,
             "started_at": started_at,
             "completed_at": completed_at,
             "duration_ms": duration_ms,
@@ -66,8 +79,12 @@ def timed_tool_execution(func: F) -> F:
         }
         
         current_metrics = tool_metrics_var.get()
-        # Create a new list to prevent shared state issues across branches
-        tool_metrics_var.set(current_metrics + [metric])
+        if current_metrics is None:
+            current_metrics = []
+            tool_metrics_var.set(current_metrics)
+        # Child tasks inherit this per-turn collector. Append so the parent
+        # sees tool results; rebinding a ContextVar only changes the child.
+        current_metrics.append(metric)
         
         return result
     
@@ -76,7 +93,7 @@ def timed_tool_execution(func: F) -> F:
 
 def record_llm_call(response_metadata: dict[str, Any]) -> None:
     """Extract model name, token usage and update cumulative request stats."""
-    metadata = request_metadata_var.get()
+    metadata = _request_metadata()
 
     # Defensive: ensure context is initialized (helps tests and ad-hoc callers).
     if not metadata or "input_tokens" not in metadata:
@@ -108,19 +125,15 @@ def record_llm_call(response_metadata: dict[str, Any]) -> None:
 
 def mark_llm_start() -> None:
     """Record the timestamp of the first LLM invocation start."""
-    metadata = request_metadata_var.get()
+    metadata = _request_metadata()
     if metadata.get("t_llm_start") is None:
         metadata["t_llm_start"] = time.perf_counter()
         request_metadata_var.set(metadata)
 
 
 def mark_first_token() -> None:
-    """Record the timestamp when the first LLM response begins.
-
-    Because the current architecture buffers the full reply before SSE word-chunking,
-    this is the closest proxy for "first token produced" in a non-streaming setup.
-    """
-    metadata = request_metadata_var.get()
+    """Record when the first response chunk is ready to emit over SSE."""
+    metadata = _request_metadata()
     if metadata.get("t_first_token") is None:
         metadata["t_first_token"] = time.perf_counter()
         request_metadata_var.set(metadata)
@@ -128,7 +141,7 @@ def mark_first_token() -> None:
 
 def record_llm_call_duration(duration_ms: int) -> None:
     """Accumulate total LLM wall-clock time for the turn."""
-    metadata = request_metadata_var.get()
+    metadata = _request_metadata()
     metadata.setdefault("llm_duration_ms", 0)
     metadata["llm_duration_ms"] += duration_ms
     request_metadata_var.set(metadata)
@@ -145,4 +158,8 @@ def record_tool_metric(name: str, duration_ms: float, status: str = "SUCCESS") -
         "duration_ms": int(duration_ms),
         "status": status,
     }
-    tool_metrics_var.set(tool_metrics_var.get() + [metric])
+    metrics = tool_metrics_var.get()
+    if metrics is None:
+        metrics = []
+        tool_metrics_var.set(metrics)
+    metrics.append(metric)

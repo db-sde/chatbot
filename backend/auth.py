@@ -48,6 +48,8 @@ def validate_site_request(site_key: str, origin: str | None, referer: str | None
 
 
 async def check_admin_auth(authorization: str | None = Header(default=None)) -> None:
+    if settings.admin_auth_token.strip() in {"", "change-me"}:
+        raise HTTPException(status_code=503, detail="Configure ADMIN_AUTH_TOKEN to enable administration")
     expected = f"Bearer {settings.admin_auth_token}"
-    if not authorization or not hmac.compare_digest(authorization, expected):
+    if not authorization or not hmac.compare_digest(authorization.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Admin token required")

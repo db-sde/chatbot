@@ -18,6 +18,8 @@ async def run_migrations() -> None:
         db_url = db_url.replace("@db:", "@localhost:")
     conn = await asyncpg.connect(dsn=db_url)
     try:
+        # Multiple API workers can start together; serialize schema changes.
+        await conn.execute("SELECT pg_advisory_lock(63881741)")
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS schema_migrations (

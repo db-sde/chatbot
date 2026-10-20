@@ -68,6 +68,7 @@ def _result(
     started: float,
     cards: list[dict[str, Any]] | None = None,
     progressive_lead_field: str | None = None,
+    knowledge_gap: bool = False,
 ) -> dict[str, Any]:
     duration_ms = (time.perf_counter() - started) * 1000
     result: dict[str, Any] = {
@@ -77,10 +78,11 @@ def _result(
         "deterministic_metric": {
             "name": f"deterministic_{route}_lookup",
             "duration_ms": duration_ms,
-            "status": "SUCCESS",
+            "status": "FAILURE" if knowledge_gap else "SUCCESS",
         },
         "tool_ms_total": duration_ms,
         "ui_cards": cards or [_actions_card(route)],
+        "knowledge_gap": knowledge_gap,
     }
     if progressive_lead_field:
         result["progressive_lead_field"] = progressive_lead_field
@@ -97,6 +99,10 @@ async def run_deterministic_route(
         return None
 
     resolved = state.get("resolved") or {}
+    # Single-selection renderers cannot represent multiple universities.
+    # Keep the existing agent/tool path for those questions.
+    if len(resolved.get("comparison_targets") or []) > 1:
+        return None
     if resolved.get("resolution_status") in {"entity_not_found", "partial_match"}:
         return None
 
@@ -108,6 +114,16 @@ async def run_deterministic_route(
     started = time.perf_counter()
 
     if route == ROUTE_FEE:
+        if university_slug and (
+            (raw_intent.get("course_query") and not course_slug)
+            or (raw_intent.get("specialization_query") and not specialization_slug)
+        ):
+            return _result(
+                route=route,
+                reply="Fees:\n- **Status:** I couldn't verify that program or specialization at this university. Please check the name or choose one of its available programs.",
+                started=started,
+                knowledge_gap=True,
+            )
         pool = await pool_provider()
         if university_slug:
             row = await queries.get_fee(pool, university_slug, course_slug, specialization_slug)
@@ -136,6 +152,7 @@ async def run_deterministic_route(
                 reply=reply,
                 started=started,
                 progressive_lead_field="name",
+                knowledge_gap=not row or all(row.get(key) is None for key in ("total_fee", "starting_fee", "emi_amount", "emi_content")),
             )
 
         rows = await queries.list_courses(
@@ -157,6 +174,7 @@ async def run_deterministic_route(
             reply=reply,
             started=started,
             progressive_lead_field="name",
+            knowledge_gap=not rows,
         )
 
     if route == ROUTE_ELIGIBILITY:
@@ -171,7 +189,7 @@ async def run_deterministic_route(
                 ])
             else:
                 reply = "Eligibility:\n- **Status:** Verified eligibility is not listed for this program yet."
-            return _result(route=route, reply=reply, started=started)
+            return _result(route=route, reply=reply, started=started, knowledge_gap=not row or not (row.get("eligibility_summary") or row.get("eligibility_content")))
 
         cards = [_actions_card(message, "Choose a program first, then I can check its eligibility.")]
         if university_slug:
@@ -215,7 +233,7 @@ async def run_deterministic_route(
             f"- **{row.get('program_name')}:** {row.get('university_name') or university_slug or ''} · {_text(row.get('duration'))} · {_money(row.get('total_fee'))}"
             for row in rows
         ) if rows else heading + ":\n- **Status:** No matching programs were found."
-        return _result(route=route, reply=reply, started=started)
+        return _result(route=route, reply=reply, started=started, knowledge_gap=not rows)
 
     if route == ROUTE_SPECIALIZATIONS:
         if course_slug:
@@ -225,7 +243,7 @@ async def run_deterministic_route(
                 f"- **{row.get('spec_name')}:** {_text(row.get('duration'))} · {_money(row.get('total_fee'))}"
                 for row in rows
             ) if rows else "Specializations:\n- **Status:** No verified specializations are listed for this program."
-            return _result(route=route, reply=reply, started=started)
+            return _result(route=route, reply=reply, started=started, knowledge_gap=not rows)
         return _result(
             route=route,
             reply="Specializations:\n- **Next step:** Choose a program before checking its available specializations.",
@@ -247,7 +265,7 @@ async def run_deterministic_route(
             f"- **UGC status:** {_text((row or {}).get('ugc_approved'))}",
             f"- **Learning mode:** {_text((row or {}).get('mode_of_learning'))}",
         ])
-        return _result(route=route, reply=reply, started=started)
+        return _result(route=route, reply=reply, started=started, knowledge_gap=not row or (row.get("naac_grade") is None and row.get("ugc_approved") is None))
 
     entity_type = "course" if course_slug else "university"
     entity_slug = course_slug or university_slug
@@ -273,6 +291,7 @@ async def run_deterministic_route(
             route=route,
             reply="Ratings & reviews:\n" + "\n".join(points),
             started=started,
+            knowledge_gap=not rows or route == ROUTE_RATINGS,
         )
 
     return None
